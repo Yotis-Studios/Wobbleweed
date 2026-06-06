@@ -4,8 +4,8 @@
 
 import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul,
          mat_perspective, mat_look_at } from "./vec.hml";
-import { fb_clear_sky } from "./framebuffer.hml";
 import { fill_tri_tex } from "./raster.hml";
+import { draw_sky } from "./sky.hml";
 
 let SUN = v_norm(v3(0.4, 1.0, 0.55));   // direction toward the light
 let AMBIENT = 0.45;
@@ -32,11 +32,12 @@ export fn camera_mvp(eye, target, w: i32, h: i32) {
     return mat_mul(proj, view);
 }
 
-// Render the world into `fb` using a precomputed mvp.
-export fn render_world(fb, mvp, grass, crate) {
+// Render the world into `fb` using a precomputed mvp. `yaw`/`pitch` drive the
+// sky's cloud panning so it matches where the camera looks.
+export fn render_world(fb, mvp, yaw, pitch, grass, crate) {
     let W = fb.width; let H = fb.height;
     let Wf = W; let Hf = H;
-    fb_clear_sky(fb, 66, 108, 198, 150, 185, 225);
+    draw_sky(fb, yaw, pitch);
 
     // --- ground: grid of small textured quads (affine swim) ---
     let G = 26.0; let N = 16; let step = (2.0 * G) / N;

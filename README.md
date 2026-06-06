@@ -47,7 +47,7 @@ window: `SDL_VIDEODRIVER=dummy hemlock examples/plasma.hml`.
 - [x] procedural textures + affine-warp ground plane (the retro core)
 - [x] input-driven free camera (WASD + arrows), real-time SDL loop
 - [ ] near-plane clipping (fixes the edge artifacts when close to the ground)
-- [ ] skybox with pixelated clouds
+- [x] sky: gradient + chunky pixelated cloud streaks that pan with the camera
 - [ ] retro post-fx (5-bit color + ordered dither, vertex jitter)
 - [ ] OBJ mesh loader + per-vertex Gouraud lighting
 

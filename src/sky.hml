@@ -1,0 +1,57 @@
+// sky.hml — the retro sky: a vertical gradient plus chunky, pixelated cloud
+// streaks that pan with the camera (yaw → horizontal, pitch → vertical). Drawn
+// as a screen-space background layer before the world, and resets the depth
+// buffer so the world draws on top.
+//
+// Clouds are blocky value-noise on purpose — the pixelated puffs are the look.
+
+import { DEPTH_FAR } from "./framebuffer.hml";
+
+fn hash2(x: i32, y: i32): i32 {
+    let mask: i64 = 4294967295;
+    let n: i64 = (i64(x) * 374761393 + i64(y) * 668265263) & mask;
+    n = ((n ^ (n >> 13)) * 1274126177) & mask;
+    n = n ^ (n >> 16);
+    return i32(n & 255);
+}
+
+fn fabs(x: f64): f64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+let CHUNK = 13;   // cloud pixel block size (chunky)
+
+export fn draw_sky(fb, yaw: f64, pitch: f64) {
+    let w = fb.width; let h = fb.height; let c = fb.color;
+    let xoff = i32(yaw * 110.0);      // clouds pan opposite the turn
+    let yoff = i32(pitch * 80.0);
+
+    for (let y = 0; y < h; y++) {
+        let t = y / (h - 1);
+        // vertical gradient: deep blue overhead -> pale toward the horizon
+        let br = i32(60.0 + (150.0 - 60.0) * t);
+        let bg = i32(100.0 + (186.0 - 100.0) * t);
+        let bb = i32(196.0 + (226.0 - 196.0) * t);
+        // cloud amount peaks in the upper-mid sky, fades out near top and horizon
+        let band = 1.0 - fabs(t - 0.34) * 1.7;
+        if (band < 0.0) { band = 0.0; }
+
+        for (let x = 0; x < w; x++) {
+            let r = br; let g = bg; let b = bb;
+            if (band > 0.0) {
+                let cx = i32((x + xoff) / CHUNK);
+                let cy = i32((y * 2 + yoff) / CHUNK);   // stretch vertically -> streaks
+                let n = (hash2(cx, cy) + hash2(cx + 17, cy * 2 + 3)) / 2;   // 0..255
+                let cloud = (n / 255.0) * band;
+                if (cloud > 0.46) {
+                    let amt = (cloud - 0.46) / 0.54;
+                    if (amt > 1.0) { amt = 1.0; }
+                    r = i32(r + (246.0 - r) * amt);
+                    g = i32(g + (249.0 - g) * amt);
+                    b = i32(b + (255.0 - b) * amt);
+                }
+            }
+            let o = (y * w + x) * 3;
+            c[o] = r & 255; c[o + 1] = g & 255; c[o + 2] = b & 255;
+        }
+    }
+    fb.depth.fill(DEPTH_FAR);
+}

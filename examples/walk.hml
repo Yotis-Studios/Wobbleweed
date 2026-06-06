@@ -63,7 +63,7 @@ fn main() {
         let target = v_add(pos, look);
 
         let mvp = camera_mvp(pos, target, W, H);
-        render_world(fb, mvp, grass, crate);
+        render_world(fb, mvp, yaw, pitch, grass, crate);
         present(win, buffer_ptr(fb.color));
 
         frame = frame + 1;
