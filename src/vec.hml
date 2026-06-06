@@ -1,0 +1,108 @@
+// vec.hml — vec3 + 4x4 matrix math for the renderer.
+//
+// Vectors are plain objects { x, y, z }. Matrices are flat arrays of 16 f64 in
+// row-major order. Everything here is pure (no I/O), so it's straightforward to
+// unit-test.
+
+import { sin, cos, sqrt, tan } from "@stdlib/math";
+
+// --- vec3 ---
+export fn v3(x: f64, y: f64, z: f64): object { return { x: x, y: y, z: z }; }
+export fn v_add(a, b)  { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+export fn v_sub(a, b)  { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+export fn v_scale(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
+export fn v_dot(a, b): f64 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+export fn v_cross(a, b) {
+    return { x: a.y * b.z - a.z * b.y,
+             y: a.z * b.x - a.x * b.z,
+             z: a.x * b.y - a.y * b.x };
+}
+
+export fn v_len(a): f64 { return sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
+
+export fn v_norm(a) {
+    let l = v_len(a);
+    if (l < 1.0e-9) { return { x: 0.0, y: 0.0, z: 0.0 }; }
+    let inv = 1.0 / l;
+    return { x: a.x * inv, y: a.y * inv, z: a.z * inv };
+}
+
+// --- 4x4 matrices (row-major flat array of 16) ---
+export fn mat_identity() {
+    return [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+}
+
+// C = A · B (both row-major).
+export fn mat_mul(a, b) {
+    let c = [];
+    for (let i = 0; i < 16; i++) { c.push(0.0); }
+    for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 4; col++) {
+            let s = 0.0;
+            for (let k = 0; k < 4; k++) {
+                s = s + a[row * 4 + k] * b[k * 4 + col];
+            }
+            c[row * 4 + col] = s;
+        }
+    }
+    return c;
+}
+
+// Transform a vec3 as a point (w=1) by a row-major matrix. Returns {x,y,z,w}.
+export fn mat_apply(m, v) {
+    return {
+        x: m[0]*v.x + m[1]*v.y + m[2]*v.z + m[3],
+        y: m[4]*v.x + m[5]*v.y + m[6]*v.z + m[7],
+        z: m[8]*v.x + m[9]*v.y + m[10]*v.z + m[11],
+        w: m[12]*v.x + m[13]*v.y + m[14]*v.z + m[15],
+    };
+}
+
+// Transform a vec3 as a direction (w=0; ignores translation).
+export fn mat_apply_dir(m, v) {
+    return {
+        x: m[0]*v.x + m[1]*v.y + m[2]*v.z,
+        y: m[4]*v.x + m[5]*v.y + m[6]*v.z,
+        z: m[8]*v.x + m[9]*v.y + m[10]*v.z,
+    };
+}
+
+export fn mat_translate(x: f64, y: f64, z: f64) {
+    return [1.0,0.0,0.0,x, 0.0,1.0,0.0,y, 0.0,0.0,1.0,z, 0.0,0.0,0.0,1.0];
+}
+
+export fn mat_scale(x: f64, y: f64, z: f64) {
+    return [x,0.0,0.0,0.0, 0.0,y,0.0,0.0, 0.0,0.0,z,0.0, 0.0,0.0,0.0,1.0];
+}
+
+export fn mat_rot_y(a: f64) {
+    let c = cos(a); let s = sin(a);
+    return [c,0.0,s,0.0, 0.0,1.0,0.0,0.0, 0.0-s,0.0,c,0.0, 0.0,0.0,0.0,1.0];
+}
+
+export fn mat_rot_x(a: f64) {
+    let c = cos(a); let s = sin(a);
+    return [1.0,0.0,0.0,0.0, 0.0,c,0.0-s,0.0, 0.0,s,c,0.0, 0.0,0.0,0.0,1.0];
+}
+
+// Right-handed perspective, looking down -Z. fov in radians.
+export fn mat_perspective(fov: f64, aspect: f64, near: f64, far: f64) {
+    let f = 1.0 / tan(fov * 0.5);
+    let nf = 1.0 / (near - far);
+    return [f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, (far + near) * nf, 2.0 * far * near * nf,
+            0.0, 0.0, 0.0 - 1.0, 0.0];
+}
+
+// View matrix placing the camera at `eye` looking at `target`, up `up`.
+export fn mat_look_at(eye, target, up) {
+    let f = v_norm(v_sub(target, eye));     // forward
+    let r = v_norm(v_cross(f, up));         // right
+    let u = v_cross(r, f);                  // true up
+    return [ r.x,  r.y,  r.z, 0.0 - v_dot(r, eye),
+             u.x,  u.y,  u.z, 0.0 - v_dot(u, eye),
+            0.0-f.x, 0.0-f.y, 0.0-f.z, v_dot(f, eye),
+            0.0, 0.0, 0.0, 1.0];
+}

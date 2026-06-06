@@ -1,0 +1,48 @@
+// framebuffer.hml — color + depth buffers for the software rasterizer.
+//
+//   color : buffer of width*height*3 bytes, 24-bit RGB, row-major.
+//   depth : array<f64> of width*height. Smaller = nearer; cleared to +inf.
+//
+// Low internal resolution is on purpose — chunky pixels are half the retro look.
+
+import { write_png } from "./png.hml";
+
+export const DEPTH_FAR = 1.0e30;
+
+export fn fb_new(width: i32, height: i32): object {
+    let color = buffer(width * height * 3);
+    let depth = [];
+    let n = width * height;
+    for (let i = 0; i < n; i++) { depth.push(DEPTH_FAR); }
+    return { width: width, height: height, color: color, depth: depth };
+}
+
+export fn fb_clear(fb, r: i32, g: i32, b: i32) {
+    let n = fb.width * fb.height;
+    let c = fb.color;
+    for (let i = 0; i < n; i++) {
+        let o = i * 3;
+        c[o] = r & 255; c[o + 1] = g & 255; c[o + 2] = b & 255;
+    }
+    fb.depth.fill(DEPTH_FAR);
+}
+
+// Vertical gradient sky (top color at y=0 fading to bottom), depth reset.
+export fn fb_clear_sky(fb, tr: i32, tg: i32, tb: i32, br: i32, bg: i32, bb: i32) {
+    let w = fb.width; let h = fb.height; let c = fb.color;
+    for (let y = 0; y < h; y++) {
+        let t = y / (h - 1);
+        let r = i32(tr + (br - tr) * t) & 255;
+        let g = i32(tg + (bg - tg) * t) & 255;
+        let b = i32(tb + (bb - tb) * t) & 255;
+        for (let x = 0; x < w; x++) {
+            let o = (y * w + x) * 3;
+            c[o] = r; c[o + 1] = g; c[o + 2] = b;
+        }
+    }
+    fb.depth.fill(DEPTH_FAR);
+}
+
+export fn fb_save(fb, path: string) {
+    write_png(path, fb.color, fb.width, fb.height);
+}

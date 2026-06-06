@@ -1,0 +1,67 @@
+// cube_png.hml — render a flat-shaded cube to a PNG. First end-to-end test of
+// the 3D pipeline (transform → project → rasterize → z-buffer → save).
+//   ./hemlock examples/cube_png.hml   ->  /tmp/cube_render.png
+
+import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul,
+         mat_perspective, mat_look_at, mat_rot_y, mat_rot_x } from "../src/vec.hml";
+import { fb_new, fb_clear_sky, fb_save } from "../src/framebuffer.hml";
+import { fill_tri } from "../src/raster.hml";
+
+let W = 320; let H = 240;
+
+// cube corners
+let V = [v3(-1.0,-1.0,-1.0), v3(1.0,-1.0,-1.0), v3(1.0,1.0,-1.0), v3(-1.0,1.0,-1.0),
+         v3(-1.0,-1.0,1.0),  v3(1.0,-1.0,1.0),  v3(1.0,1.0,1.0),  v3(-1.0,1.0,1.0)];
+// faces: 4 corner indices, normal, base RGB
+let F = [
+  { i: [0,1,2,3], n: v3(0.0,0.0,-1.0), c: [220,70,70] },    // front
+  { i: [5,4,7,6], n: v3(0.0,0.0,1.0),  c: [70,200,90] },    // back
+  { i: [4,0,3,7], n: v3(-1.0,0.0,0.0), c: [80,120,230] },   // left
+  { i: [1,5,6,2], n: v3(1.0,0.0,0.0),  c: [235,200,70] },   // right
+  { i: [3,2,6,7], n: v3(0.0,1.0,0.0),  c: [90,210,220] },   // top
+  { i: [4,5,1,0], n: v3(0.0,-1.0,0.0), c: [210,90,200] },   // bottom
+];
+
+fn project(mvp, v) {
+    let c = mat_apply(mvp, v);
+    if (c.w < 0.0001) { return null; }   // behind camera (near-clip comes later)
+    let inv = 1.0 / c.w;
+    return { x: (c.x * inv * 0.5 + 0.5) * W,
+             y: (1.0 - (c.y * inv * 0.5 + 0.5)) * H,
+             z: c.z * inv };
+}
+
+fn main() {
+    let fb = fb_new(W, H);
+    fb_clear_sky(fb, 70, 110, 200, 170, 200, 235);
+
+    let proj = mat_perspective(1.0472, W / H, 0.1, 100.0);   // 60° fov
+    let view = mat_look_at(v3(2.6, 2.0, 3.4), v3(0.0, 0.0, 0.0), v3(0.0, 1.0, 0.0));
+    let model = mat_mul(mat_rot_y(0.7), mat_rot_x(0.35));
+    let mvp = mat_mul(proj, mat_mul(view, model));
+
+    let light = v_norm(v3(0.4, 1.0, 0.6));   // direction TO the light
+    let ambient = 0.35;
+
+    for (face in F) {
+        let nw = v_norm(mat_apply_dir(model, face.n));
+        let ndotl = v_dot(nw, light);
+        if (ndotl < 0.0) { ndotl = 0.0; }
+        let shade = ambient + (1.0 - ambient) * ndotl;
+        let r = i32(face.c[0] * shade);
+        let g = i32(face.c[1] * shade);
+        let b = i32(face.c[2] * shade);
+
+        let p = [];
+        for (idx in face.i) { p.push(project(mvp, V[idx])); }
+        if (p[0] == null || p[1] == null || p[2] == null || p[3] == null) { continue; }
+        // quad -> 2 tris; z-buffer handles visibility (no backface cull yet)
+        fill_tri(fb, p[0].x,p[0].y,p[0].z, p[1].x,p[1].y,p[1].z, p[2].x,p[2].y,p[2].z, r,g,b);
+        fill_tri(fb, p[0].x,p[0].y,p[0].z, p[2].x,p[2].y,p[2].z, p[3].x,p[3].y,p[3].z, r,g,b);
+    }
+
+    fb_save(fb, "/tmp/cube_render.png");
+    print("wrote /tmp/cube_render.png");
+}
+
+main();
