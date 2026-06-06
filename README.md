@@ -41,12 +41,15 @@ window: `SDL_VIDEODRIVER=dummy hemlock examples/plasma.hml`.
 ## Roadmap
 
 - [x] SDL window + framebuffer present + event polling (real-time loop)
-- [ ] vec3 / 4×4 matrix math, perspective + look-at camera
-- [ ] triangle rasterizer (affine UV, z-buffer, Gouraud) — the retro core
-- [ ] OBJ mesh loader + textures
+- [x] vec3 / 4×4 matrix math, perspective + look-at camera
+- [x] triangle rasterizer — affine UV + z-buffer (flat + textured fills)
+- [x] PNG sink for screenshots
+- [x] procedural textures + affine-warp ground plane (the retro core)
 - [x] input-driven free camera (WASD + arrows), real-time SDL loop
+- [ ] near-plane clipping (fixes the edge artifacts when close to the ground)
+- [ ] skybox with pixelated clouds
 - [ ] retro post-fx (5-bit color + ordered dither, vertex jitter)
-- [ ] PNG sink for screenshots
+- [ ] OBJ mesh loader + per-vertex Gouraud lighting
 
 Reached through `@stdlib/math` + FFI only, so it should run under `hemlockc`
 (compiled) as well as the interpreter.
