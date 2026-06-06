@@ -14,7 +14,7 @@ let W = 160;
 let H = 120;
 
 fn main() {
-    let win = window_open("lowpoly — plasma", W, H, 5);
+    let win = window_open("Wobbleweed — plasma", W, H, 5);
     if (win == null) { eprint("could not open window"); return; }
 
     let fb = buffer(W * H * 3);

@@ -1,6 +1,6 @@
 // sdl.hml — a minimal SDL2 binding for presenting a software framebuffer.
 //
-// lowpoly renders into a plain RGB byte buffer (the framebuffer). This module
+// Wobbleweed renders into a plain RGB byte buffer (the framebuffer). This module
 // is the *output sink*: it opens a window, uploads the framebuffer to a
 // streaming texture each frame, and presents it — plus event polling for quit
 // and keys. SDL is reached through Hemlock's FFI (`extern fn`), so the only

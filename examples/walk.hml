@@ -18,7 +18,7 @@ import { window_open, present, poll, keystate, held, ticks, delay, window_close,
 let W = 320; let H = 240;
 
 fn main() {
-    let win = window_open("lowpoly", W, H, 3);
+    let win = window_open("Wobbleweed", W, H, 3);
     if (win == null) { eprint("could not open window"); return; }
 
     let fb = fb_new(W, H);

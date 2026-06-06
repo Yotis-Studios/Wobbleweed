@@ -1,6 +1,6 @@
-# lowpoly
+# Wobbleweed
 
-A retro **PS1/N64-era** software 3D engine in pure Hemlock, rendering to a real
+Wobbleweed is a retro **PS1/N64-era** software 3D engine in pure Hemlock, rendering to a real
 **SDL2 window** — no OpenGL, no game framework. The CPU rasterizes textured, lit
 triangles into a memory framebuffer; SDL just blits that framebuffer to the
 screen each frame and feeds back input.
