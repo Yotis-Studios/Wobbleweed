@@ -64,7 +64,7 @@ window: `SDL_VIDEODRIVER=dummy hemlock examples/plasma.hml`.
 - [x] sky: gradient + chunky pixelated cloud streaks that pan with the camera (CPU path)
 - [x] GPU backend via `SDL_RenderGeometry` — affine UVs, painter's sort, Gouraud (offloads rasterization, keeps the wobble)
 - [ ] near-plane clipping (fixes the edge artifacts when close to the ground)
-- [ ] clouds on the GPU sky (bake the cloud layer into a panned sky texture)
+- [x] clouds on the GPU sky — tileable panorama texture panned by yaw, seam-split so UVs stay in [0,1]
 - [ ] retro post-fx (5-bit color + ordered dither, vertex jitter)
 - [ ] OBJ mesh loader + per-vertex Gouraud lighting
 

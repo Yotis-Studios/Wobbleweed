@@ -37,6 +37,46 @@ export fn tex_grass(w: i32, h: i32): object {
     return t;
 }
 
+fn fabs(x: f64): f64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+// Sky panorama: a vertical gradient plus chunky, pixelated cloud streaks,
+// tileable horizontally so the GPU sky quad can pan seamlessly with camera yaw.
+// V (0..1) runs deep-blue overhead -> pale at the horizon.
+export fn tex_sky(w: i32, h: i32): object {
+    let t = tex_new(w, h);
+    let d = t.data;
+    let CH = 8;                  // cloud block size (chunky)
+    let cellsx = w / CH;         // horizontal period -> seamless wrap
+    for (let y = 0; y < h; y++) {
+        let ty = y / (h - 1);
+        let br = i32(60.0 + (150.0 - 60.0) * ty);
+        let bg = i32(100.0 + (186.0 - 100.0) * ty);
+        let bb = i32(196.0 + (226.0 - 196.0) * ty);
+        let band = 1.0 - fabs(ty - 0.34) * 1.7;   // clouds peak in the upper-mid sky
+        if (band < 0.0) { band = 0.0; }
+        let cy = i32(y / (CH * 2));                // stretch vertically -> streaks
+        for (let x = 0; x < w; x++) {
+            let r = br; let g = bg; let b = bb;
+            if (band > 0.0) {
+                let cx = i32(x / CH) % cellsx;
+                let cx2 = (cx + 17) % cellsx;
+                let n = (hash2(cx, cy) + hash2(cx2, cy * 2 + 3)) / 2;
+                let cloud = (n / 255.0) * band;
+                if (cloud > 0.46) {
+                    let amt = (cloud - 0.46) / 0.54;
+                    if (amt > 1.0) { amt = 1.0; }
+                    r = i32(r + (246.0 - r) * amt);
+                    g = i32(g + (249.0 - g) * amt);
+                    b = i32(b + (255.0 - b) * amt);
+                }
+            }
+            let o = (y * w + x) * 3;
+            d[o] = r & 255; d[o + 1] = g & 255; d[o + 2] = b & 255;
+        }
+    }
+    return t;
+}
+
 // Checkerboard — handy for *seeing* the affine texture warp clearly.
 export fn tex_checker(w: i32, h: i32, cells: i32): object {
     let t = tex_new(w, h);

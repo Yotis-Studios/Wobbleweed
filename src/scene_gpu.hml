@@ -40,20 +40,37 @@ fn tv(p, u: f64, v: f64, light: f64) {
     return { x: p.x, y: p.y, z: p.z, u: u, v: v, r: c, g: c, b: c };
 }
 
-// colored vertex (untextured): real color, fixed screen-space z
-fn cv(x: f64, y: f64, z: f64, r: i32, g: i32, b: i32) {
-    return { x: x, y: y, z: z, u: 0.0, v: 0.0, r: r, g: g, b: b };
+// full-white textured vertex (texture shown unmodulated), behind everything
+fn skv(x: f64, y: f64, u: f64, v: f64) {
+    return { x: x, y: y, z: 2.0, u: u, v: v, r: 255, g: 255, b: 255 };
 }
 
-// A flat gradient sky as one untextured quad behind everything (z = 2.0, past
-// the far plane, so painter's sort draws it first). Top deep blue, bottom pale.
-fn emit_sky(b, W: f64, H: f64) {
-    let tl = cv(0.0, 0.0, 2.0, 60, 100, 196);
-    let tr = cv(W,   0.0, 2.0, 60, 100, 196);
-    let br = cv(W,   H,   2.0, 150, 186, 226);
-    let bl = cv(0.0, H,   2.0, 150, 186, 226);
-    batch_tri(b, null, tl, tr, br);
-    batch_tri(b, null, tl, br, bl);
+fn emit_sky_quad(b, skytex, u0: f64, u1: f64, xa: f64, xb: f64, H: f64) {
+    batch_tri(b, skytex, skv(xa, 0.0, u0, 0.0), skv(xb, 0.0, u1, 0.0), skv(xb, H, u1, 1.0));
+    batch_tri(b, skytex, skv(xa, 0.0, u0, 0.0), skv(xb, H, u1, 1.0), skv(xa, H, u0, 1.0));
+}
+
+// The sky: a fullscreen quad sampling the panorama texture, panned by yaw so the
+// clouds slide as you turn (z = 2.0, past the far plane -> painter draws it
+// first). The visible window is hfov wide; when it crosses the texture's wrap
+// seam we split into two quads so UVs always stay in [0,1] (no reliance on
+// GPU/software texture-wrap behaviour, which differs between them).
+let TWO_PI = 6.283185307;
+let HFOV = 1.42;   // ~ horizontal field of view for fovy=1.15, 4:3
+
+fn emit_sky(b, skytex, yaw: f64, W: f64, H: f64) {
+    let uspan = HFOV / TWO_PI;
+    let turns = yaw / TWO_PI;
+    let uoff = turns - i64(turns);    // fractional turn
+    if (uoff < 0.0) { uoff = uoff + 1.0; }
+    let uend = uoff + uspan;
+    if (uend <= 1.0) {
+        emit_sky_quad(b, skytex, uoff, uend, 0.0, W, H);
+    } else {
+        let split = W * (1.0 - uoff) / uspan;
+        emit_sky_quad(b, skytex, uoff, 1.0, 0.0, split, H);
+        emit_sky_quad(b, skytex, 0.0, uend - 1.0, split, W, H);
+    }
 }
 
 fn emit_quad(b, tex, p0, p1, p2, p3, light) {
@@ -63,8 +80,8 @@ fn emit_quad(b, tex, p0, p1, p2, p3, light) {
 }
 
 // Render the world into batch `b`. gtex/ctex are SDL textures (grass, crate).
-export fn render_world_gpu(b, mvp, W: f64, H: f64, gtex, ctex) {
-    emit_sky(b, W, H);
+export fn render_world_gpu(b, mvp, yaw: f64, W: f64, H: f64, gtex, ctex, skytex) {
+    emit_sky(b, skytex, yaw, W, H);
 
     // ground grid
     let G = 26.0; let N = 16; let step = (2.0 * G) / N;

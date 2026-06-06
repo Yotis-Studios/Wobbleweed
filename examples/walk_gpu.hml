@@ -8,7 +8,7 @@
 //   hemlockc examples/walk_gpu.hml -o walk_gpu && ./walk_gpu
 import { sin, cos } from "@stdlib/math";
 import { v3, v_add, v_scale } from "../src/vec.hml";
-import { tex_grass, tex_checker } from "../src/texture.hml";
+import { tex_grass, tex_checker, tex_sky } from "../src/texture.hml";
 import { batch_new, batch_flush } from "../src/geom.hml";
 import { camera_mvp, render_world_gpu } from "../src/scene_gpu.hml";
 import { window_open, upload_texture, clear, present_geom, poll, keystate, held,
@@ -23,6 +23,7 @@ fn main() {
 
     let gtex = upload_texture(win, tex_grass(64, 64));
     let ctex = upload_texture(win, tex_checker(64, 64, 4));
+    let skytex = upload_texture(win, tex_sky(320, 128));
     let b = batch_new(4096);
 
     let pos = v3(4.0, 2.0, 10.0);
@@ -59,7 +60,7 @@ fn main() {
         let mvp = camera_mvp(pos, target, W, H);
 
         clear(win, 0, 0, 0);
-        render_world_gpu(b, mvp, W, H, gtex, ctex);
+        render_world_gpu(b, mvp, yaw, W, H, gtex, ctex, skytex);
         batch_flush(win, b);
         present_geom(win);
 
