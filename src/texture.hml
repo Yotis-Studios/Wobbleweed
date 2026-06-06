@@ -1,0 +1,54 @@
+// texture.hml — textures for the rasterizer.
+//
+// A texture is { width, height, data } where data is a width*height*3 RGB
+// buffer. Sampling is nearest-neighbour (chunky, on purpose). Includes a couple
+// of procedural generators so the engine is self-contained.
+
+export fn tex_new(w: i32, h: i32): object {
+    return { width: w, height: h, data: buffer(w * h * 3) };
+}
+
+// Deterministic per-texel hash -> 0..255. Done in i64 with 32-bit masking so
+// the big-prime multiplies don't overflow.
+fn hash2(x: i32, y: i32): i32 {
+    let mask: i64 = 4294967295;
+    let n: i64 = (i64(x) * 374761393 + i64(y) * 668265263) & mask;
+    n = ((n ^ (n >> 13)) * 1274126177) & mask;
+    n = n ^ (n >> 16);
+    return i32(n & 255);
+}
+
+// Procedural grass: noisy greens with a few darker blades. Tiles seamlessly-ish.
+export fn tex_grass(w: i32, h: i32): object {
+    let t = tex_new(w, h);
+    let d = t.data;
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let n = hash2(x, y);
+            let n2 = hash2(x * 3 + 7, y * 3 + 11);
+            let g = 90 + (n % 70);          // green base + variation
+            let r = 35 + (n2 % 35);
+            let b = 30 + (n % 25);
+            if (n2 < 24) { g = g - 35; r = r - 10; }   // darker clumps
+            let o = (y * w + x) * 3;
+            d[o] = r & 255; d[o + 1] = g & 255; d[o + 2] = b & 255;
+        }
+    }
+    return t;
+}
+
+// Checkerboard — handy for *seeing* the affine texture warp clearly.
+export fn tex_checker(w: i32, h: i32, cells: i32): object {
+    let t = tex_new(w, h);
+    let d = t.data;
+    let cs = w / cells;
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let on = ((i32(x / cs) + i32(y / cs)) % 2) == 0;
+            let o = (y * w + x) * 3;
+            let v = on ? 210 : 70;
+            d[o] = v & 255; d[o + 1] = v & 255; d[o + 2] = v & 255;
+        }
+    }
+    return t;
+}

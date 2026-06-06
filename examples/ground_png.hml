@@ -1,0 +1,61 @@
+// ground_png.hml — the signature retro shot: a textured ground plane at a
+// grazing angle, so the affine (non-perspective-correct) UV mapping makes the
+// grass *swim* toward the horizon — the PS1/N64 look from the inspo.
+//
+// The ground is a grid of small textured quads (like the consoles did) so the
+// affine error per polygon is the subtle wobble, not a broken stretch.
+//   ./hemlock examples/ground_png.hml  ->  /tmp/ground_render.png
+
+import { v3, v_norm, mat_apply, mat_mul, mat_perspective, mat_look_at } from "../src/vec.hml";
+import { fb_new, fb_clear_sky, fb_save } from "../src/framebuffer.hml";
+import { fill_tri_tex } from "../src/raster.hml";
+import { tex_grass } from "../src/texture.hml";
+
+let W = 320; let H = 240;
+let G = 24.0;     // ground half-extent
+let N = 20;       // grid subdivisions per side
+
+fn project(mvp, v) {
+    let c = mat_apply(mvp, v);
+    if (c.w < 0.0001) { return null; }
+    let inv = 1.0 / c.w;
+    return { x: (c.x * inv * 0.5 + 0.5) * W,
+             y: (1.0 - (c.y * inv * 0.5 + 0.5)) * H,
+             z: c.z * inv };
+}
+
+fn main() {
+    let fb = fb_new(W, H);
+    fb_clear_sky(fb, 70, 110, 200, 150, 185, 225);
+
+    let proj = mat_perspective(1.15, W / H, 0.1, 200.0);
+    // low camera looking out across the ground -> grazing angle
+    let view = mat_look_at(v3(0.0, 1.6, 9.0), v3(0.0, 1.0, 0.0 - 30.0), v3(0.0, 1.0, 0.0));
+    let mvp = mat_mul(proj, view);
+
+    let grass = tex_grass(32, 32);
+    let step = (2.0 * G) / N;
+    let tiles = 1.0;   // texture repeats once per cell
+
+    for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+            let x0 = 0.0 - G + i * step;       let x1 = x0 + step;
+            let z0 = 0.0 - G + j * step;       let z1 = z0 + step;
+            let p0 = project(mvp, v3(x0, 0.0, z0));
+            let p1 = project(mvp, v3(x1, 0.0, z0));
+            let p2 = project(mvp, v3(x1, 0.0, z1));
+            let p3 = project(mvp, v3(x0, 0.0, z1));
+            if (p0 == null || p1 == null || p2 == null || p3 == null) { continue; }
+            // per-cell UVs (0..tiles); flat ground light with slight depth fade
+            let u0 = 0.0; let u1 = tiles; let v0 = 0.0; let v1 = tiles;
+            let L = 0.95;
+            fill_tri_tex(fb, p0.x,p0.y,p0.z, u0,v0,L, p1.x,p1.y,p1.z, u1,v0,L, p2.x,p2.y,p2.z, u1,v1,L, grass);
+            fill_tri_tex(fb, p0.x,p0.y,p0.z, u0,v0,L, p2.x,p2.y,p2.z, u1,v1,L, p3.x,p3.y,p3.z, u0,v1,L, grass);
+        }
+    }
+
+    fb_save(fb, "/tmp/ground_render.png");
+    print("wrote /tmp/ground_render.png");
+}
+
+main();
