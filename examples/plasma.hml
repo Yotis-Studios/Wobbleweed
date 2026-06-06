@@ -1,0 +1,56 @@
+// plasma.hml — a classic animated plasma, drawn into a software framebuffer and
+// presented through SDL. A first real-time-loop smoke test for the window path:
+// no 3D yet, just prove framebuffer → texture → present runs every frame.
+//
+//   ./hemlock examples/plasma.hml      (needs a display)
+//
+// The render is per-pixel in the interpreter, so keep the internal resolution
+// small; compile with hemlockc for smooth real-time.
+
+import { sin } from "@stdlib/math";
+import { window_open, present, poll, ticks, delay, window_close } from "../src/sdl.hml";
+
+let W = 160;
+let H = 120;
+
+fn main() {
+    let win = window_open("lowpoly — plasma", W, H, 5);
+    if (win == null) { eprint("could not open window"); return; }
+
+    let fb = buffer(W * H * 3);
+    let running = true;
+    let frame = 0;
+    let t0 = ticks();
+
+    while (running) {
+        let ev = poll(win);
+        if (ev.quit) { running = false; }
+
+        let t = frame * 0.06;
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                let v = sin(x * 0.08 + t)
+                      + sin(y * 0.10 - t * 0.7)
+                      + sin((x + y) * 0.06 + t * 1.3);
+                // v in [-3,3] → map each channel with phase offsets for color
+                let o = (y * W + x) * 3;
+                fb[o]     = i32((sin(v * 1.7) * 0.5 + 0.5) * 255) & 255;
+                fb[o + 1] = i32((sin(v * 1.7 + 2.094) * 0.5 + 0.5) * 255) & 255;
+                fb[o + 2] = i32((sin(v * 1.7 + 4.188) * 0.5 + 0.5) * 255) & 255;
+            }
+        }
+
+        present(win, buffer_ptr(fb));
+        frame = frame + 1;
+        if (frame % 30 == 0) {
+            let secs = (ticks() - t0) / 1000.0;
+            eprint(`frame ${frame}  ~${i32(frame / secs)} fps`);
+        }
+        delay(8);
+    }
+
+    window_close(win);
+    print("bye");
+}
+
+main();

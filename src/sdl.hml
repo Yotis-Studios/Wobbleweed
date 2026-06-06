@@ -1,0 +1,117 @@
+// sdl.hml — a minimal SDL2 binding for presenting a software framebuffer.
+//
+// lowpoly renders into a plain RGB byte buffer (the framebuffer). This module
+// is the *output sink*: it opens a window, uploads the framebuffer to a
+// streaming texture each frame, and presents it — plus event polling for quit
+// and keys. SDL is reached through Hemlock's FFI (`extern fn`), so the only
+// dependency is `libSDL2-2.0.so.0` at runtime.
+//
+// The framebuffer is width*height*3 bytes, 24-bit RGB, row-major — which maps
+// directly to SDL's RGB24 texture format (no conversion).
+
+import "libSDL2-2.0.so.0";
+
+extern fn SDL_Init(flags: u32): i32;
+extern fn SDL_CreateWindow(title: string, x: i32, y: i32, w: i32, h: i32, flags: u32): ptr;
+extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;
+extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr;
+extern fn SDL_RenderSetLogicalSize(ren: ptr, w: i32, h: i32): i32;
+extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32;
+extern fn SDL_RenderClear(ren: ptr): i32;
+extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
+extern fn SDL_RenderPresent(ren: ptr): void;
+extern fn SDL_PollEvent(ev: ptr): i32;
+extern fn SDL_Delay(ms: u32): void;
+extern fn SDL_GetTicks(): u32;
+extern fn SDL_GetError(): string;
+extern fn SDL_DestroyTexture(tex: ptr): void;
+extern fn SDL_DestroyRenderer(ren: ptr): void;
+extern fn SDL_DestroyWindow(win: ptr): void;
+extern fn SDL_Quit(): void;
+
+// --- constants ---
+let SDL_INIT_VIDEO = 32;
+let SDL_WINDOWPOS_CENTERED = 805240832;       // 0x2FFF0000
+let SDL_WINDOW_SHOWN = 4;
+let SDL_RENDERER_ACCELERATED = 2;
+let SDL_RENDERER_SOFTWARE = 1;
+let SDL_PIXELFORMAT_RGB24 = 386930691;        // byte order R,G,B
+let SDL_TEXTUREACCESS_STREAMING = 1;
+let SDL_QUIT = 256;                            // 0x100
+let SDL_KEYDOWN = 768;                         // 0x300
+let EVENT_SIZE = 256;                          // SDL_Event is 56 bytes; over-allocate
+let KEYSYM_SYM_OFFSET = 20;                    // SDL_KeyboardEvent.keysym.sym
+
+// Common key codes (SDLK_*)
+export let KEY_ESCAPE = 27;
+export let KEY_SPACE = 32;
+export let KEY_LEFT = 1073741904;
+export let KEY_RIGHT = 1073741903;
+export let KEY_UP = 1073741906;
+export let KEY_DOWN = 1073741905;
+export let KEY_W = 119;
+export let KEY_A = 97;
+export let KEY_S = 115;
+export let KEY_D = 100;
+
+// Open a window sized width*height, scaled up by `scale` (nearest, chunky).
+// Returns { win, ren, tex, ev, width, height } or null on failure.
+export fn window_open(title: string, width: i32, height: i32, scale: i32): object {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        eprint(`SDL_Init failed: ${SDL_GetError()}`);
+        return null;
+    }
+    let win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               width * scale, height * scale, SDL_WINDOW_SHOWN);
+    if (win == null) { eprint(`CreateWindow failed: ${SDL_GetError()}`); return null; }
+
+    // Prefer GPU-accelerated; fall back to software (e.g. headless/dummy driver).
+    let ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (ren == null) { ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE); }
+    if (ren == null) { ren = SDL_CreateRenderer(win, -1, 0); }
+    if (ren == null) { eprint(`CreateRenderer failed: ${SDL_GetError()}`); return null; }
+    // Logical size = internal resolution; SDL scales it up to the window.
+    SDL_RenderSetLogicalSize(ren, width, height);
+
+    let tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, width, height);
+    if (tex == null) { eprint(`CreateTexture failed: ${SDL_GetError()}`); return null; }
+
+    return { win: win, ren: ren, tex: tex, ev: alloc(EVENT_SIZE),
+             width: width, height: height };
+}
+
+// Push the framebuffer (a raw ptr to width*height*3 RGB bytes) to the screen.
+export fn present(w: object, pixels: ptr) {
+    SDL_UpdateTexture(w.tex, null, pixels, w.width * 3);
+    SDL_RenderClear(w.ren);
+    SDL_RenderCopy(w.ren, w.tex, null, null);
+    SDL_RenderPresent(w.ren);
+}
+
+// Drain pending events. Returns { quit: bool, keys: array<i32> } where `keys`
+// are the SDLK codes pressed this frame.
+export fn poll(w: object): object {
+    let quit = false;
+    let keys = [];
+    while (SDL_PollEvent(w.ev) != 0) {
+        let etype = ptr_deref_u32(w.ev);
+        if (etype == SDL_QUIT) {
+            quit = true;
+        } else if (etype == SDL_KEYDOWN) {
+            let sym = ptr_deref_u32(ptr_offset(w.ev, KEYSYM_SYM_OFFSET, 1));
+            keys.push(sym);
+            if (sym == KEY_ESCAPE) { quit = true; }
+        }
+    }
+    return { quit: quit, keys: keys };
+}
+
+export fn ticks(): i32 { return SDL_GetTicks(); }
+export fn delay(ms: i32) { SDL_Delay(ms); }
+
+export fn window_close(w: object) {
+    SDL_DestroyTexture(w.tex);
+    SDL_DestroyRenderer(w.ren);
+    SDL_DestroyWindow(w.win);
+    SDL_Quit();
+}
