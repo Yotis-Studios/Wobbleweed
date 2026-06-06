@@ -1,0 +1,109 @@
+// scene_gpu.hml — the demo world emitted as GPU triangles (SDL_RenderGeometry).
+//
+// Same world as scene.hml, but instead of filling pixels on the CPU we project
+// vertices and queue triangles into a geom batch; the GPU rasterizes them with
+// affine UVs (the wobble) and Gouraud vertex colors. Painter's sort in the batch
+// handles occlusion (no z-buffer — like real PS1).
+
+import { v3, v_norm, v_dot, mat_apply, mat_mul,
+         mat_perspective, mat_look_at } from "./vec.hml";
+import { batch_tri } from "./geom.hml";
+
+let SUN = v_norm(v3(0.4, 1.0, 0.55));
+let AMBIENT = 0.45;
+
+fn face_light(n): f64 {
+    let d = v_dot(n, SUN);
+    if (d < 0.0) { d = 0.0; }
+    return AMBIENT + (1.0 - AMBIENT) * d;
+}
+
+export fn camera_mvp(eye, target, w: i32, h: i32) {
+    let proj = mat_perspective(1.15, w / h, 0.1, 200.0);
+    let view = mat_look_at(eye, target, v3(0.0, 1.0, 0.0));
+    return mat_mul(proj, view);
+}
+
+fn project(mvp, p, W: f64, H: f64) {
+    let c = mat_apply(mvp, p);
+    if (c.w < 0.0001) { return null; }
+    let inv = 1.0 / c.w;
+    return { x: (c.x * inv * 0.5 + 0.5) * W,
+             y: (1.0 - (c.y * inv * 0.5 + 0.5)) * H,
+             z: c.z * inv };
+}
+
+// textured vertex: gray color = light*255 modulates the texture (Gouraud)
+fn tv(p, u: f64, v: f64, light: f64) {
+    let c = i32(light * 255.0);
+    if (c > 255) { c = 255; } if (c < 0) { c = 0; }
+    return { x: p.x, y: p.y, z: p.z, u: u, v: v, r: c, g: c, b: c };
+}
+
+// colored vertex (untextured): real color, fixed screen-space z
+fn cv(x: f64, y: f64, z: f64, r: i32, g: i32, b: i32) {
+    return { x: x, y: y, z: z, u: 0.0, v: 0.0, r: r, g: g, b: b };
+}
+
+// A flat gradient sky as one untextured quad behind everything (z = 2.0, past
+// the far plane, so painter's sort draws it first). Top deep blue, bottom pale.
+fn emit_sky(b, W: f64, H: f64) {
+    let tl = cv(0.0, 0.0, 2.0, 60, 100, 196);
+    let tr = cv(W,   0.0, 2.0, 60, 100, 196);
+    let br = cv(W,   H,   2.0, 150, 186, 226);
+    let bl = cv(0.0, H,   2.0, 150, 186, 226);
+    batch_tri(b, null, tl, tr, br);
+    batch_tri(b, null, tl, br, bl);
+}
+
+fn emit_quad(b, tex, p0, p1, p2, p3, light) {
+    if (p0 == null || p1 == null || p2 == null || p3 == null) { return; }
+    batch_tri(b, tex, tv(p0, 0.0, 0.0, light), tv(p1, 1.0, 0.0, light), tv(p2, 1.0, 1.0, light));
+    batch_tri(b, tex, tv(p0, 0.0, 0.0, light), tv(p2, 1.0, 1.0, light), tv(p3, 0.0, 1.0, light));
+}
+
+// Render the world into batch `b`. gtex/ctex are SDL textures (grass, crate).
+export fn render_world_gpu(b, mvp, W: f64, H: f64, gtex, ctex) {
+    emit_sky(b, W, H);
+
+    // ground grid
+    let G = 26.0; let N = 16; let step = (2.0 * G) / N;
+    let glight = face_light(v3(0.0, 1.0, 0.0));
+    for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+            let x0 = 0.0 - G + i * step; let x1 = x0 + step;
+            let z0 = 0.0 - G + j * step; let z1 = z0 + step;
+            emit_quad(b, gtex,
+                project(mvp, v3(x0, 0.0, z0), W, H),
+                project(mvp, v3(x1, 0.0, z0), W, H),
+                project(mvp, v3(x1, 0.0, z1), W, H),
+                project(mvp, v3(x0, 0.0, z1), W, H),
+                glight);
+        }
+    }
+
+    // crate: 4 sides + top
+    let s = 1.6; let hgt = 2.6;
+    let x0 = 0.0 - s; let x1 = s; let z0 = 0.0 - s; let z1 = s; let y0 = 0.0; let y1 = hgt;
+    // +z, -z, +x, -x faces, then top
+    emit_quad(b, ctex,
+        project(mvp, v3(x0, y1, z1), W, H), project(mvp, v3(x1, y1, z1), W, H),
+        project(mvp, v3(x1, y0, z1), W, H), project(mvp, v3(x0, y0, z1), W, H),
+        face_light(v3(0.0, 0.0, 1.0)));
+    emit_quad(b, ctex,
+        project(mvp, v3(x1, y1, z0), W, H), project(mvp, v3(x0, y1, z0), W, H),
+        project(mvp, v3(x0, y0, z0), W, H), project(mvp, v3(x1, y0, z0), W, H),
+        face_light(v3(0.0, 0.0, 0.0 - 1.0)));
+    emit_quad(b, ctex,
+        project(mvp, v3(x1, y1, z1), W, H), project(mvp, v3(x1, y1, z0), W, H),
+        project(mvp, v3(x1, y0, z0), W, H), project(mvp, v3(x1, y0, z1), W, H),
+        face_light(v3(1.0, 0.0, 0.0)));
+    emit_quad(b, ctex,
+        project(mvp, v3(x0, y1, z0), W, H), project(mvp, v3(x0, y1, z1), W, H),
+        project(mvp, v3(x0, y0, z1), W, H), project(mvp, v3(x0, y0, z0), W, H),
+        face_light(v3(0.0 - 1.0, 0.0, 0.0)));
+    emit_quad(b, ctex,
+        project(mvp, v3(x0, y1, z0), W, H), project(mvp, v3(x1, y1, z0), W, H),
+        project(mvp, v3(x1, y1, z1), W, H), project(mvp, v3(x0, y1, z1), W, H),
+        face_light(v3(0.0, 1.0, 0.0)));
+}

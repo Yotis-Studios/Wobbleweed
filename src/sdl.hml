@@ -17,8 +17,12 @@ extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;
 extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr;
 extern fn SDL_RenderSetLogicalSize(ren: ptr, w: i32, h: i32): i32;
 extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32;
+extern fn SDL_SetTextureScaleMode(tex: ptr, mode: i32): i32;
+extern fn SDL_SetRenderDrawColor(ren: ptr, r: i32, g: i32, b: i32, a: i32): i32;
 extern fn SDL_RenderClear(ren: ptr): i32;
 extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
+extern fn SDL_RenderGeometry(ren: ptr, tex: ptr, verts: ptr, nv: i32, idx: ptr, ni: i32): i32;
+extern fn SDL_RenderReadPixels(ren: ptr, rect: ptr, fmt: u32, px: ptr, pitch: i32): i32;
 extern fn SDL_RenderPresent(ren: ptr): void;
 extern fn SDL_PollEvent(ev: ptr): i32;
 extern fn SDL_GetKeyboardState(numkeys: ptr): ptr;
@@ -37,7 +41,9 @@ let SDL_WINDOW_SHOWN = 4;
 let SDL_RENDERER_ACCELERATED = 2;
 let SDL_RENDERER_SOFTWARE = 1;
 let SDL_PIXELFORMAT_RGB24 = 386930691;        // byte order R,G,B
+let SDL_TEXTUREACCESS_STATIC = 0;
 let SDL_TEXTUREACCESS_STREAMING = 1;
+let SDL_SCALEMODE_NEAREST = 0;
 let SDL_QUIT = 256;                            // 0x100
 let SDL_KEYDOWN = 768;                         // 0x300
 let EVENT_SIZE = 256;                          // SDL_Event is 56 bytes; over-allocate
@@ -72,10 +78,13 @@ export fn window_open(title: string, width: i32, height: i32, scale: i32): objec
                                width * scale, height * scale, SDL_WINDOW_SHOWN);
     if (win == null) { eprint(`CreateWindow failed: ${SDL_GetError()}`); return null; }
 
-    // Prefer GPU-accelerated; fall back to software (e.g. headless/dummy driver).
-    let ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    // flags=0 lets SDL pick the best driver: GPU-accelerated on a real display,
+    // software when headless. (Do NOT force SDL_RENDERER_ACCELERATED — under the
+    // dummy driver the compiler backend gets a renderer that fails
+    // SDL_RenderGeometry with "Invalid renderer"; flags=0 behaves identically in
+    // the interpreter and compiler.) Fall back to explicit software if needed.
+    let ren = SDL_CreateRenderer(win, -1, 0);
     if (ren == null) { ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE); }
-    if (ren == null) { ren = SDL_CreateRenderer(win, -1, 0); }
     if (ren == null) { eprint(`CreateRenderer failed: ${SDL_GetError()}`); return null; }
     // Logical size = internal resolution; SDL scales it up to the window.
     SDL_RenderSetLogicalSize(ren, width, height);
@@ -93,6 +102,39 @@ export fn present(w: object, pixels: ptr) {
     SDL_RenderClear(w.ren);
     SDL_RenderCopy(w.ren, w.tex, null, null);
     SDL_RenderPresent(w.ren);
+}
+
+// --- GPU geometry path (SDL_RenderGeometry) ---
+
+// Upload a Wobbleweed texture ({ width, height, data: buffer }) to a static SDL
+// texture sampled with nearest (chunky). Returns the SDL_Texture ptr.
+export fn upload_texture(w: object, tex: object): ptr {
+    let t = SDL_CreateTexture(w.ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STATIC,
+                              tex.width, tex.height);
+    SDL_UpdateTexture(t, null, buffer_ptr(tex.data), tex.width * 3);
+    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_NEAREST);
+    return t;
+}
+
+// Clear the renderer to a solid color (start of a GPU frame).
+export fn clear(w: object, r: i32, g: i32, b: i32) {
+    SDL_SetRenderDrawColor(w.ren, r, g, b, 255);
+    SDL_RenderClear(w.ren);
+}
+
+// Draw `nverts` packed SDL_Vertex (20 bytes each) from `vbuf` with `sdltex`
+// (null = untextured, vertex colors only).
+export fn draw_tris(w: object, sdltex, vbuf: ptr, nverts: i32) {
+    SDL_RenderGeometry(w.ren, sdltex, vbuf, nverts, null, 0);
+}
+
+// Present the GPU frame.
+export fn present_geom(w: object) { SDL_RenderPresent(w.ren); }
+
+// Read the rendered frame back into `dst` (a width*height*3 RGB buffer) — used
+// for headless PNG verification.
+export fn read_pixels(w: object, dst) {
+    SDL_RenderReadPixels(w.ren, null, SDL_PIXELFORMAT_RGB24, buffer_ptr(dst), w.width * 3);
 }
 
 // Drain pending events. Returns { quit: bool, keys: array<i32> } where `keys`

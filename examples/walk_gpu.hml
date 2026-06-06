@@ -1,0 +1,78 @@
+// walk_gpu.hml — the real-time walkable scene, rendered on the GPU via
+// SDL_RenderGeometry. The CPU only projects vertices + lights faces; the GPU
+// rasterizes (affine UVs = the wobble, painter's sort = PS1-style occlusion).
+//
+//   WASD  move        arrows  look        Esc  quit
+//
+// Compile for smooth real-time:
+//   hemlockc examples/walk_gpu.hml -o walk_gpu && ./walk_gpu
+import { sin, cos } from "@stdlib/math";
+import { v3, v_add, v_scale } from "../src/vec.hml";
+import { tex_grass, tex_checker } from "../src/texture.hml";
+import { batch_new, batch_flush } from "../src/geom.hml";
+import { camera_mvp, render_world_gpu } from "../src/scene_gpu.hml";
+import { window_open, upload_texture, clear, present_geom, poll, keystate, held,
+         ticks, delay, window_close,
+         SC_W, SC_A, SC_S, SC_D, SC_LEFT, SC_RIGHT, SC_UP, SC_DOWN } from "../src/sdl.hml";
+
+let W = 320; let H = 240;
+
+fn main() {
+    let win = window_open("Wobbleweed", W, H, 3);
+    if (win == null) { eprint("could not open window"); return; }
+
+    let gtex = upload_texture(win, tex_grass(64, 64));
+    let ctex = upload_texture(win, tex_checker(64, 64, 4));
+    let b = batch_new(4096);
+
+    let pos = v3(4.0, 2.0, 10.0);
+    let yaw = 0.0 - 0.35;
+    let pitch = 0.0 - 0.08;
+    let move_speed = 0.18;
+    let turn_speed = 0.045;
+
+    let running = true;
+    let frame = 0;
+    let t0 = ticks();
+
+    while (running) {
+        let ev = poll(win);
+        if (ev.quit) { running = false; }
+        let ks = keystate();
+
+        if (held(ks, SC_LEFT))  { yaw = yaw - turn_speed; }
+        if (held(ks, SC_RIGHT)) { yaw = yaw + turn_speed; }
+        if (held(ks, SC_UP))    { pitch = pitch + turn_speed; }
+        if (held(ks, SC_DOWN))  { pitch = pitch - turn_speed; }
+        if (pitch > 1.4) { pitch = 1.4; }
+        if (pitch < 0.0 - 1.4) { pitch = 0.0 - 1.4; }
+
+        let fwd = v3(sin(yaw), 0.0, 0.0 - cos(yaw));
+        let rgt = v3(cos(yaw), 0.0, sin(yaw));
+        if (held(ks, SC_W)) { pos = v_add(pos, v_scale(fwd, move_speed)); }
+        if (held(ks, SC_S)) { pos = v_add(pos, v_scale(fwd, 0.0 - move_speed)); }
+        if (held(ks, SC_D)) { pos = v_add(pos, v_scale(rgt, move_speed)); }
+        if (held(ks, SC_A)) { pos = v_add(pos, v_scale(rgt, 0.0 - move_speed)); }
+
+        let look = v3(sin(yaw) * cos(pitch), sin(pitch), (0.0 - cos(yaw)) * cos(pitch));
+        let target = v_add(pos, look);
+        let mvp = camera_mvp(pos, target, W, H);
+
+        clear(win, 0, 0, 0);
+        render_world_gpu(b, mvp, W, H, gtex, ctex);
+        batch_flush(win, b);
+        present_geom(win);
+
+        frame = frame + 1;
+        if (frame % 60 == 0) {
+            let secs = (ticks() - t0) / 1000.0;
+            eprint(`frame ${frame}  ~${i32(frame / secs)} fps`);
+        }
+        delay(4);
+    }
+
+    window_close(win);
+    print("bye");
+}
+
+main();

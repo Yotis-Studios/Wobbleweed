@@ -1,0 +1,37 @@
+// geom_scene.hml — render the world through the GPU backend
+// (SDL_RenderGeometry) and save a PNG, so we can verify the GPU path headlessly.
+import { window_open, upload_texture, clear, present_geom, read_pixels,
+         window_close } from "../src/sdl.hml";
+import { v3 } from "../src/vec.hml";
+import { tex_grass, tex_checker } from "../src/texture.hml";
+import { batch_new, batch_flush } from "../src/geom.hml";
+import { camera_mvp, render_world_gpu } from "../src/scene_gpu.hml";
+import { write_png } from "../src/png.hml";
+
+let W = 320; let H = 240;
+
+fn main() {
+    let win = window_open("Wobbleweed (GPU)", W, H, 1);
+    if (win == null) { eprint("window failed"); return; }
+
+    let gtex = upload_texture(win, tex_grass(64, 64));
+    let ctex = upload_texture(win, tex_checker(64, 64, 4));
+
+    let mvp = camera_mvp(v3(3.0, 2.2, 9.0), v3(0.0, 1.4, 0.0), W, H);
+    let b = batch_new(2048);
+
+    clear(win, 0, 0, 0);
+    render_world_gpu(b, mvp, W, H, gtex, ctex);
+    batch_flush(win, b);
+
+    // read the backbuffer BEFORE presenting (after present its contents are
+    // undefined under the software renderer)
+    let px = buffer(W * H * 3);
+    read_pixels(win, px);
+    present_geom(win);
+    write_png("/tmp/geom_scene.png", px, W, H);
+    print("wrote /tmp/geom_scene.png");
+    window_close(win);
+}
+
+main();

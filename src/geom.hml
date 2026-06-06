@@ -1,0 +1,71 @@
+// geom.hml — the GPU triangle backend.
+//
+// The CPU still owns transform + projection + lighting; this module takes the
+// resulting screen-space triangles (with UV and per-vertex Gouraud color),
+// sorts them back-to-front (painter's algorithm — exactly how PS1 hardware
+// ordered primitives, no z-buffer), batches runs of the same texture, and hands
+// each batch to SDL_RenderGeometry. Texture UVs interpolate affinely because
+// SDL_Vertex is 2D — that's the wobble, GPU-rasterized.
+//
+// A vertex is { x, y (screen px), z (ndc depth, larger = farther), u, v,
+// r, g, b }. For textured triangles set r=g=b=light*255 (the color modulates
+// the texture -> Gouraud shading). For solid triangles pass the real color and
+// a null texture.
+
+import { draw_tris } from "./sdl.hml";
+
+let VSTRIDE = 20;   // bytes per SDL_Vertex: pos(f32x2) color(u8x4) uv(f32x2)
+
+fn put_vert(buf: ptr, vi: i32, v) {
+    let o = vi * VSTRIDE;
+    ptr_write_f32(ptr_offset(buf, o, 1), v.x);
+    ptr_write_f32(ptr_offset(buf, o + 4, 1), v.y);
+    ptr_write_u8(ptr_offset(buf, o + 8, 1), v.r & 255);
+    ptr_write_u8(ptr_offset(buf, o + 9, 1), v.g & 255);
+    ptr_write_u8(ptr_offset(buf, o + 10, 1), v.b & 255);
+    ptr_write_u8(ptr_offset(buf, o + 11, 1), 255);
+    ptr_write_f32(ptr_offset(buf, o + 12, 1), v.u);
+    ptr_write_f32(ptr_offset(buf, o + 16, 1), v.v);
+}
+
+// Create a batch that can hold up to `max_tris` triangles per frame.
+export fn batch_new(max_tris: i32) {
+    return { tris: [], buf: alloc(max_tris * 3 * VSTRIDE), cap: max_tris };
+}
+
+export fn batch_reset(b) { b.tris = []; }
+
+// Queue one triangle. `tex` is an SDL texture ptr (null = untextured).
+export fn batch_tri(b, tex, a, bb, c) {
+    let depth = (a.z + bb.z + c.z) / 3.0;
+    b.tris.push({ tex: tex, depth: depth, a: a, b: bb, c: c });
+}
+
+// Sort back-to-front and emit one SDL_RenderGeometry call per same-texture run.
+export fn batch_flush(w, b) {
+    let tris = b.tris;
+    // painter's order: farthest (largest ndc z) drawn first
+    tris.sort(fn(p, q) {
+        if (p.depth > q.depth) { return 0 - 1; }
+        if (p.depth < q.depth) { return 1; }
+        return 0;
+    });
+    let buf = b.buf;
+    let n = tris.length;
+    let i = 0;
+    while (i < n) {
+        let tex = tris[i].tex;
+        let vi = 0;
+        let j = i;
+        while (j < n && tris[j].tex == tex) {
+            let t = tris[j];
+            put_vert(buf, vi, t.a); vi = vi + 1;
+            put_vert(buf, vi, t.b); vi = vi + 1;
+            put_vert(buf, vi, t.c); vi = vi + 1;
+            j = j + 1;
+        }
+        draw_tris(w, tex, buf, vi);
+        i = j;
+    }
+    b.tris = [];
+}
