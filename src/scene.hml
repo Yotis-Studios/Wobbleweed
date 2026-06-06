@@ -1,0 +1,78 @@
+// scene.hml — draws the demo world (textured ground + a crate) from a camera.
+// Shared by the PNG screenshot test and the real-time SDL walk demo, so what you
+// see in a still is exactly what you walk around in.
+
+import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul,
+         mat_perspective, mat_look_at } from "./vec.hml";
+import { fb_clear_sky } from "./framebuffer.hml";
+import { fill_tri_tex } from "./raster.hml";
+
+let SUN = v_norm(v3(0.4, 1.0, 0.55));   // direction toward the light
+let AMBIENT = 0.45;
+
+fn project(mvp, v, W: f64, H: f64) {
+    let c = mat_apply(mvp, v);
+    if (c.w < 0.0001) { return null; }
+    let inv = 1.0 / c.w;
+    return { x: (c.x * inv * 0.5 + 0.5) * W,
+             y: (1.0 - (c.y * inv * 0.5 + 0.5)) * H,
+             z: c.z * inv };
+}
+
+fn face_light(n) {
+    let d = v_dot(n, SUN);
+    if (d < 0.0) { d = 0.0; }
+    return AMBIENT + (1.0 - AMBIENT) * d;
+}
+
+// Build a perspective + look-at MVP for a camera at `eye` facing `target`.
+export fn camera_mvp(eye, target, w: i32, h: i32) {
+    let proj = mat_perspective(1.15, w / h, 0.1, 200.0);
+    let view = mat_look_at(eye, target, v3(0.0, 1.0, 0.0));
+    return mat_mul(proj, view);
+}
+
+// Render the world into `fb` using a precomputed mvp.
+export fn render_world(fb, mvp, grass, crate) {
+    let W = fb.width; let H = fb.height;
+    let Wf = W; let Hf = H;
+    fb_clear_sky(fb, 66, 108, 198, 150, 185, 225);
+
+    // --- ground: grid of small textured quads (affine swim) ---
+    let G = 26.0; let N = 16; let step = (2.0 * G) / N;
+    let gl = face_light(v3(0.0, 1.0, 0.0));
+    for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+            let x0 = 0.0 - G + i * step; let x1 = x0 + step;
+            let z0 = 0.0 - G + j * step; let z1 = z0 + step;
+            let p0 = project(mvp, v3(x0,0.0,z0), Wf, Hf);
+            let p1 = project(mvp, v3(x1,0.0,z0), Wf, Hf);
+            let p2 = project(mvp, v3(x1,0.0,z1), Wf, Hf);
+            let p3 = project(mvp, v3(x0,0.0,z1), Wf, Hf);
+            if (p0 == null || p1 == null || p2 == null || p3 == null) { continue; }
+            fill_tri_tex(fb, p0.x,p0.y,p0.z, 0.0,0.0,gl, p1.x,p1.y,p1.z, 1.0,0.0,gl, p2.x,p2.y,p2.z, 1.0,1.0,gl, grass);
+            fill_tri_tex(fb, p0.x,p0.y,p0.z, 0.0,0.0,gl, p2.x,p2.y,p2.z, 1.0,1.0,gl, p3.x,p3.y,p3.z, 0.0,1.0,gl, grass);
+        }
+    }
+
+    // --- crate: a textured box sitting on the ground ---
+    let s = 1.6; let hgt = 2.6;
+    let cv = [v3(0.0-s,0.0,0.0-s), v3(s,0.0,0.0-s), v3(s,hgt,0.0-s), v3(0.0-s,hgt,0.0-s),
+             v3(0.0-s,0.0,s),     v3(s,0.0,s),     v3(s,hgt,s),     v3(0.0-s,hgt,s)];
+    // faces: corner indices + outward normal (front/back/left/right/top)
+    let cf = [
+      { i: [0,1,2,3], n: v3(0.0,0.0,-1.0) },
+      { i: [5,4,7,6], n: v3(0.0,0.0,1.0) },
+      { i: [4,0,3,7], n: v3(-1.0,0.0,0.0) },
+      { i: [1,5,6,2], n: v3(1.0,0.0,0.0) },
+      { i: [3,2,6,7], n: v3(0.0,1.0,0.0) },
+    ];
+    for (f in cf) {
+        let L = face_light(f.n);
+        let q = [];
+        for (idx in f.i) { q.push(project(mvp, cv[idx], Wf, Hf)); }
+        if (q[0] == null || q[1] == null || q[2] == null || q[3] == null) { continue; }
+        fill_tri_tex(fb, q[0].x,q[0].y,q[0].z, 0.0,0.0,L, q[1].x,q[1].y,q[1].z, 1.0,0.0,L, q[2].x,q[2].y,q[2].z, 1.0,1.0,L, crate);
+        fill_tri_tex(fb, q[0].x,q[0].y,q[0].z, 0.0,0.0,L, q[2].x,q[2].y,q[2].z, 1.0,1.0,L, q[3].x,q[3].y,q[3].z, 0.0,1.0,L, crate);
+    }
+}

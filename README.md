@@ -44,7 +44,7 @@ window: `SDL_VIDEODRIVER=dummy hemlock examples/plasma.hml`.
 - [ ] vec3 / 4×4 matrix math, perspective + look-at camera
 - [ ] triangle rasterizer (affine UV, z-buffer, Gouraud) — the retro core
 - [ ] OBJ mesh loader + textures
-- [ ] input-driven free camera; fixed-timestep loop
+- [x] input-driven free camera (WASD + arrows), real-time SDL loop
 - [ ] retro post-fx (5-bit color + ordered dither, vertex jitter)
 - [ ] PNG sink for screenshots
 

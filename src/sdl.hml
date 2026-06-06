@@ -21,6 +21,7 @@ extern fn SDL_RenderClear(ren: ptr): i32;
 extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
 extern fn SDL_RenderPresent(ren: ptr): void;
 extern fn SDL_PollEvent(ev: ptr): i32;
+extern fn SDL_GetKeyboardState(numkeys: ptr): ptr;
 extern fn SDL_Delay(ms: u32): void;
 extern fn SDL_GetTicks(): u32;
 extern fn SDL_GetError(): string;
@@ -53,6 +54,12 @@ export let KEY_W = 119;
 export let KEY_A = 97;
 export let KEY_S = 115;
 export let KEY_D = 100;
+
+// SDL_Scancode values, for held-key polling via SDL_GetKeyboardState.
+export let SC_A = 4;  export let SC_D = 7;  export let SC_E = 8;
+export let SC_Q = 20; export let SC_S = 22; export let SC_W = 26;
+export let SC_RIGHT = 79; export let SC_LEFT = 80; export let SC_DOWN = 81; export let SC_UP = 82;
+export let SC_LSHIFT = 225; export let SC_SPACE = 44;
 
 // Open a window sized width*height, scaled up by `scale` (nearest, chunky).
 // Returns { win, ren, tex, ev, width, height } or null on failure.
@@ -104,6 +111,13 @@ export fn poll(w: object): object {
         }
     }
     return { quit: quit, keys: keys };
+}
+
+// Continuous (held) keyboard state — call after poll() each frame. Returns a
+// pointer into SDL's scancode→pressed(0/1) array; query with held(state, SC_*).
+export fn keystate(): ptr { return SDL_GetKeyboardState(null); }
+export fn held(state: ptr, scancode: i32): bool {
+    return ptr_deref_u8(ptr_offset(state, scancode, 1)) != 0;
 }
 
 export fn ticks(): i32 { return SDL_GetTicks(); }
