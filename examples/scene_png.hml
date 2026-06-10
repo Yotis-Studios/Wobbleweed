@@ -5,6 +5,7 @@
 import { v3 } from "../src/vec.hml";
 import { fb_new, fb_save } from "../src/framebuffer.hml";
 import { camera_mvp, render_world } from "../src/scene.hml";
+import { fb_retro } from "../src/postfx.hml";
 import { tex_grass, tex_checker } from "../src/texture.hml";
 
 let W = 320; let H = 240;
@@ -15,6 +16,7 @@ fn main() {
     let crate = tex_checker(32, 32, 4);
     let mvp = camera_mvp(v3(3.0, 2.2, 9.0), v3(0.0, 1.4, 0.0), W, H);
     render_world(fb, mvp, 0.0 - 0.32, 0.0 - 0.08, grass, crate);
+    fb_retro(fb);   // 5-bit + PS1 ordered dither
     fb_save(fb, "/tmp/scene_render.png");
     print("wrote /tmp/scene_render.png");
 }

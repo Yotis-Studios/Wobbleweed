@@ -1,0 +1,38 @@
+// postfx.hml — the PS1 finishing pass for the CPU framebuffer.
+//
+// PS1 video output was 15-bit color (5 bits per channel); the GPU hid the
+// banding by adding a fixed 4x4 ordered-dither pattern before truncating.
+// This is that exact pattern (from psx-spx: the GPU's dither offsets), so
+// smooth gradients — the sky — break into the signature checkered grain.
+//
+// Only the CPU path can run this (it owns every pixel); the GPU path stays
+// smooth 8-bit, which is its own kind of period-accurate (PS2-era smoothness).
+
+// PS1 GPU dither offsets, row-major 4x4, applied per channel.
+let DITHER = [
+    -4,  0, -3,  1,
+     2, -2,  3, -1,
+    -3,  1, -4,  0,
+     3, -1,  2, -2,
+];
+
+// Quantize the framebuffer to 5 bits/channel with ordered dither, then expand
+// back to 8 bits (v | v>>5) so full white stays full white on screen.
+export fn fb_retro(fb) {
+    let w = fb.width; let h = fb.height; let c = fb.color;
+    for (let y = 0; y < h; y++) {
+        let row = y * w;
+        let drow = (y & 3) * 4;
+        for (let x = 0; x < w; x++) {
+            let d = DITHER[drow + (x & 3)];
+            let o = (row + x) * 3;
+            for (let k = 0; k < 3; k++) {
+                let v = c[o + k] + d;
+                if (v < 0) { v = 0; }
+                if (v > 255) { v = 255; }
+                v = v & 248;             // keep the top 5 bits
+                c[o + k] = v | (v >> 5);
+            }
+        }
+    }
+}

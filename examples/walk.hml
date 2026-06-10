@@ -1,6 +1,6 @@
 // walk.hml — a real-time, walkable retro scene in an SDL window.
 //
-//   WASD  move        arrows  look        Esc  quit
+//   WASD  move        arrows  look        Space  toggle dither        Esc  quit
 //
 // Renders the same world as scene_png.hml into the framebuffer every frame and
 // presents it through SDL. Compile for smooth real-time:
@@ -11,8 +11,10 @@ import { sin, cos } from "@stdlib/math";
 import { v3, v_add, v_scale } from "../src/vec.hml";
 import { fb_new } from "../src/framebuffer.hml";
 import { camera_mvp, render_world } from "../src/scene.hml";
+import { fb_retro } from "../src/postfx.hml";
 import { tex_grass, tex_checker } from "../src/texture.hml";
 import { window_open, present, poll, keystate, held, ticks, delay, window_close,
+         KEY_SPACE,
          SC_W, SC_A, SC_S, SC_D, SC_LEFT, SC_RIGHT, SC_UP, SC_DOWN } from "../src/sdl.hml";
 
 let W = 320; let H = 240;
@@ -32,6 +34,7 @@ fn main() {
 
     let move_speed = 0.18;
     let turn_speed = 0.045;
+    let retro = true;     // Space toggles the 5-bit dither pass
 
     let running = true;
     let frame = 0;
@@ -40,6 +43,9 @@ fn main() {
     while (running) {
         let ev = poll(win);
         if (ev.quit) { running = false; }
+        for (k in ev.keys) {
+            if (k == KEY_SPACE) { retro = !retro; }
+        }
         let ks = keystate();
 
         // look
@@ -64,6 +70,7 @@ fn main() {
 
         let mvp = camera_mvp(pos, target, W, H);
         render_world(fb, mvp, yaw, pitch, grass, crate);
+        if (retro) { fb_retro(fb); }
         present(win, buffer_ptr(fb.color));
 
         frame = frame + 1;

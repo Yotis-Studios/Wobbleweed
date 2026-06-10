@@ -6,6 +6,7 @@
 // perspective divide -> rasterizer, so geometry right up against (or behind)
 // the camera gets cut cleanly instead of popping out.
 
+import { floor } from "@stdlib/math";
 import { v3, v_norm, v_dot, mat_apply, mat_mul,
          mat_perspective, mat_look_at } from "./vec.hml";
 import { fill_tri_tex } from "./raster.hml";
@@ -35,11 +36,13 @@ fn cv(mvp, p, u: f64, v: f64, l: f64) {
 }
 
 // Perspective divide + viewport transform. Only called on vertices that
-// survived the near clip, so w is always safely positive.
+// survived the near clip, so w is always safely positive. Screen x/y snap to
+// whole pixels — the PS1 had no subpixel precision, and that snap is what
+// makes edges shimmer ("vertex jitter") when the camera moves.
 fn to_screen(v, W: f64, H: f64) {
     let inv = 1.0 / v.w;
-    return { x: (v.x * inv * 0.5 + 0.5) * W,
-             y: (1.0 - (v.y * inv * 0.5 + 0.5)) * H,
+    return { x: floor((v.x * inv * 0.5 + 0.5) * W + 0.5),
+             y: floor((1.0 - (v.y * inv * 0.5 + 0.5)) * H + 0.5),
              z: v.z * inv, u: v.u, v: v.v, l: v.l };
 }
 

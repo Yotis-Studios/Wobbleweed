@@ -9,6 +9,7 @@
 // (shared clip.hml), so walking into geometry cuts it cleanly instead of
 // popping whole quads.
 
+import { floor } from "@stdlib/math";
 import { v3, v_norm, v_dot, mat_apply, mat_mul,
          mat_perspective, mat_look_at } from "./vec.hml";
 import { batch_tri } from "./geom.hml";
@@ -37,13 +38,14 @@ fn cv(mvp, p, u: f64, v: f64, l: f64) {
 
 // Perspective divide + viewport -> a geom vertex. The gray Gouraud color is
 // light*255 (it modulates the texture). Only called after the near clip, so w
-// is safely positive.
+// is safely positive. Screen x/y snap to whole pixels like the PS1 (no
+// subpixel precision = the vertex jitter), same as the CPU path.
 fn to_screen(v, W: f64, H: f64) {
     let inv = 1.0 / v.w;
     let c = i32(v.l * 255.0);
     if (c > 255) { c = 255; } if (c < 0) { c = 0; }
-    return { x: (v.x * inv * 0.5 + 0.5) * W,
-             y: (1.0 - (v.y * inv * 0.5 + 0.5)) * H,
+    return { x: floor((v.x * inv * 0.5 + 0.5) * W + 0.5),
+             y: floor((1.0 - (v.y * inv * 0.5 + 0.5)) * H + 0.5),
              z: v.z * inv, u: v.u, v: v.v, r: c, g: c, b: c };
 }
 
