@@ -7,15 +7,17 @@
 // the camera gets cut cleanly instead of popping out.
 
 import { floor } from "@stdlib/math";
-import { v3, v_norm, v_dot, mat_apply, mat_mul,
+import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul, mat_translate,
          mat_perspective, mat_look_at } from "./vec.hml";
-import { fill_tri_tex } from "./raster.hml";
+import { fill_tri_tex, fill_tri_shade } from "./raster.hml";
 import { clip_tri_near } from "./clip.hml";
+import { load_obj, palette } from "./obj.hml";
 import { draw_sky } from "./sky.hml";
 
 let SUN = v_norm(v3(0.4, 1.0, 0.55));   // direction toward the light
 let AMBIENT = 0.45;
 
+// Lambert ramp for a unit normal — used per face (flat) and per vertex (Gouraud).
 fn face_light(n) {
     let d = v_dot(n, SUN);
     if (d < 0.0) { d = 0.0; }
@@ -69,9 +71,47 @@ fn draw_quad(fb, mvp, p0, p1, p2, p3, light: f64, tex, W: f64, H: f64) {
     draw_tri(fb, a, c, d, tex, W, H);
 }
 
+// --- OBJ meshes, lit per vertex (Gouraud) ---
+
+// The demo tree + its colors, bundled so examples just pass it around.
+export fn load_tree(path: string) {
+    let mesh = load_obj(path);
+    let colors = palette(mesh, { trunk:  { r: 112, g: 78, b: 46 },
+                                 leaves: { r: 58, g: 138, b: 62 } },
+                         { r: 160, g: 160, b: 160 });
+    return { mesh: mesh, colors: colors };
+}
+
+// Solid-color Gouraud mesh: light each vertex from its smooth normal, then
+// near-clip and rasterize (light rides the clip verts' `l` slot).
+export fn render_mesh(fb, mvp, tree, model, W: f64, H: f64) {
+    let mesh = tree.mesh; let colors = tree.colors;
+    let mm = mat_mul(mvp, model);
+    for (f in mesh.faces) {
+        let col = colors[f.m];
+        let la = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.na])));
+        let lb = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.nb])));
+        let lc = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.nc])));
+        let a = cv(mm, mesh.pos[f.pa], 0.0, 0.0, la);
+        let b = cv(mm, mesh.pos[f.pb], 0.0, 0.0, lb);
+        let c = cv(mm, mesh.pos[f.pc], 0.0, 0.0, lc);
+        let tris = clip_tri_near(a, b, c);
+        for (t in tris) {
+            let p0 = to_screen(t[0], W, H);
+            let p1 = to_screen(t[1], W, H);
+            let p2 = to_screen(t[2], W, H);
+            fill_tri_shade(fb, p0.x, p0.y, p0.z, p0.l,
+                               p1.x, p1.y, p1.z, p1.l,
+                               p2.x, p2.y, p2.z, p2.l,
+                               col.r, col.g, col.b);
+        }
+    }
+}
+
 // Render the world into `fb` using a precomputed mvp. `yaw`/`pitch` drive the
-// sky's cloud panning so it matches where the camera looks.
-export fn render_world(fb, mvp, yaw, pitch, grass, crate) {
+// sky's cloud panning so it matches where the camera looks. `tree` is a
+// load_tree() bundle.
+export fn render_world(fb, mvp, yaw, pitch, grass, crate, tree) {
     let Wf = fb.width; let Hf = fb.height;
     draw_sky(fb, yaw, pitch);
 
@@ -103,4 +143,7 @@ export fn render_world(fb, mvp, yaw, pitch, grass, crate) {
         draw_quad(fb, mvp, pts[f.i[0]], pts[f.i[1]], pts[f.i[2]], pts[f.i[3]],
                   face_light(f.n), crate, Wf, Hf);
     }
+
+    // --- the tree: an OBJ mesh, Gouraud-lit from smooth normals ---
+    render_mesh(fb, mvp, tree, mat_translate(-5.0, 0.0, -3.0), Wf, Hf);
 }

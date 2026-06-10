@@ -10,10 +10,11 @@
 // popping whole quads.
 
 import { floor } from "@stdlib/math";
-import { v3, v_norm, v_dot, mat_apply, mat_mul,
+import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul, mat_translate,
          mat_perspective, mat_look_at } from "./vec.hml";
 import { batch_tri } from "./geom.hml";
 import { clip_tri_near, clip_tri_rect } from "./clip.hml";
+import { load_obj, palette } from "./obj.hml";
 
 let SUN = v_norm(v3(0.4, 1.0, 0.55));
 let AMBIENT = 0.45;
@@ -97,6 +98,50 @@ fn emit_sky(b, skytex, yaw: f64, W: f64, H: f64) {
     }
 }
 
+// --- OBJ meshes, lit per vertex (Gouraud) ---
+
+// The demo tree + its colors, bundled so examples just pass it around.
+export fn load_tree(path: string) {
+    let mesh = load_obj(path);
+    let colors = palette(mesh, { trunk:  { r: 112, g: 78, b: 46 },
+                                 leaves: { r: 58, g: 138, b: 62 } },
+                         { r: 160, g: 160, b: 160 });
+    return { mesh: mesh, colors: colors };
+}
+
+// Solid-color Gouraud mesh: light each vertex from its smooth normal and bake
+// color*light into the vertex color; the GPU interpolates (untextured tris,
+// tex = null). Near-clip + guard band as usual — the gray from to_screen gets
+// recolored per channel.
+fn recolor(v, col) {
+    return { x: v.x, y: v.y, z: v.z, u: 0.0, v: 0.0,
+             r: i32(col.r * v.r / 255.0), g: i32(col.g * v.g / 255.0),
+             b: i32(col.b * v.b / 255.0) };
+}
+
+export fn render_mesh_gpu(b, mvp, tree, model, W: f64, H: f64) {
+    let mesh = tree.mesh; let colors = tree.colors;
+    let mm = mat_mul(mvp, model);
+    let m = 2.0 * W;
+    for (f in mesh.faces) {
+        let col = colors[f.m];
+        let la = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.na])));
+        let lb = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.nb])));
+        let lc = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.nc])));
+        let va = cv(mm, mesh.pos[f.pa], 0.0, 0.0, la);
+        let vb = cv(mm, mesh.pos[f.pb], 0.0, 0.0, lb);
+        let vc = cv(mm, mesh.pos[f.pc], 0.0, 0.0, lc);
+        let tris = clip_tri_near(va, vb, vc);
+        for (t in tris) {
+            let p0 = recolor(to_screen(t[0], W, H), col);
+            let p1 = recolor(to_screen(t[1], W, H), col);
+            let p2 = recolor(to_screen(t[2], W, H), col);
+            let st = clip_tri_rect(p0, p1, p2, 0.0 - m, 0.0 - m, W + m, H + m);
+            for (s in st) { batch_tri(b, null, s[0], s[1], s[2]); }
+        }
+    }
+}
+
 // Textured quad p0..p3 (world space, UVs (0,0)(1,0)(1,1)(0,1)).
 fn emit_quad(b, tex, mvp, p0, p1, p2, p3, light: f64, W: f64, H: f64) {
     let a = cv(mvp, p0, 0.0, 0.0, light);
@@ -107,8 +152,9 @@ fn emit_quad(b, tex, mvp, p0, p1, p2, p3, light: f64, W: f64, H: f64) {
     draw_tri(b, tex, a, c, d, W, H);
 }
 
-// Render the world into batch `b`. gtex/ctex are SDL textures (grass, crate).
-export fn render_world_gpu(b, mvp, yaw: f64, W: f64, H: f64, gtex, ctex, skytex) {
+// Render the world into batch `b`. gtex/ctex are SDL textures (grass, crate);
+// `tree` is a load_tree() bundle.
+export fn render_world_gpu(b, mvp, yaw: f64, W: f64, H: f64, gtex, ctex, skytex, tree) {
     emit_sky(b, skytex, yaw, W, H);
 
     // ground grid
@@ -142,4 +188,7 @@ export fn render_world_gpu(b, mvp, yaw: f64, W: f64, H: f64, gtex, ctex, skytex)
     emit_quad(b, ctex, mvp,
         v3(x0, y1, z0), v3(x1, y1, z0), v3(x1, y1, z1), v3(x0, y1, z1),
         face_light(v3(0.0, 1.0, 0.0)), W, H);
+
+    // the tree: an OBJ mesh, Gouraud-lit from smooth normals
+    render_mesh_gpu(b, mvp, tree, mat_translate(-5.0, 0.0, -3.0), W, H);
 }

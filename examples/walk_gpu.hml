@@ -10,7 +10,7 @@ import { sin, cos } from "@stdlib/math";
 import { v3, v_add, v_scale } from "../src/vec.hml";
 import { tex_grass, tex_checker, tex_sky } from "../src/texture.hml";
 import { batch_new, batch_flush } from "../src/geom.hml";
-import { camera_mvp, render_world_gpu } from "../src/scene_gpu.hml";
+import { camera_mvp, render_world_gpu, load_tree } from "../src/scene_gpu.hml";
 import { window_open, upload_texture, clear, present_geom, poll, keystate, held,
          ticks, delay, window_close,
          SC_W, SC_A, SC_S, SC_D, SC_LEFT, SC_RIGHT, SC_UP, SC_DOWN } from "../src/sdl.hml";
@@ -24,6 +24,7 @@ fn main() {
     let gtex = upload_texture(win, tex_grass(64, 64));
     let ctex = upload_texture(win, tex_checker(64, 64, 4));
     let skytex = upload_texture(win, tex_sky(320, 128));
+    let tree = load_tree("assets/tree.obj");
     let b = batch_new(4096);
 
     let pos = v3(4.0, 2.0, 10.0);
@@ -60,7 +61,7 @@ fn main() {
         let mvp = camera_mvp(pos, target, W, H);
 
         clear(win, 0, 0, 0);
-        render_world_gpu(b, mvp, yaw, W, H, gtex, ctex, skytex);
+        render_world_gpu(b, mvp, yaw, W, H, gtex, ctex, skytex, tree);
         batch_flush(win, b);
         present_geom(win);
 

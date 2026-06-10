@@ -1,0 +1,104 @@
+// obj.hml — a minimal Wavefront OBJ loader.
+//
+// Supports v / vt / vn / f with every face index form (v, v/t, v/t/n, v//n;
+// negative indices count from the end) — polygons fan-triangulate. usemtl is
+// tracked by name so one file can carry differently-colored parts without a
+// .mtl parser; map the names to colors with palette() below.
+//
+// If the file has no vn records, smooth per-vertex normals are computed by
+// summing area-weighted face normals — which is exactly what per-vertex
+// Gouraud lighting wants on low-poly meshes.
+
+import { v3, v_add, v_sub, v_cross, v_norm } from "./vec.hml";
+
+fn parse_idx(s: string, n: i32): i32 {
+    let k = i32(s);
+    if (k < 0) { return n + k; }   // negative = relative to end
+    return k - 1;                  // OBJ counts from 1
+}
+
+// A face corner "p/t/n" (t, n optional) -> { p, t, n } with -1 for absent.
+fn parse_corner(s: string, np: i32, nt: i32, nn: i32) {
+    let seg = s.split("/");
+    let p = parse_idx(seg[0], np);
+    let t = -1; let n = -1;
+    if (seg.length > 1 && seg[1].length > 0) { t = parse_idx(seg[1], nt); }
+    if (seg.length > 2 && seg[2].length > 0) { n = parse_idx(seg[2], nn); }
+    return { p: p, t: t, n: n };
+}
+
+// Load an OBJ file. Returns
+//   { pos:   array<vec3>,
+//     uv:    array<{u,v}>          (v flipped: OBJ counts from the bottom),
+//     nrm:   array<vec3>           (computed if the file has none),
+//     faces: array<{pa,pb,pc, ta,tb,tc, na,nb,nc, m}>,
+//     mats:  array<string>         (usemtl names in first-use order) }
+export fn load_obj(path: string) {
+    let pos = []; let uv = []; let nrm = [];
+    let faces = [];
+    let mats = [];
+    let cur = 0;
+
+    for (line in __read_file(path).split("\n")) {
+        let toks = [];
+        for (t in line.replace("\t", " ").split(" ")) {
+            if (t.length > 0) { toks.push(t); }
+        }
+        if (toks.length == 0 || toks[0].starts_with("#")) { continue; }
+        let kind = toks[0];
+
+        if (kind == "v" && toks.length >= 4) {
+            pos.push(v3(f64(toks[1]), f64(toks[2]), f64(toks[3])));
+        } else if (kind == "vt" && toks.length >= 3) {
+            uv.push({ u: f64(toks[1]), v: 1.0 - f64(toks[2]) });
+        } else if (kind == "vn" && toks.length >= 4) {
+            nrm.push(v3(f64(toks[1]), f64(toks[2]), f64(toks[3])));
+        } else if (kind == "usemtl" && toks.length >= 2) {
+            cur = -1;
+            for (let i = 0; i < mats.length; i++) {
+                if (mats[i] == toks[1]) { cur = i; }
+            }
+            if (cur < 0) { mats.push(toks[1]); cur = mats.length - 1; }
+        } else if (kind == "f" && toks.length >= 4) {
+            let c0 = parse_corner(toks[1], pos.length, uv.length, nrm.length);
+            let prev = parse_corner(toks[2], pos.length, uv.length, nrm.length);
+            for (let i = 3; i < toks.length; i++) {
+                let c = parse_corner(toks[i], pos.length, uv.length, nrm.length);
+                faces.push({ pa: c0.p, pb: prev.p, pc: c.p,
+                             ta: c0.t, tb: prev.t, tc: c.t,
+                             na: c0.n, nb: prev.n, nc: c.n, m: cur });
+                prev = c;
+            }
+        }
+    }
+
+    // No normals in the file: build smooth ones (area-weighted face normals
+    // summed per vertex), and point every corner at its position's normal.
+    if (nrm.length == 0) {
+        for (let i = 0; i < pos.length; i++) { nrm.push(v3(0.0, 0.0, 0.0)); }
+        for (f in faces) {
+            let n = v_cross(v_sub(pos[f.pb], pos[f.pa]),
+                            v_sub(pos[f.pc], pos[f.pa]));
+            nrm[f.pa] = v_add(nrm[f.pa], n);
+            nrm[f.pb] = v_add(nrm[f.pb], n);
+            nrm[f.pc] = v_add(nrm[f.pc], n);
+        }
+        for (let i = 0; i < nrm.length; i++) { nrm[i] = v_norm(nrm[i]); }
+        for (f in faces) { f.na = f.pa; f.nb = f.pb; f.nc = f.pc; }
+    }
+
+    return { pos: pos, uv: uv, nrm: nrm, faces: faces, mats: mats };
+}
+
+// Map a mesh's material names to colors: `table` is { name: {r,g,b} }, `def`
+// fills the gaps (and slot 0 when the file has no usemtl at all). Returns an
+// array indexed by face.m.
+export fn palette(mesh, table, def) {
+    let out = [];
+    for (name in mesh.mats) {
+        let c = table[name];
+        out.push(c == null ? def : c);
+    }
+    if (out.length == 0) { out.push(def); }
+    return out;
+}

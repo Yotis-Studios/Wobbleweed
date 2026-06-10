@@ -1,10 +1,11 @@
-// scene_png.hml — render the demo world (ground + crate) from a fixed camera to
-// a PNG. Same renderer the real-time walk demo uses.
+// scene_png.hml — render the demo world (ground + crate + tree) from a fixed
+// camera to a PNG. Same renderer the real-time walk demo uses.
 //   ./hemlock examples/scene_png.hml  ->  /tmp/scene_render.png
+// (run from the repo root: the tree mesh loads from assets/tree.obj)
 
 import { v3 } from "../src/vec.hml";
 import { fb_new, fb_save } from "../src/framebuffer.hml";
-import { camera_mvp, render_world } from "../src/scene.hml";
+import { camera_mvp, render_world, load_tree } from "../src/scene.hml";
 import { fb_retro } from "../src/postfx.hml";
 import { tex_grass, tex_checker } from "../src/texture.hml";
 
@@ -14,8 +15,9 @@ fn main() {
     let fb = fb_new(W, H);
     let grass = tex_grass(32, 32);
     let crate = tex_checker(32, 32, 4);
+    let tree = load_tree("assets/tree.obj");
     let mvp = camera_mvp(v3(3.0, 2.2, 9.0), v3(0.0, 1.4, 0.0), W, H);
-    render_world(fb, mvp, 0.0 - 0.32, 0.0 - 0.08, grass, crate);
+    render_world(fb, mvp, 0.0 - 0.32, 0.0 - 0.08, grass, crate, tree);
     fb_retro(fb);   // 5-bit + PS1 ordered dither
     fb_save(fb, "/tmp/scene_render.png");
     print("wrote /tmp/scene_render.png");

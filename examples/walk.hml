@@ -10,7 +10,7 @@
 import { sin, cos } from "@stdlib/math";
 import { v3, v_add, v_scale } from "../src/vec.hml";
 import { fb_new } from "../src/framebuffer.hml";
-import { camera_mvp, render_world } from "../src/scene.hml";
+import { camera_mvp, render_world, load_tree } from "../src/scene.hml";
 import { fb_retro } from "../src/postfx.hml";
 import { tex_grass, tex_checker } from "../src/texture.hml";
 import { window_open, present, poll, keystate, held, ticks, delay, window_close,
@@ -26,6 +26,7 @@ fn main() {
     let fb = fb_new(W, H);
     let grass = tex_grass(32, 32);
     let crate = tex_checker(32, 32, 4);
+    let tree = load_tree("assets/tree.obj");
 
     // camera state
     let pos = v3(4.0, 2.0, 10.0);
@@ -69,7 +70,7 @@ fn main() {
         let target = v_add(pos, look);
 
         let mvp = camera_mvp(pos, target, W, H);
-        render_world(fb, mvp, yaw, pitch, grass, crate);
+        render_world(fb, mvp, yaw, pitch, grass, crate, tree);
         if (retro) { fb_retro(fb); }
         present(win, buffer_ptr(fb.color));
 
