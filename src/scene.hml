@@ -1,24 +1,23 @@
 // scene.hml — draws the demo world (textured ground + a crate) from a camera.
 // Shared by the PNG screenshot test and the real-time SDL walk demo, so what you
 // see in a still is exactly what you walk around in.
+//
+// Every triangle goes world space -> clip space -> near-plane clip ->
+// perspective divide -> rasterizer, so geometry right up against (or behind)
+// the camera gets cut cleanly instead of popping out.
 
-import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul,
+import { floor } from "@stdlib/math";
+import { v3, v_norm, v_dot, mat_apply, mat_apply_dir, mat_mul, mat_translate,
          mat_perspective, mat_look_at } from "./vec.hml";
-import { fill_tri_tex } from "./raster.hml";
+import { fill_tri_tex, fill_tri_shade } from "./raster.hml";
+import { clip_tri_near } from "./clip.hml";
+import { load_obj, palette } from "./obj.hml";
 import { draw_sky } from "./sky.hml";
 
 let SUN = v_norm(v3(0.4, 1.0, 0.55));   // direction toward the light
 let AMBIENT = 0.45;
 
-fn project(mvp, v, W: f64, H: f64) {
-    let c = mat_apply(mvp, v);
-    if (c.w < 0.0001) { return null; }
-    let inv = 1.0 / c.w;
-    return { x: (c.x * inv * 0.5 + 0.5) * W,
-             y: (1.0 - (c.y * inv * 0.5 + 0.5)) * H,
-             z: c.z * inv };
-}
-
+// Lambert ramp for a unit normal — used per face (flat) and per vertex (Gouraud).
 fn face_light(n) {
     let d = v_dot(n, SUN);
     if (d < 0.0) { d = 0.0; }
@@ -32,11 +31,88 @@ export fn camera_mvp(eye, target, w: i32, h: i32) {
     return mat_mul(proj, view);
 }
 
+// World-space point -> clip-space vertex carrying UV + light (no divide yet).
+fn cv(mvp, p, u: f64, v: f64, l: f64) {
+    let c = mat_apply(mvp, p);
+    return { x: c.x, y: c.y, z: c.z, w: c.w, u: u, v: v, l: l };
+}
+
+// Perspective divide + viewport transform. Only called on vertices that
+// survived the near clip, so w is always safely positive. Screen x/y snap to
+// whole pixels — the PS1 had no subpixel precision, and that snap is what
+// makes edges shimmer ("vertex jitter") when the camera moves.
+fn to_screen(v, W: f64, H: f64) {
+    let inv = 1.0 / v.w;
+    return { x: floor((v.x * inv * 0.5 + 0.5) * W + 0.5),
+             y: floor((1.0 - (v.y * inv * 0.5 + 0.5)) * H + 0.5),
+             z: v.z * inv, u: v.u, v: v.v, l: v.l };
+}
+
+// Near-clip a clip-space triangle and rasterize whatever survives.
+fn draw_tri(fb, a, b, c, tex, W: f64, H: f64) {
+    let tris = clip_tri_near(a, b, c);
+    for (t in tris) {
+        let p0 = to_screen(t[0], W, H);
+        let p1 = to_screen(t[1], W, H);
+        let p2 = to_screen(t[2], W, H);
+        fill_tri_tex(fb, p0.x, p0.y, p0.z, p0.u, p0.v, p0.l,
+                         p1.x, p1.y, p1.z, p1.u, p1.v, p1.l,
+                         p2.x, p2.y, p2.z, p2.u, p2.v, p2.l, tex);
+    }
+}
+
+// Textured quad p0..p3 (counter-order with UVs (0,0)(1,0)(1,1)(0,1)).
+fn draw_quad(fb, mvp, p0, p1, p2, p3, light: f64, tex, W: f64, H: f64) {
+    let a = cv(mvp, p0, 0.0, 0.0, light);
+    let b = cv(mvp, p1, 1.0, 0.0, light);
+    let c = cv(mvp, p2, 1.0, 1.0, light);
+    let d = cv(mvp, p3, 0.0, 1.0, light);
+    draw_tri(fb, a, b, c, tex, W, H);
+    draw_tri(fb, a, c, d, tex, W, H);
+}
+
+// --- OBJ meshes, lit per vertex (Gouraud) ---
+
+// The demo tree + its colors, bundled so examples just pass it around.
+export fn load_tree(path: string) {
+    let mesh = load_obj(path);
+    let colors = palette(mesh, { trunk:  { r: 112, g: 78, b: 46 },
+                                 leaves: { r: 58, g: 138, b: 62 } },
+                         { r: 160, g: 160, b: 160 });
+    return { mesh: mesh, colors: colors };
+}
+
+// Solid-color Gouraud mesh: light each vertex from its smooth normal, then
+// near-clip and rasterize (light rides the clip verts' `l` slot).
+export fn render_mesh(fb, mvp, tree, model, W: f64, H: f64) {
+    let mesh = tree.mesh; let colors = tree.colors;
+    let mm = mat_mul(mvp, model);
+    for (f in mesh.faces) {
+        let col = colors[f.m];
+        let la = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.na])));
+        let lb = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.nb])));
+        let lc = face_light(v_norm(mat_apply_dir(model, mesh.nrm[f.nc])));
+        let a = cv(mm, mesh.pos[f.pa], 0.0, 0.0, la);
+        let b = cv(mm, mesh.pos[f.pb], 0.0, 0.0, lb);
+        let c = cv(mm, mesh.pos[f.pc], 0.0, 0.0, lc);
+        let tris = clip_tri_near(a, b, c);
+        for (t in tris) {
+            let p0 = to_screen(t[0], W, H);
+            let p1 = to_screen(t[1], W, H);
+            let p2 = to_screen(t[2], W, H);
+            fill_tri_shade(fb, p0.x, p0.y, p0.z, p0.l,
+                               p1.x, p1.y, p1.z, p1.l,
+                               p2.x, p2.y, p2.z, p2.l,
+                               col.r, col.g, col.b);
+        }
+    }
+}
+
 // Render the world into `fb` using a precomputed mvp. `yaw`/`pitch` drive the
-// sky's cloud panning so it matches where the camera looks.
-export fn render_world(fb, mvp, yaw, pitch, grass, crate) {
-    let W = fb.width; let H = fb.height;
-    let Wf = W; let Hf = H;
+// sky's cloud panning so it matches where the camera looks. `tree` is a
+// load_tree() bundle.
+export fn render_world(fb, mvp, yaw, pitch, grass, crate, tree) {
+    let Wf = fb.width; let Hf = fb.height;
     draw_sky(fb, yaw, pitch);
 
     // --- ground: grid of small textured quads (affine swim) ---
@@ -46,20 +122,15 @@ export fn render_world(fb, mvp, yaw, pitch, grass, crate) {
         for (let j = 0; j < N; j++) {
             let x0 = 0.0 - G + i * step; let x1 = x0 + step;
             let z0 = 0.0 - G + j * step; let z1 = z0 + step;
-            let p0 = project(mvp, v3(x0,0.0,z0), Wf, Hf);
-            let p1 = project(mvp, v3(x1,0.0,z0), Wf, Hf);
-            let p2 = project(mvp, v3(x1,0.0,z1), Wf, Hf);
-            let p3 = project(mvp, v3(x0,0.0,z1), Wf, Hf);
-            if (p0 == null || p1 == null || p2 == null || p3 == null) { continue; }
-            fill_tri_tex(fb, p0.x,p0.y,p0.z, 0.0,0.0,gl, p1.x,p1.y,p1.z, 1.0,0.0,gl, p2.x,p2.y,p2.z, 1.0,1.0,gl, grass);
-            fill_tri_tex(fb, p0.x,p0.y,p0.z, 0.0,0.0,gl, p2.x,p2.y,p2.z, 1.0,1.0,gl, p3.x,p3.y,p3.z, 0.0,1.0,gl, grass);
+            draw_quad(fb, mvp, v3(x0, 0.0, z0), v3(x1, 0.0, z0),
+                      v3(x1, 0.0, z1), v3(x0, 0.0, z1), gl, grass, Wf, Hf);
         }
     }
 
     // --- crate: a textured box sitting on the ground ---
     let s = 1.6; let hgt = 2.6;
-    let cv = [v3(0.0-s,0.0,0.0-s), v3(s,0.0,0.0-s), v3(s,hgt,0.0-s), v3(0.0-s,hgt,0.0-s),
-             v3(0.0-s,0.0,s),     v3(s,0.0,s),     v3(s,hgt,s),     v3(0.0-s,hgt,s)];
+    let pts = [v3(0.0-s,0.0,0.0-s), v3(s,0.0,0.0-s), v3(s,hgt,0.0-s), v3(0.0-s,hgt,0.0-s),
+               v3(0.0-s,0.0,s),     v3(s,0.0,s),     v3(s,hgt,s),     v3(0.0-s,hgt,s)];
     // faces: corner indices + outward normal (front/back/left/right/top)
     let cf = [
       { i: [0,1,2,3], n: v3(0.0,0.0,-1.0) },
@@ -69,11 +140,10 @@ export fn render_world(fb, mvp, yaw, pitch, grass, crate) {
       { i: [3,2,6,7], n: v3(0.0,1.0,0.0) },
     ];
     for (f in cf) {
-        let L = face_light(f.n);
-        let q = [];
-        for (idx in f.i) { q.push(project(mvp, cv[idx], Wf, Hf)); }
-        if (q[0] == null || q[1] == null || q[2] == null || q[3] == null) { continue; }
-        fill_tri_tex(fb, q[0].x,q[0].y,q[0].z, 0.0,0.0,L, q[1].x,q[1].y,q[1].z, 1.0,0.0,L, q[2].x,q[2].y,q[2].z, 1.0,1.0,L, crate);
-        fill_tri_tex(fb, q[0].x,q[0].y,q[0].z, 0.0,0.0,L, q[2].x,q[2].y,q[2].z, 1.0,1.0,L, q[3].x,q[3].y,q[3].z, 0.0,1.0,L, crate);
+        draw_quad(fb, mvp, pts[f.i[0]], pts[f.i[1]], pts[f.i[2]], pts[f.i[3]],
+                  face_light(f.n), crate, Wf, Hf);
     }
+
+    // --- the tree: an OBJ mesh, Gouraud-lit from smooth normals ---
+    render_mesh(fb, mvp, tree, mat_translate(-5.0, 0.0, -3.0), Wf, Hf);
 }

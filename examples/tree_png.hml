@@ -1,0 +1,29 @@
+// tree_png.hml — the OBJ loader + Gouraud showcase: load assets/tree.obj and
+// render it up close, smooth-lit from computed vertex normals, over the sky.
+//   ./hemlock examples/tree_png.hml  ->  /tmp/tree_render.png
+// (run from the repo root: the tree mesh loads from assets/tree.obj)
+
+import { v3 } from "../src/vec.hml";
+import { fb_new, fb_save } from "../src/framebuffer.hml";
+import { camera_mvp, render_mesh, load_tree } from "../src/scene.hml";
+import { mat_translate } from "../src/vec.hml";
+import { draw_sky } from "../src/sky.hml";
+import { fb_retro } from "../src/postfx.hml";
+
+let W = 320; let H = 240;
+
+fn main() {
+    let tree = load_tree("assets/tree.obj");
+    print(`loaded: ${tree.mesh.pos.length} verts, ${tree.mesh.faces.length} tris, ` +
+          `${tree.mesh.mats.length} materials`);
+
+    let fb = fb_new(W, H);
+    draw_sky(fb, 0.0, 0.0);
+    let mvp = camera_mvp(v3(2.6, 2.8, 6.4), v3(0.0, 2.6, 0.0), W, H);
+    render_mesh(fb, mvp, tree, mat_translate(0.0, 0.0, 0.0), W, H);
+    fb_retro(fb);
+    fb_save(fb, "/tmp/tree_render.png");
+    print("wrote /tmp/tree_render.png");
+}
+
+main();
