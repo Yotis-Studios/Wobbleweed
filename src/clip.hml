@@ -1,0 +1,111 @@
+// clip.hml — near-plane clipping in homogeneous clip space.
+//
+// Projecting a vertex at or behind the camera plane is meaningless (the
+// perspective divide blows up or flips it), so before this module the scenes
+// just dropped any triangle with a vertex at w<=0 — whole ground quads popped
+// out of existence as soon as the camera got close. The classic fix: clip each
+// triangle against the near plane *in clip space*, before the divide. For our
+// projection matrix the near plane is ndc z = -1, i.e. clip-space z + w = 0;
+// everything kept satisfies z + w >= EPS, so w is safely positive afterwards.
+//
+// A clip vertex is { x, y, z, w (clip space), u, v, l (light) } — UV and light
+// interpolate linearly along the cut edges (in clip space that's exact).
+
+let EPS = 0.000001;
+
+fn ndist(v): f64 { return v.z + v.w; }   // > 0 = in front of the near plane
+
+fn lerp_cv(a, b, t: f64) {
+    return { x: a.x + (b.x - a.x) * t,
+             y: a.y + (b.y - a.y) * t,
+             z: a.z + (b.z - a.z) * t,
+             w: a.w + (b.w - a.w) * t,
+             u: a.u + (b.u - a.u) * t,
+             v: a.v + (b.v - a.v) * t,
+             l: a.l + (b.l - a.l) * t };
+}
+
+// Sutherland–Hodgman of triangle abc against the near plane. Returns an array
+// of 0, 1 or 2 triangles (each an array of 3 clip vertices); winding is
+// preserved. The all-in / all-out cases exit early, so the fully visible world
+// pays one add and three compares per triangle.
+export fn clip_tri_near(a, b, c) {
+    let da = ndist(a); let db = ndist(b); let dc = ndist(c);
+    if (da > EPS && db > EPS && dc > EPS) { return [[a, b, c]]; }
+    if (da <= EPS && db <= EPS && dc <= EPS) { return []; }
+
+    let vin = [a, b, c];
+    let din = [da, db, dc];
+    let out = [];
+    for (let i = 0; i < 3; i++) {
+        let j = (i + 1) % 3;
+        let di = din[i]; let dj = din[j];
+        if (di > EPS) { out.push(vin[i]); }
+        // edge crosses the plane: cut at d = EPS (toward the kept side)
+        if ((di > EPS && dj <= EPS) || (di <= EPS && dj > EPS)) {
+            out.push(lerp_cv(vin[i], vin[j], (di - EPS) / (di - dj)));
+        }
+    }
+    // 3 or 4 vertices survive; fan-triangulate
+    let tris = [[out[0], out[1], out[2]]];
+    if (out.length == 4) { tris.push([out[0], out[2], out[3]]); }
+    return tris;
+}
+
+// --- 2D guard-band clip (screen space, GPU path) ---
+//
+// Near-clipped slivers can still project to screen coordinates thousands of
+// pixels off-screen, and SDL's software rasterizer silently rejects triangles
+// that big (its fixed-point cross products overflow). So the GPU path clips
+// projected triangles against a rectangle a couple of screens larger than the
+// viewport. Attributes lerp linearly in *screen* space, which restricts the
+// original triangle's affine texture mapping exactly — the cuts are invisible
+// and the wobble is untouched.
+//
+// Vertices here are geom verts { x, y (screen), z (ndc), u, v, r, g, b }.
+
+fn lerp_sv(a, b, t: f64) {
+    return { x: a.x + (b.x - a.x) * t,
+             y: a.y + (b.y - a.y) * t,
+             z: a.z + (b.z - a.z) * t,
+             u: a.u + (b.u - a.u) * t,
+             v: a.v + (b.v - a.v) * t,
+             r: i32(a.r + (b.r - a.r) * t),
+             g: i32(a.g + (b.g - a.g) * t),
+             b: i32(a.b + (b.b - a.b) * t) };
+}
+
+// Clip polygon `poly` against the half-plane dfn(v) >= 0.
+fn clip_half(poly, dfn) {
+    let out = [];
+    let n = poly.length;
+    for (let i = 0; i < n; i++) {
+        let j = (i + 1) % n;
+        let di = dfn(poly[i]); let dj = dfn(poly[j]);
+        if (di >= 0.0) { out.push(poly[i]); }
+        if ((di >= 0.0 && dj < 0.0) || (di < 0.0 && dj >= 0.0)) {
+            out.push(lerp_sv(poly[i], poly[j], di / (di - dj)));
+        }
+    }
+    return out;
+}
+
+// Clip screen-space triangle abc against rect [x0,x1]x[y0,y1]; returns an
+// array of 0..5 triangles. Fully inside (the usual case) exits early.
+export fn clip_tri_rect(a, b, c, x0: f64, y0: f64, x1: f64, y1: f64) {
+    if (a.x >= x0 && a.x <= x1 && a.y >= y0 && a.y <= y1 &&
+        b.x >= x0 && b.x <= x1 && b.y >= y0 && b.y <= y1 &&
+        c.x >= x0 && c.x <= x1 && c.y >= y0 && c.y <= y1) {
+        return [[a, b, c]];
+    }
+    let poly = [a, b, c];
+    poly = clip_half(poly, fn(v) { return v.x - x0; });
+    if (poly.length >= 3) { poly = clip_half(poly, fn(v) { return x1 - v.x; }); }
+    if (poly.length >= 3) { poly = clip_half(poly, fn(v) { return v.y - y0; }); }
+    if (poly.length >= 3) { poly = clip_half(poly, fn(v) { return y1 - v.y; }); }
+    let tris = [];
+    for (let k = 2; k < poly.length; k++) {
+        tris.push([poly[0], poly[k - 1], poly[k]]);
+    }
+    return tris;
+}
