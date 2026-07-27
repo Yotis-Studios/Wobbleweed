@@ -1,0 +1,105 @@
+// _bench_flat.hml — how fast could the emit path be with zero per-vertex objects?
+// Same 32x32 ground grid as _bench_scale (N=32 ~ 2000 tris), but projects with
+// scalars straight into the SDL_Vertex buffer. No clip.hml, no {x,y,z} objects.
+import { floor, sin, cos } from "@stdlib/math";
+import { time_ms } from "@stdlib/time";
+import { v3, v_add, mat_mul, mat_perspective, mat_look_at } from "../src/vec.hml";
+import { tex_grass } from "../src/texture.hml";
+import { window_open, upload_texture, clear, present_geom, draw_tris, window_close } from "../src/sdl.hml";
+
+let W = 320; let H = 240;
+let VS = 20;
+
+fn main() {
+    let win = window_open("flat", W, H, 1);
+    if (win == null) { eprint("window failed"); return; }
+    let gtex = upload_texture(win, tex_grass(64, 64));
+    let CAP = 16384;
+    let buf = alloc(CAP * 3 * VS);
+    // parallel arrays for the painter sort: key = depth, val = triangle slot
+    let N = 32; let G = 26.0; let step = (2.0 * G) / N;
+    let pos = v3(0.0, 2.0, 26.0);
+    let yaw = 0.0;
+    let frames = 60;
+    let t_emit = 0; let ntris = 0;
+    let w0 = time_ms();
+    for (let f = 0; f < frames; f++) {
+        yaw = yaw + 0.004;
+        let look = v3(sin(yaw), 0.0 - 0.15, 0.0 - cos(yaw));
+        let proj = mat_perspective(1.15, W / H, 0.1, 200.0);
+        let view = mat_look_at(pos, v_add(pos, look), v3(0.0, 1.0, 0.0));
+        let m = mat_mul(proj, view);
+        let m0 = m[0]; let m1 = m[1]; let m2 = m[2]; let m3 = m[3];
+        let m4 = m[4]; let m5 = m[5]; let m6 = m[6]; let m7 = m[7];
+        let m8 = m[8]; let m9 = m[9]; let m10 = m[10]; let m11 = m[11];
+        let m12 = m[12]; let m13 = m[13]; let m14 = m[14]; let m15 = m[15];
+        let Wf = W * 1.0; let Hf = H * 1.0;
+        clear(win, 0, 0, 0);
+        let t0 = time_ms();
+        let vi = 0;
+        for (let i = 0; i < N; i++) {
+            let x0 = 0.0 - G + i * step; let x1 = x0 + step;
+            for (let j = 0; j < N; j++) {
+                let z0 = 0.0 - G + j * step; let z1 = z0 + step;
+                // project 4 corners (y = 0) — scalars only
+                let ax = m0*x0 + m3;  let ay = m4*x0 + m7;  let aw = m12*x0 + m14*z0 + m15;
+                aw = m12*x0 + m13*0.0 + m14*z0 + m15;
+                let awx = m0*x0 + m2*z0 + m3; let awy = m4*x0 + m6*z0 + m7;
+                let bwx = m0*x1 + m2*z0 + m3; let bwy = m4*x1 + m6*z0 + m7;
+                let cwx = m0*x1 + m2*z1 + m3; let cwy = m4*x1 + m6*z1 + m7;
+                let dwx = m0*x0 + m2*z1 + m3; let dwy = m4*x0 + m6*z1 + m7;
+                let aww = m12*x0 + m14*z0 + m15;
+                let bww = m12*x1 + m14*z0 + m15;
+                let cww = m12*x1 + m14*z1 + m15;
+                let dww = m12*x0 + m14*z1 + m15;
+                if (aww < 0.001 || bww < 0.001 || cww < 0.001 || dww < 0.001) { continue; }
+                let ia = 1.0/aww; let ib = 1.0/bww; let ic = 1.0/cww; let id = 1.0/dww;
+                let sax = floor((awx*ia*0.5+0.5)*Wf+0.5); let say = floor((1.0-(awy*ia*0.5+0.5))*Hf+0.5);
+                let sbx = floor((bwx*ib*0.5+0.5)*Wf+0.5); let sby = floor((1.0-(bwy*ib*0.5+0.5))*Hf+0.5);
+                let scx = floor((cwx*ic*0.5+0.5)*Wf+0.5); let scy = floor((1.0-(cwy*ic*0.5+0.5))*Hf+0.5);
+                let sdx = floor((dwx*id*0.5+0.5)*Wf+0.5); let sdy = floor((1.0-(dwy*id*0.5+0.5))*Hf+0.5);
+                if (vi + 6 > CAP * 3) { continue; }
+                let o = vi * VS;
+                // tri 1: a b c
+                ptr_write_f32(ptr_offset(buf,o,1), sax);   ptr_write_f32(ptr_offset(buf,o+4,1), say);
+                ptr_write_u8(ptr_offset(buf,o+8,1),230); ptr_write_u8(ptr_offset(buf,o+9,1),230);
+                ptr_write_u8(ptr_offset(buf,o+10,1),230); ptr_write_u8(ptr_offset(buf,o+11,1),255);
+                ptr_write_f32(ptr_offset(buf,o+12,1), 0.0); ptr_write_f32(ptr_offset(buf,o+16,1), 0.0);
+                o = o + VS;
+                ptr_write_f32(ptr_offset(buf,o,1), sbx);   ptr_write_f32(ptr_offset(buf,o+4,1), sby);
+                ptr_write_u8(ptr_offset(buf,o+8,1),230); ptr_write_u8(ptr_offset(buf,o+9,1),230);
+                ptr_write_u8(ptr_offset(buf,o+10,1),230); ptr_write_u8(ptr_offset(buf,o+11,1),255);
+                ptr_write_f32(ptr_offset(buf,o+12,1), 1.0); ptr_write_f32(ptr_offset(buf,o+16,1), 0.0);
+                o = o + VS;
+                ptr_write_f32(ptr_offset(buf,o,1), scx);   ptr_write_f32(ptr_offset(buf,o+4,1), scy);
+                ptr_write_u8(ptr_offset(buf,o+8,1),230); ptr_write_u8(ptr_offset(buf,o+9,1),230);
+                ptr_write_u8(ptr_offset(buf,o+10,1),230); ptr_write_u8(ptr_offset(buf,o+11,1),255);
+                ptr_write_f32(ptr_offset(buf,o+12,1), 1.0); ptr_write_f32(ptr_offset(buf,o+16,1), 1.0);
+                o = o + VS;
+                ptr_write_f32(ptr_offset(buf,o,1), sax);   ptr_write_f32(ptr_offset(buf,o+4,1), say);
+                ptr_write_u8(ptr_offset(buf,o+8,1),230); ptr_write_u8(ptr_offset(buf,o+9,1),230);
+                ptr_write_u8(ptr_offset(buf,o+10,1),230); ptr_write_u8(ptr_offset(buf,o+11,1),255);
+                ptr_write_f32(ptr_offset(buf,o+12,1), 0.0); ptr_write_f32(ptr_offset(buf,o+16,1), 0.0);
+                o = o + VS;
+                ptr_write_f32(ptr_offset(buf,o,1), scx);   ptr_write_f32(ptr_offset(buf,o+4,1), scy);
+                ptr_write_u8(ptr_offset(buf,o+8,1),230); ptr_write_u8(ptr_offset(buf,o+9,1),230);
+                ptr_write_u8(ptr_offset(buf,o+10,1),230); ptr_write_u8(ptr_offset(buf,o+11,1),255);
+                ptr_write_f32(ptr_offset(buf,o+12,1), 1.0); ptr_write_f32(ptr_offset(buf,o+16,1), 1.0);
+                o = o + VS;
+                ptr_write_f32(ptr_offset(buf,o,1), sdx);   ptr_write_f32(ptr_offset(buf,o+4,1), sdy);
+                ptr_write_u8(ptr_offset(buf,o+8,1),230); ptr_write_u8(ptr_offset(buf,o+9,1),230);
+                ptr_write_u8(ptr_offset(buf,o+10,1),230); ptr_write_u8(ptr_offset(buf,o+11,1),255);
+                ptr_write_f32(ptr_offset(buf,o+12,1), 0.0); ptr_write_f32(ptr_offset(buf,o+16,1), 1.0);
+                vi = vi + 6;
+            }
+        }
+        t_emit = t_emit + (time_ms() - t0);
+        ntris = ntris + vi / 3;
+        draw_tris(win, gtex, buf, vi);
+        present_geom(win);
+    }
+    let wall = time_ms() - w0;
+    print(`FLAT: tris/frame=${i32(ntris/frames)} fps=${i32(frames*1000.0/wall)} emit=${t_emit/(frames*1.0)}ms (1 draw call, no sort, no clip)`);
+    window_close(win);
+}
+main();

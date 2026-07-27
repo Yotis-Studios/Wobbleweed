@@ -1,0 +1,28 @@
+import { window_open, upload_texture, clear, read_pixels, window_close } from "../src/sdl.hml";
+import { tex_sky, tex_grass, tex_checker } from "../src/texture.hml";
+import { batch_new, batch_flush } from "../src/geom.hml";
+import { v3 } from "../src/vec.hml";
+import { camera_mvp, render_world_gpu, load_tree } from "../src/scene_gpu.hml";
+fn main() {
+    let W = 320; let H = 240;
+    let win = window_open("s5", W, H, 1);
+    let gtex = upload_texture(win, tex_grass(64,64));
+    let ctex = upload_texture(win, tex_checker(64,64,4));
+    let st = upload_texture(win, tex_sky(320, 128));
+    let tree = load_tree("assets/tree.obj");
+    let b = batch_new(2048);
+    let mvp = camera_mvp(v3(3.0,2.2,9.0), v3(0.0,1.4,0.0), W, H);
+    clear(win, 0, 0, 0);
+    render_world_gpu(b, mvp, 0.0-0.32, W, H, gtex, ctex, st, tree);
+    // keep ONLY the sky triangles
+    let keep = [];
+    for (t in b.tris) { if (t.depth > 1.5) { keep.push(t); } }
+    print(`total=${b.tris.length} sky=${keep.length}`);
+    b.tris = keep;
+    batch_flush(win, b);
+    let px = buffer(W*H*3);
+    read_pixels(win, px);
+    print(`SKY-ONLY: y=2 -> ${px[(2*320+160)*3]},${px[(2*320+160)*3+1]},${px[(2*320+160)*3+2]}  y=80 -> ${px[(80*320+160)*3]},${px[(80*320+160)*3+1]},${px[(80*320+160)*3+2]}  y=200 -> ${px[(200*320+160)*3]},${px[(200*320+160)*3+1]},${px[(200*320+160)*3+2]}`);
+    window_close(win);
+}
+main();

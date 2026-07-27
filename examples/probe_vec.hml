@@ -1,0 +1,914 @@
+// probe_vec.hml — verification program for src/vec.hml (Nightshade W0-2 / G20).
+//
+// Run compiled:   hemlockc -O1 examples/probe_vec.hml -o /tmp/probe_vec && /tmp/probe_vec
+// Run interpreted: hemlock examples/probe_vec.hml
+// Needs no SDL, no display, no files.
+//
+// It checks five things:
+//   1. REGRESSION GUARD. Every export that existed before the Nightshade work
+//      still returns bit-identical values. The previous implementations are
+//      copied verbatim below as `ref_*` (from vec.hml at 8111c43) and diffed
+//      against the live module on 1000 seeded inputs per function.
+//   2. mat_look_dir is orthonormal, right-handed and non-degenerate at every
+//      pitch, including +/-89.9 deg and exactly +/-90 deg, where mat_look_at
+//      collapses.
+//   3. mat_invert_rigid(m) . m == identity to 1e-12.
+//   4. ray_aabb agrees with an independent 6-face brute-force reference on
+//      10000 seeded random cases.
+//   5. The remaining new primitives satisfy their algebraic identities.
+//
+// PRNG NOTE: the seeded generator below is a u64 LCG that uses only `*`, `+`,
+// `&` and `divi`. It must not use `>>`: on this toolchain `>>` applied to a u64
+// whose high bit is set is an ARITHMETIC shift when compiled and a LOGICAL shift
+// when interpreted, so a textbook xorshift produces different streams on the two
+// backends. i32/i64 arithmetic traps on overflow; u64 wraps, which is why the
+// state is u64.
+
+import { sin, cos, sqrt, tan, floor, divi, PI } from "@stdlib/math";
+import { exit } from "@stdlib/process";
+import { clock } from "@stdlib/time";
+
+import { v3, v_add, v_sub, v_scale, v_dot, v_cross, v_len, v_norm,
+         mat_identity, mat_mul, mat_apply, mat_apply_dir,
+         mat_translate, mat_scale, mat_rot_x, mat_rot_y, mat_rot_z,
+         mat_perspective, mat_look_at, mat_look_dir, mat_invert_rigid,
+         v_lerp, v_dist, v_dist2, v_dist2_xyz, v_reflect,
+         ray_aabb, ray_aabb_xyz, ray_plane, ray_plane_xyz,
+         aabb_overlap, aabb_overlap_xyz } from "../src/vec.hml";
+
+// ===========================================================================
+// harness
+// ===========================================================================
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_notes: array = [];
+
+fn chk(name: string, ok: i32) {
+    if (ok == 1) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL: ${name}`);
+    }
+}
+
+fn note(s: string) { g_notes.push(s); }
+
+fn absf(p_x: f64): f64 {
+    let x: f64 = p_x;
+    if (x < 0.0) { x = -x; }
+    let out: f64 = x;
+    return out;
+}
+
+// ===========================================================================
+// seeded PRNG — u64 LCG, backend-identical (verified interpreted vs compiled)
+// ===========================================================================
+
+let g_rng: u64 = 1;
+
+fn rnd_seed(s: u64) { g_rng = s; }
+
+fn rnd01(): f64 {
+    let s: u64 = g_rng;
+    s = s * 6364136223846793005 + 1442695040888963407;
+    g_rng = s;
+    let hi: u64 = divi(s, 4294967296) & 4294967295;   // top 32 bits; `>>` is unsafe here
+    let out: f64 = f64(hi) * 2.3283064365386963e-10;  // * 2^-32  -> [0,1)
+    return out;
+}
+
+fn rndr(p_lo: f64, p_hi: f64): f64 {
+    let lo: f64 = p_lo;
+    let hi: f64 = p_hi;
+    let out: f64 = lo + (hi - lo) * rnd01();
+    return out;
+}
+
+fn rnd_vec() { return { x: rndr(-8.0, 8.0), y: rndr(-8.0, 8.0), z: rndr(-8.0, 8.0) }; }
+
+fn rnd_mat() {
+    let m = [];
+    for (let i = 0; i < 16; i++) { m.push(rndr(-4.0, 4.0)); }
+    return m;
+}
+
+// ===========================================================================
+// REFERENCE: verbatim copy of src/vec.hml as of commit 8111c43
+// (the version every legacy module was written against). Do not "clean up".
+// ===========================================================================
+
+fn ref_v3(x: f64, y: f64, z: f64): object { return { x: x, y: y, z: z }; }
+fn ref_v_add(a, b)  { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+fn ref_v_sub(a, b)  { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+fn ref_v_scale(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
+fn ref_v_dot(a, b): f64 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+fn ref_v_cross(a, b) {
+    return { x: a.y * b.z - a.z * b.y,
+             y: a.z * b.x - a.x * b.z,
+             z: a.x * b.y - a.y * b.x };
+}
+
+fn ref_v_len(a): f64 { return sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
+
+fn ref_v_norm(a) {
+    let l = ref_v_len(a);
+    if (l < 1.0e-9) { return { x: 0.0, y: 0.0, z: 0.0 }; }
+    let inv = 1.0 / l;
+    return { x: a.x * inv, y: a.y * inv, z: a.z * inv };
+}
+
+fn ref_mat_identity() {
+    return [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+}
+
+fn ref_mat_mul(a, b) {
+    let c = [];
+    for (let i = 0; i < 16; i++) { c.push(0.0); }
+    for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 4; col++) {
+            let s = 0.0;
+            for (let k = 0; k < 4; k++) {
+                s = s + a[row * 4 + k] * b[k * 4 + col];
+            }
+            c[row * 4 + col] = s;
+        }
+    }
+    return c;
+}
+
+fn ref_mat_apply(m, v) {
+    return {
+        x: m[0]*v.x + m[1]*v.y + m[2]*v.z + m[3],
+        y: m[4]*v.x + m[5]*v.y + m[6]*v.z + m[7],
+        z: m[8]*v.x + m[9]*v.y + m[10]*v.z + m[11],
+        w: m[12]*v.x + m[13]*v.y + m[14]*v.z + m[15],
+    };
+}
+
+fn ref_mat_apply_dir(m, v) {
+    return {
+        x: m[0]*v.x + m[1]*v.y + m[2]*v.z,
+        y: m[4]*v.x + m[5]*v.y + m[6]*v.z,
+        z: m[8]*v.x + m[9]*v.y + m[10]*v.z,
+    };
+}
+
+fn ref_mat_translate(x: f64, y: f64, z: f64) {
+    return [1.0,0.0,0.0,x, 0.0,1.0,0.0,y, 0.0,0.0,1.0,z, 0.0,0.0,0.0,1.0];
+}
+
+fn ref_mat_scale(x: f64, y: f64, z: f64) {
+    return [x,0.0,0.0,0.0, 0.0,y,0.0,0.0, 0.0,0.0,z,0.0, 0.0,0.0,0.0,1.0];
+}
+
+fn ref_mat_rot_y(a: f64) {
+    let c = cos(a); let s = sin(a);
+    return [c,0.0,s,0.0, 0.0,1.0,0.0,0.0, 0.0-s,0.0,c,0.0, 0.0,0.0,0.0,1.0];
+}
+
+fn ref_mat_rot_x(a: f64) {
+    let c = cos(a); let s = sin(a);
+    return [1.0,0.0,0.0,0.0, 0.0,c,0.0-s,0.0, 0.0,s,c,0.0, 0.0,0.0,0.0,1.0];
+}
+
+fn ref_mat_perspective(fov: f64, aspect: f64, near: f64, far: f64) {
+    let f = 1.0 / tan(fov * 0.5);
+    let nf = 1.0 / (near - far);
+    return [f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, (far + near) * nf, 2.0 * far * near * nf,
+            0.0, 0.0, 0.0 - 1.0, 0.0];
+}
+
+fn ref_mat_look_at(eye, target, up) {
+    let f = ref_v_norm(ref_v_sub(target, eye));
+    let r = ref_v_norm(ref_v_cross(f, up));
+    let u = ref_v_cross(r, f);
+    return [ r.x,  r.y,  r.z, 0.0 - ref_v_dot(r, eye),
+             u.x,  u.y,  u.z, 0.0 - ref_v_dot(u, eye),
+            0.0-f.x, 0.0-f.y, 0.0-f.z, ref_v_dot(f, eye),
+            0.0, 0.0, 0.0, 1.0];
+}
+
+// ===========================================================================
+// comparison helpers
+// ===========================================================================
+
+let g_worst: f64 = 0.0;
+
+fn track(p_d: f64) {
+    let d: f64 = p_d;
+    if (d < 0.0) { d = -d; }
+    if (d > g_worst) { g_worst = d; }
+}
+
+// exact bit-for-bit equality on a 3-component vector
+fn same3(a, b): i32 {
+    track(a.x - b.x); track(a.y - b.y); track(a.z - b.z);
+    let out: i32 = 0;
+    if (a.x == b.x) { if (a.y == b.y) { if (a.z == b.z) { out = 1; } } }
+    return out;
+}
+
+fn same4(a, b): i32 {
+    track(a.x - b.x); track(a.y - b.y); track(a.z - b.z); track(a.w - b.w);
+    let out: i32 = 0;
+    if (a.x == b.x) { if (a.y == b.y) { if (a.z == b.z) { if (a.w == b.w) { out = 1; } } } }
+    return out;
+}
+
+fn same16(a, b): i32 {
+    let out: i32 = 1;
+    for (let i = 0; i < 16; i++) {
+        track(a[i] - b[i]);
+        if (a[i] != b[i]) { out = 0; }
+    }
+    return out;
+}
+
+fn near(p_a: f64, p_b: f64, p_tol: f64): i32 {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = -d; }
+    let out: i32 = 0;
+    if (d <= p_tol) { out = 1; }
+    return out;
+}
+
+// ===========================================================================
+// 1. REGRESSION GUARD — every pre-existing export, 1000 seeded inputs
+// ===========================================================================
+
+fn test_regression() {
+    print("[1] regression vs vec.hml@8111c43, 1000 seeded inputs per export");
+    rnd_seed(20260727);
+    g_worst = 0.0;
+
+    let bad_v3: i32 = 0;      let bad_add: i32 = 0;    let bad_sub: i32 = 0;
+    let bad_scale: i32 = 0;   let bad_dot: i32 = 0;    let bad_cross: i32 = 0;
+    let bad_len: i32 = 0;     let bad_norm: i32 = 0;   let bad_ident: i32 = 0;
+    let bad_mul: i32 = 0;     let bad_apply: i32 = 0;  let bad_applyd: i32 = 0;
+    let bad_tr: i32 = 0;      let bad_sc: i32 = 0;     let bad_ry: i32 = 0;
+    let bad_rx: i32 = 0;      let bad_persp: i32 = 0;  let bad_look: i32 = 0;
+
+    for (let i = 0; i < 1000; i++) {
+        let ax: f64 = rndr(-8.0, 8.0); let ay: f64 = rndr(-8.0, 8.0); let az: f64 = rndr(-8.0, 8.0);
+        let bx: f64 = rndr(-8.0, 8.0); let by: f64 = rndr(-8.0, 8.0); let bz: f64 = rndr(-8.0, 8.0);
+        let s: f64  = rndr(-5.0, 5.0);
+        let a = { x: ax, y: ay, z: az };
+        let b = { x: bx, y: by, z: bz };
+
+        if (same3(v3(ax, ay, az), ref_v3(ax, ay, az)) == 0) { bad_v3 = bad_v3 + 1; }
+        if (same3(v_add(a, b), ref_v_add(a, b)) == 0) { bad_add = bad_add + 1; }
+        if (same3(v_sub(a, b), ref_v_sub(a, b)) == 0) { bad_sub = bad_sub + 1; }
+        if (same3(v_scale(a, s), ref_v_scale(a, s)) == 0) { bad_scale = bad_scale + 1; }
+        if (same3(v_cross(a, b), ref_v_cross(a, b)) == 0) { bad_cross = bad_cross + 1; }
+        if (same3(v_norm(a), ref_v_norm(a)) == 0) { bad_norm = bad_norm + 1; }
+
+        let d1: f64 = v_dot(a, b);   let d2: f64 = ref_v_dot(a, b);
+        track(d1 - d2);
+        if (d1 != d2) { bad_dot = bad_dot + 1; }
+
+        let l1: f64 = v_len(a);      let l2: f64 = ref_v_len(a);
+        track(l1 - l2);
+        if (l1 != l2) { bad_len = bad_len + 1; }
+
+        if (same16(mat_identity(), ref_mat_identity()) == 0) { bad_ident = bad_ident + 1; }
+
+        let ma = rnd_mat();
+        let mb = rnd_mat();
+        if (same16(mat_mul(ma, mb), ref_mat_mul(ma, mb)) == 0) { bad_mul = bad_mul + 1; }
+        if (same4(mat_apply(ma, a), ref_mat_apply(ma, a)) == 0) { bad_apply = bad_apply + 1; }
+        if (same3(mat_apply_dir(ma, a), ref_mat_apply_dir(ma, a)) == 0) { bad_applyd = bad_applyd + 1; }
+
+        if (same16(mat_translate(ax, ay, az), ref_mat_translate(ax, ay, az)) == 0) { bad_tr = bad_tr + 1; }
+        if (same16(mat_scale(ax, ay, az), ref_mat_scale(ax, ay, az)) == 0) { bad_sc = bad_sc + 1; }
+
+        let ang: f64 = rndr(-7.0, 7.0);
+        if (same16(mat_rot_y(ang), ref_mat_rot_y(ang)) == 0) { bad_ry = bad_ry + 1; }
+        if (same16(mat_rot_x(ang), ref_mat_rot_x(ang)) == 0) { bad_rx = bad_rx + 1; }
+
+        let fov: f64 = rndr(0.3, 2.6);
+        let asp: f64 = rndr(0.4, 3.0);
+        let nr: f64  = rndr(0.01, 2.0);
+        let fr: f64  = nr + rndr(1.0, 500.0);
+        if (same16(mat_perspective(fov, asp, nr, fr),
+                   ref_mat_perspective(fov, asp, nr, fr)) == 0) { bad_persp = bad_persp + 1; }
+
+        // mat_look_at with a randomly tilted up vector, so the reference path
+        // exercises v_norm/v_cross/v_dot as well.
+        let tgt = { x: rndr(-8.0, 8.0), y: rndr(-8.0, 8.0), z: rndr(-8.0, 8.0) };
+        let upv = { x: rndr(-1.0, 1.0), y: rndr(0.2, 1.0), z: rndr(-1.0, 1.0) };
+        if (same16(mat_look_at(a, tgt, upv), ref_mat_look_at(a, tgt, upv)) == 0) { bad_look = bad_look + 1; }
+    }
+
+    chk("v3 identical", 1 - bad_v3);
+    chk("v_add identical", 1 - bad_add);
+    chk("v_sub identical", 1 - bad_sub);
+    chk("v_scale identical", 1 - bad_scale);
+    chk("v_dot identical", 1 - bad_dot);
+    chk("v_cross identical", 1 - bad_cross);
+    chk("v_len identical", 1 - bad_len);
+    chk("v_norm identical", 1 - bad_norm);
+    chk("mat_identity identical", 1 - bad_ident);
+    chk("mat_mul identical", 1 - bad_mul);
+    chk("mat_apply identical", 1 - bad_apply);
+    chk("mat_apply_dir identical", 1 - bad_applyd);
+    chk("mat_translate identical", 1 - bad_tr);
+    chk("mat_scale identical", 1 - bad_sc);
+    chk("mat_rot_y identical", 1 - bad_ry);
+    chk("mat_rot_x identical", 1 - bad_rx);
+    chk("mat_perspective identical", 1 - bad_persp);
+    chk("mat_look_at identical", 1 - bad_look);
+
+    note(`regression: max |new - old| over 18 exports x 1000 inputs = ${g_worst}`);
+
+    // degenerate corners the random sweep cannot reach
+    let z = { x: 0.0, y: 0.0, z: 0.0 };
+    let tiny = { x: 1.0e-12, y: 0.0, z: 0.0 };
+    chk("v_norm(0) identical", same3(v_norm(z), ref_v_norm(z)));
+    chk("v_norm(tiny) identical", same3(v_norm(tiny), ref_v_norm(tiny)));
+    chk("v_len(0) identical", near(v_len(z), ref_v_len(z), 0.0));
+    let mi = mat_identity();
+    chk("mat_mul(I,I) identical", same16(mat_mul(mi, mi), ref_mat_mul(mi, mi)));
+    let mz = [0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0];
+    chk("mat_mul(0,0) identical", same16(mat_mul(mz, mz), ref_mat_mul(mz, mz)));
+    chk("mat_mul(I,0) identical", same16(mat_mul(mi, mz), ref_mat_mul(mi, mz)));
+    // integer-valued inputs (v3 declares f64, but nothing stops a caller)
+    let ia = { x: 3, y: -4, z: 12 };
+    let ib = { x: 1, y: 2, z: 3 };
+    chk("v_add int inputs identical", same3(v_add(ia, ib), ref_v_add(ia, ib)));
+    chk("v_dot int inputs identical", near(v_dot(ia, ib), ref_v_dot(ia, ib), 0.0));
+    chk("v_len int inputs identical", near(v_len(ia), ref_v_len(ia), 0.0));
+}
+
+// ===========================================================================
+// 2. mat_look_dir — stability, orthonormality, handedness, agreement
+// ===========================================================================
+
+// max |M(3x3) rows orthonormality error|; also returns det via g_det
+let g_det: f64 = 0.0;
+
+fn basis_error(m): f64 {
+    let r0: f64 = m[0]; let r1: f64 = m[1]; let r2: f64 = m[2];
+    let u0: f64 = m[4]; let u1: f64 = m[5]; let u2: f64 = m[6];
+    let f0: f64 = m[8]; let f1: f64 = m[9]; let f2: f64 = m[10];
+    let e: f64 = 0.0;
+    let t: f64 = 0.0;
+    t = absf(r0*r0 + r1*r1 + r2*r2 - 1.0); if (t > e) { e = t; }
+    t = absf(u0*u0 + u1*u1 + u2*u2 - 1.0); if (t > e) { e = t; }
+    t = absf(f0*f0 + f1*f1 + f2*f2 - 1.0); if (t > e) { e = t; }
+    t = absf(r0*u0 + r1*u1 + r2*u2);       if (t > e) { e = t; }
+    t = absf(r0*f0 + r1*f1 + r2*f2);       if (t > e) { e = t; }
+    t = absf(u0*f0 + u1*f1 + u2*f2);       if (t > e) { e = t; }
+    // 3x3 determinant of the (right, up, forward) basis; +1 for a right-handed
+    // orthonormal basis, 0 when the basis has collapsed.
+    g_det = r0*(u1*f2 - u2*f1) - r1*(u0*f2 - u2*f0) + r2*(u0*f1 - u1*f0);
+    let out: f64 = e;
+    return out;
+}
+
+fn test_look_dir() {
+    print("[2] mat_look_dir stability / orthonormality / handedness");
+    rnd_seed(777001);
+
+    let deg: f64 = PI / 180.0;
+    let pitches = [0.0, 0.5*deg, 45.0*deg, 80.0*deg, 85.0*deg, 89.0*deg,
+                   89.9*deg, 89.999*deg, 90.0*deg, 91.0*deg, 179.0*deg,
+                   -0.5*deg, -45.0*deg, -85.0*deg, -89.9*deg, -89.999*deg,
+                   -90.0*deg, -179.0*deg];
+    let worst_ortho: f64 = 0.0;
+    let worst_det: f64 = 0.0;
+    let worst_eye: f64 = 0.0;
+    let np: i32 = pitches.length;
+
+    for (let k = 0; k < np; k++) {
+        let pit: f64 = pitches[k];
+        for (let j = 0; j < 64; j++) {
+            let yaw: f64 = rndr(-9.0, 9.0);
+            let eye = { x: rndr(-500.0, 500.0), y: rndr(-50.0, 50.0), z: rndr(-500.0, 500.0) };
+            let m = mat_look_dir(eye, yaw, pit);
+            let e: f64 = basis_error(m);
+            if (e > worst_ortho) { worst_ortho = e; }
+            let dd: f64 = absf(g_det - 1.0);
+            if (dd > worst_det) { worst_det = dd; }
+            // the view matrix must send the eye to the origin
+            let p = mat_apply(m, eye);
+            let pe: f64 = absf(p.x) + absf(p.y) + absf(p.z) + absf(p.w - 1.0);
+            // scale-relative: eye magnitude is up to ~700
+            if (pe > worst_eye) { worst_eye = pe; }
+        }
+    }
+    chk("look_dir orthonormal at every pitch incl. +/-89.9 and +/-90 deg",
+        near(worst_ortho, 0.0, 1.0e-14));
+    chk("look_dir right-handed (det == 1) at every pitch", near(worst_det, 0.0, 1.0e-14));
+    chk("look_dir maps eye to origin", near(worst_eye, 0.0, 1.0e-11));
+    note(`look_dir: max orthonormality err = ${worst_ortho}, max |det-1| = ${worst_det}, max |M*eye - origin| = ${worst_eye}`);
+
+    // pitch exactly +/-89.9 deg: the basis must be well-conditioned, not merely finite
+    let e89 = { x: 12.5, y: 3.25, z: -7.75 };
+    let mp = mat_look_dir(e89, 1.1, 89.9 * deg);
+    let mn = mat_look_dir(e89, 1.1, -89.9 * deg);
+    let ep: f64 = basis_error(mp); let detp: f64 = g_det;
+    let en: f64 = basis_error(mn); let detn: f64 = g_det;
+    chk("look_dir non-degenerate at +89.9 deg", near(ep, 0.0, 1.0e-15));
+    chk("look_dir det==1 at +89.9 deg", near(detp, 1.0, 1.0e-15));
+    chk("look_dir non-degenerate at -89.9 deg", near(en, 0.0, 1.0e-15));
+    chk("look_dir det==1 at -89.9 deg", near(detn, 1.0, 1.0e-15));
+    note(`+89.9 deg: ortho err = ${ep}, det = ${detp}   -89.9 deg: ortho err = ${en}, det = ${detn}`);
+
+    // forward must actually be the yaw/pitch direction: a point 1 m ahead lands
+    // at view-space (0, 0, -1).
+    let worst_fwd: f64 = 0.0;
+    for (let k2 = 0; k2 < np; k2++) {
+        let pit2: f64 = pitches[k2];
+        for (let j2 = 0; j2 < 16; j2++) {
+            let yaw2: f64 = rndr(-9.0, 9.0);
+            let eye2 = { x: rndr(-20.0, 20.0), y: rndr(-20.0, 20.0), z: rndr(-20.0, 20.0) };
+            let fw = { x: sin(yaw2) * cos(pit2), y: sin(pit2), z: -(cos(yaw2) * cos(pit2)) };
+            let ahead = { x: eye2.x + fw.x, y: eye2.y + fw.y, z: eye2.z + fw.z };
+            let m2 = mat_look_dir(eye2, yaw2, pit2);
+            let q = mat_apply(m2, ahead);
+            let er: f64 = absf(q.x) + absf(q.y) + absf(q.z + 1.0);
+            if (er > worst_fwd) { worst_fwd = er; }
+        }
+    }
+    chk("look_dir forward maps to view -Z", near(worst_fwd, 0.0, 1.0e-13));
+    note(`look_dir: max |forward -> (0,0,-1)| err = ${worst_fwd}`);
+
+    // agreement with mat_look_at away from the degeneracy (proves the convention
+    // is the same one the legacy renderer and walk_gpu.hml already use)
+    let worst_agree: f64 = 0.0;
+    let up = { x: 0.0, y: 1.0, z: 0.0 };
+    for (let j3 = 0; j3 < 500; j3++) {
+        let yaw3: f64 = rndr(-9.0, 9.0);
+        let pit3: f64 = rndr(-1.3, 1.3);
+        let eye3 = { x: rndr(-30.0, 30.0), y: rndr(-30.0, 30.0), z: rndr(-30.0, 30.0) };
+        let look = { x: eye3.x + sin(yaw3) * cos(pit3),
+                     y: eye3.y + sin(pit3),
+                     z: eye3.z - cos(yaw3) * cos(pit3) };
+        let m3 = mat_look_dir(eye3, yaw3, pit3);
+        let m4 = mat_look_at(eye3, look, up);
+        for (let e4 = 0; e4 < 16; e4++) {
+            let d4: f64 = absf(m3[e4] - m4[e4]);
+            if (d4 > worst_agree) { worst_agree = d4; }
+        }
+    }
+    chk("look_dir agrees with look_at for |pitch| <= 74.5 deg", near(worst_agree, 0.0, 1.0e-12));
+    note(`look_dir vs look_at (|pitch|<=1.3 rad, 500 cases): max element diff = ${worst_agree}`);
+
+    // and the reason mat_look_dir exists: mat_look_at is rank-deficient at 90 deg
+    let mdeg = mat_look_at({x:0.0,y:0.0,z:0.0}, {x:0.0,y:1.0,z:0.0}, up);
+    let edeg: f64 = basis_error(mdeg);
+    let detdeg: f64 = g_det;
+    chk("mat_look_at is degenerate looking straight up (documents why look_dir exists)",
+        near(detdeg, 0.0, 1.0e-15));
+    note(`mat_look_at straight up: det = ${detdeg} (rank deficient), ortho err = ${edeg}`);
+}
+
+// ===========================================================================
+// 3. mat_invert_rigid
+// ===========================================================================
+
+fn ident_error(m): f64 {
+    let e: f64 = 0.0;
+    for (let i = 0; i < 16; i++) {
+        let want: f64 = 0.0;
+        if (i == 0) { want = 1.0; }
+        if (i == 5) { want = 1.0; }
+        if (i == 10) { want = 1.0; }
+        if (i == 15) { want = 1.0; }
+        let d: f64 = absf(m[i] - want);
+        if (d > e) { e = d; }
+    }
+    let out: f64 = e;
+    return out;
+}
+
+fn test_invert_rigid() {
+    print("[3] mat_invert_rigid . m == identity");
+    rnd_seed(31337);
+    let worst: f64 = 0.0;
+    let worst2: f64 = 0.0;
+    let n: i32 = 2000;
+    let deg: f64 = PI / 180.0;
+
+    for (let i = 0; i < n; i++) {
+        let m = [];
+        if (i % 2 == 0) {
+            // a view matrix straight out of mat_look_dir, incl. extreme pitch
+            let eye = { x: rndr(-400.0, 400.0), y: rndr(-80.0, 80.0), z: rndr(-400.0, 400.0) };
+            let pit: f64 = rndr(-89.999 * deg, 89.999 * deg);
+            m = mat_look_dir(eye, rndr(-9.0, 9.0), pit);
+        } else {
+            // an arbitrary rigid body transform T * Ry * Rx * Rz
+            let t = mat_translate(rndr(-90.0, 90.0), rndr(-90.0, 90.0), rndr(-90.0, 90.0));
+            let r = mat_mul(mat_mul(mat_rot_y(rndr(-9.0, 9.0)), mat_rot_x(rndr(-9.0, 9.0))),
+                            mat_rot_z(rndr(-9.0, 9.0)));
+            m = mat_mul(t, r);
+        }
+        let inv = mat_invert_rigid(m);
+        let e1: f64 = ident_error(mat_mul(inv, m));
+        let e2: f64 = ident_error(mat_mul(m, inv));
+        if (e1 > worst) { worst = e1; }
+        if (e2 > worst2) { worst2 = e2; }
+    }
+    chk("mat_invert_rigid(m) . m == I to 1e-12", near(worst, 0.0, 1.0e-12));
+    chk("m . mat_invert_rigid(m) == I to 1e-12", near(worst2, 0.0, 1.0e-12));
+    note(`invert_rigid over ${n} matrices: max |inv*m - I| = ${worst}, max |m*inv - I| = ${worst2}`);
+
+    // exact identity round trip
+    let mi = mat_identity();
+    chk("mat_invert_rigid(I) == I", same16(mat_invert_rigid(mi), mi));
+    // pure translation inverts to the negated translation, exactly
+    let tt = mat_translate(3.5, -12.25, 7.125);
+    let ti = mat_invert_rigid(tt);
+    chk("invert(translate) is exact", near(ti[3], -3.5, 0.0)
+        * near(ti[7], 12.25, 0.0) * near(ti[11], -7.125, 0.0));
+}
+
+// ===========================================================================
+// 4. ray_aabb vs an independent 6-face brute-force reference
+// ===========================================================================
+
+// Brute force: intersect the ray with each of the six face planes, keep the
+// smallest non-negative t whose hit point lies inside the face rectangle.
+// Completely different algorithm from the slab test in vec.hml.
+fn ref_ray_aabb(p_ox: f64, p_oy: f64, p_oz: f64,
+                p_dx: f64, p_dy: f64, p_dz: f64,
+                p_lox: f64, p_loy: f64, p_loz: f64,
+                p_hix: f64, p_hiy: f64, p_hiz: f64): f64 {
+    let ox: f64 = p_ox; let oy: f64 = p_oy; let oz: f64 = p_oz;
+    let dx: f64 = p_dx; let dy: f64 = p_dy; let dz: f64 = p_dz;
+    let lox: f64 = p_lox; let loy: f64 = p_loy; let loz: f64 = p_loz;
+    let hix: f64 = p_hix; let hiy: f64 = p_hiy; let hiz: f64 = p_hiz;
+    let eps: f64 = 1.0e-12;
+
+    // origin inside (inclusive) -> entry at t = 0
+    let inside: i32 = 1;
+    if (ox < lox) { inside = 0; }  if (ox > hix) { inside = 0; }
+    if (oy < loy) { inside = 0; }  if (oy > hiy) { inside = 0; }
+    if (oz < loz) { inside = 0; }  if (oz > hiz) { inside = 0; }
+    if (inside == 1) { let z: f64 = 0.0; return z; }
+
+    let best: f64 = -1.0;
+    let t: f64 = 0.0;
+    let px: f64 = 0.0; let py: f64 = 0.0; let pz: f64 = 0.0;
+
+    // two X faces
+    if (dx != 0.0) {
+        for (let s = 0; s < 2; s++) {
+            let pv: f64 = lox;
+            if (s == 1) { pv = hix; }
+            t = (pv - ox) / dx;
+            if (t >= 0.0) {
+                py = oy + t * dy; pz = oz + t * dz;
+                if (py >= loy - eps) { if (py <= hiy + eps) {
+                if (pz >= loz - eps) { if (pz <= hiz + eps) {
+                    if (best < 0.0) { best = t; } else { if (t < best) { best = t; } }
+                } } } }
+            }
+        }
+    }
+    // two Y faces
+    if (dy != 0.0) {
+        for (let s2 = 0; s2 < 2; s2++) {
+            let pv2: f64 = loy;
+            if (s2 == 1) { pv2 = hiy; }
+            t = (pv2 - oy) / dy;
+            if (t >= 0.0) {
+                px = ox + t * dx; pz = oz + t * dz;
+                if (px >= lox - eps) { if (px <= hix + eps) {
+                if (pz >= loz - eps) { if (pz <= hiz + eps) {
+                    if (best < 0.0) { best = t; } else { if (t < best) { best = t; } }
+                } } } }
+            }
+        }
+    }
+    // two Z faces
+    if (dz != 0.0) {
+        for (let s3 = 0; s3 < 2; s3++) {
+            let pv3: f64 = loz;
+            if (s3 == 1) { pv3 = hiz; }
+            t = (pv3 - oz) / dz;
+            if (t >= 0.0) {
+                px = ox + t * dx; py = oy + t * dy;
+                if (px >= lox - eps) { if (px <= hix + eps) {
+                if (py >= loy - eps) { if (py <= hiy + eps) {
+                    if (best < 0.0) { best = t; } else { if (t < best) { best = t; } }
+                } } } }
+            }
+        }
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn test_ray_aabb() {
+    print("[4] ray_aabb vs 6-face brute force, 10000 seeded cases");
+    rnd_seed(4242424);
+    let n: i32 = 10000;
+    let mismatches: i32 = 0;
+    let grazing: i32 = 0;
+    let hits: i32 = 0;
+    let insides: i32 = 0;
+    let worst_t: f64 = 0.0;
+
+    for (let i = 0; i < n; i++) {
+        let cx: f64 = rndr(-3.0, 3.0); let cy: f64 = rndr(-3.0, 3.0); let cz: f64 = rndr(-3.0, 3.0);
+        let ex: f64 = rndr(0.2, 2.0);  let ey: f64 = rndr(0.2, 2.0);  let ez: f64 = rndr(0.2, 2.0);
+        let lox: f64 = cx - ex; let loy: f64 = cy - ey; let loz: f64 = cz - ez;
+        let hix: f64 = cx + ex; let hiy: f64 = cy + ey; let hiz: f64 = cz + ez;
+
+        let ox: f64 = rndr(-7.0, 7.0); let oy: f64 = rndr(-7.0, 7.0); let oz: f64 = rndr(-7.0, 7.0);
+        let dx: f64 = 0.0; let dy: f64 = 0.0; let dz: f64 = 0.0;
+
+        let mode: i32 = i % 4;
+        if (mode == 0) {
+            // aimed at a random point inside the box -> mostly hits
+            dx = rndr(lox, hix) - ox; dy = rndr(loy, hiy) - oy; dz = rndr(loz, hiz) - oz;
+        } else {
+            if (mode == 1) {
+                // uniform-ish random direction -> mostly misses
+                dx = rndr(-1.0, 1.0); dy = rndr(-1.0, 1.0); dz = rndr(-1.0, 1.0);
+            } else {
+                if (mode == 2) {
+                    // axis-parallel rays: the branch that would be inf/NaN otherwise
+                    let axis: i32 = i % 3;
+                    if (axis == 0) { dx = rndr(-1.0, 1.0); }
+                    if (axis == 1) { dy = rndr(-1.0, 1.0); }
+                    if (axis == 2) { dz = rndr(-1.0, 1.0); }
+                } else {
+                    // origin near/inside the box
+                    ox = rndr(lox - 0.5, hix + 0.5);
+                    oy = rndr(loy - 0.5, hiy + 0.5);
+                    oz = rndr(loz - 0.5, hiz + 0.5);
+                    dx = rndr(-1.0, 1.0); dy = rndr(-1.0, 1.0); dz = rndr(-1.0, 1.0);
+                }
+            }
+        }
+        if (dx == 0.0) { if (dy == 0.0) { if (dz == 0.0) { dx = 1.0; } } }
+
+        let ta: f64 = ray_aabb_xyz(ox, oy, oz, dx, dy, dz, lox, loy, loz, hix, hiy, hiz);
+        let tb: f64 = ref_ray_aabb(ox, oy, oz, dx, dy, dz, lox, loy, loz, hix, hiy, hiz);
+
+        // object-argument wrapper must give exactly the same number
+        let tc: f64 = ray_aabb({x:ox,y:oy,z:oz}, {x:dx,y:dy,z:dz},
+                               {x:lox,y:loy,z:loz}, {x:hix,y:hiy,z:hiz});
+        if (tc != ta) { mismatches = mismatches + 1; }
+
+        if (ta >= 0.0) { hits = hits + 1; }
+        if (ta == 0.0) { insides = insides + 1; }
+
+        let agree: i32 = 0;
+        if (ta < 0.0) { if (tb < 0.0) { agree = 1; } }
+        if (ta >= 0.0) {
+            if (tb >= 0.0) {
+                let d: f64 = absf(ta - tb);
+                let tol: f64 = 1.0e-9 * (1.0 + absf(ta));
+                if (d <= tol) { agree = 1; }
+                if (d > worst_t) { worst_t = d; }
+            }
+        }
+        if (agree == 0) {
+            // a genuine grazing case: the hit point sits on a box edge, where
+            // the two algorithms are allowed to disagree about inclusion.
+            let tg: f64 = ta;
+            if (tg < 0.0) { tg = tb; }
+            let gx: f64 = ox + tg * dx; let gy: f64 = oy + tg * dy; let gz: f64 = oz + tg * dz;
+            let m1: f64 = absf(gx - lox); let m2: f64 = absf(gx - hix);
+            let m3: f64 = absf(gy - loy); let m4: f64 = absf(gy - hiy);
+            let m5: f64 = absf(gz - loz); let m6: f64 = absf(gz - hiz);
+            let mn: f64 = m1;
+            if (m2 < mn) { mn = m2; } if (m3 < mn) { mn = m3; }
+            if (m4 < mn) { mn = m4; } if (m5 < mn) { mn = m5; }
+            if (m6 < mn) { mn = m6; }
+            if (mn < 1.0e-9) { grazing = grazing + 1; } else { mismatches = mismatches + 1; }
+        }
+    }
+
+    chk("ray_aabb agrees with brute force on 10000 cases", 1 - mismatches);
+    note(`ray_aabb: ${n} cases, ${hits} hits (${insides} origin-inside), mismatches = ${mismatches}, grazing-tolerated = ${grazing}, max |t_slab - t_face| = ${worst_t}`);
+
+    // explicit hand-checked cases
+    chk("ray_aabb straight hit", near(ray_aabb_xyz(0.0,0.0,5.0, 0.0,0.0,-1.0, -1.0,-1.0,-1.0, 1.0,1.0,1.0), 4.0, 1.0e-15));
+    chk("ray_aabb behind is a miss", near(ray_aabb_xyz(0.0,0.0,5.0, 0.0,0.0,1.0, -1.0,-1.0,-1.0, 1.0,1.0,1.0), -1.0, 0.0));
+    chk("ray_aabb origin inside is 0", near(ray_aabb_xyz(0.0,0.0,0.0, 0.3,0.4,0.5, -1.0,-1.0,-1.0, 1.0,1.0,1.0), 0.0, 0.0));
+    chk("ray_aabb parallel outside slab misses", near(ray_aabb_xyz(5.0,0.0,0.0, 0.0,0.0,-1.0, -1.0,-1.0,-1.0, 1.0,1.0,1.0), -1.0, 0.0));
+    chk("ray_aabb parallel inside slab hits", near(ray_aabb_xyz(0.5,0.0,9.0, 0.0,0.0,-1.0, -1.0,-1.0,-1.0, 1.0,1.0,1.0), 8.0, 1.0e-15));
+    chk("ray_aabb unnormalised dir scales t", near(ray_aabb_xyz(0.0,0.0,5.0, 0.0,0.0,-2.0, -1.0,-1.0,-1.0, 1.0,1.0,1.0), 2.0, 1.0e-15));
+}
+
+// ===========================================================================
+// 5. the remaining new primitives
+// ===========================================================================
+
+fn test_misc() {
+    print("[5] v_lerp / v_dist / v_dist2 / v_reflect / ray_plane / aabb_overlap / mat_rot_z");
+    rnd_seed(90210);
+
+    // --- v_lerp
+    let a = v3(1.0, -2.0, 3.5);
+    let b = v3(-4.0, 8.0, 0.25);
+    chk("v_lerp t=0 is exactly a", same3(v_lerp(a, b, 0.0), a));
+    chk("v_lerp t=1 is exactly b", same3(v_lerp(a, b, 1.0), b));
+    let mid = v_lerp(a, b, 0.5);
+    chk("v_lerp t=0.5 is the midpoint",
+        near(mid.x, -1.5, 1.0e-15) * near(mid.y, 3.0, 1.0e-15) * near(mid.z, 1.875, 1.0e-15));
+    let ext = v_lerp(a, b, 2.0);
+    chk("v_lerp extrapolates", near(ext.x, -9.0, 1.0e-14));
+
+    // --- v_dist / v_dist2
+    let worst_d: f64 = 0.0;
+    for (let i = 0; i < 1000; i++) {
+        let p = rnd_vec(); let q = rnd_vec();
+        let d2: f64 = v_dist2(p, q);
+        let d: f64 = v_dist(p, q);
+        let e: f64 = absf(d * d - d2);
+        let rel: f64 = e / (1.0 + d2);
+        if (rel > worst_d) { worst_d = rel; }
+        let dl: f64 = v_len(v_sub(p, q));
+        if (absf(dl - d) > 1.0e-13 * (1.0 + d)) { worst_d = 1.0; }
+        if (v_dist2_xyz(p.x, p.y, p.z, q.x, q.y, q.z) != d2) { worst_d = 1.0; }
+    }
+    chk("v_dist^2 == v_dist2 == |a-b|^2 on 1000 cases", near(worst_d, 0.0, 1.0e-14));
+    chk("v_dist(a,a) == 0", near(v_dist(a, a), 0.0, 0.0));
+    chk("v_dist2(a,a) == 0", near(v_dist2(a, a), 0.0, 0.0));
+
+    // --- v_reflect
+    let n = v3(0.0, 1.0, 0.0);
+    let inc = v3(1.0, -1.0, 0.0);
+    let rf = v_reflect(inc, n);
+    chk("v_reflect off +Y", near(rf.x, 1.0, 1.0e-15) * near(rf.y, 1.0, 1.0e-15) * near(rf.z, 0.0, 1.0e-15));
+    let worst_r: f64 = 0.0;
+    for (let i2 = 0; i2 < 1000; i2++) {
+        let v = rnd_vec();
+        let nn = v_norm(rnd_vec());
+        if (v_len(nn) > 0.5) {
+            let r1 = v_reflect(v, nn);
+            // length preserved
+            let e1: f64 = absf(v_len(r1) - v_len(v)) / (1.0 + v_len(v));
+            if (e1 > worst_r) { worst_r = e1; }
+            // reflecting twice returns the original
+            let r2 = v_reflect(r1, nn);
+            let e2: f64 = v_dist(r2, v) / (1.0 + v_len(v));
+            if (e2 > worst_r) { worst_r = e2; }
+            // the tangential component is unchanged, the normal one negated
+            let e3: f64 = absf(v_dot(r1, nn) + v_dot(v, nn)) / (1.0 + v_len(v));
+            if (e3 > worst_r) { worst_r = e3; }
+        }
+    }
+    chk("v_reflect preserves length, is an involution, flips the normal component",
+        near(worst_r, 0.0, 1.0e-14));
+    note(`v_reflect: worst relative identity error over 1000 cases = ${worst_r}`);
+
+    // --- ray_plane
+    chk("ray_plane ground hit",
+        near(ray_plane_xyz(0.0, 5.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0), 5.0, 1.0e-15));
+    chk("ray_plane parallel misses",
+        near(ray_plane_xyz(0.0, 5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0), -1.0, 0.0));
+    chk("ray_plane behind misses",
+        near(ray_plane_xyz(0.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0), -1.0, 0.0));
+    chk("ray_plane on the plane is t=0",
+        near(ray_plane_xyz(0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0), 0.0, 0.0));
+    // offset plane: y = 3  ->  n=(0,1,0), d=-3
+    chk("ray_plane offset plane",
+        near(ray_plane_xyz(0.0, 10.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, -3.0), 7.0, 1.0e-14));
+    let worst_p: f64 = 0.0;
+    let plane_hits: i32 = 0;
+    for (let i3 = 0; i3 < 2000; i3++) {
+        let ro = rnd_vec();
+        let rd = v_norm(rnd_vec());
+        let pn = v_norm(rnd_vec());
+        let pd: f64 = rndr(-10.0, 10.0);
+        if (v_len(rd) > 0.5) { if (v_len(pn) > 0.5) {
+            let t: f64 = ray_plane(ro, rd, pn, pd);
+            if (t >= 0.0) {
+                plane_hits = plane_hits + 1;
+                let hx: f64 = ro.x + t * rd.x;
+                let hy: f64 = ro.y + t * rd.y;
+                let hz: f64 = ro.z + t * rd.z;
+                let resid: f64 = absf(pn.x*hx + pn.y*hy + pn.z*hz + pd) / (1.0 + t);
+                if (resid > worst_p) { worst_p = resid; }
+                if (ray_plane_xyz(ro.x,ro.y,ro.z, rd.x,rd.y,rd.z, pn.x,pn.y,pn.z, pd) != t) {
+                    worst_p = 1.0;
+                }
+            }
+        } }
+    }
+    chk("ray_plane hit point satisfies n.x + d == 0 on 2000 cases", near(worst_p, 0.0, 1.0e-13));
+    note(`ray_plane: ${plane_hits}/2000 hits, worst scaled residual = ${worst_p}`);
+
+    // --- aabb_overlap
+    let l0 = v3(0.0, 0.0, 0.0); let h0 = v3(1.0, 1.0, 1.0);
+    chk("aabb_overlap self", aabb_overlap(l0, h0, l0, h0));
+    chk("aabb_overlap separated x", 1 - aabb_overlap(l0, h0, v3(1.5,0.0,0.0), v3(2.5,1.0,1.0)));
+    chk("aabb_overlap touching x is 1", aabb_overlap(l0, h0, v3(1.0,0.0,0.0), v3(2.0,1.0,1.0)));
+    chk("aabb_overlap contained", aabb_overlap(l0, h0, v3(0.25,0.25,0.25), v3(0.5,0.5,0.5)));
+    chk("aabb_overlap separated y", 1 - aabb_overlap(l0, h0, v3(0.0,-3.0,0.0), v3(1.0,-2.0,1.0)));
+    chk("aabb_overlap separated z", 1 - aabb_overlap(l0, h0, v3(0.0,0.0,9.0), v3(1.0,1.0,9.5)));
+    let bad_ov: i32 = 0;
+    for (let i4 = 0; i4 < 5000; i4++) {
+        let alx: f64 = rndr(-5.0,5.0); let aly: f64 = rndr(-5.0,5.0); let alz: f64 = rndr(-5.0,5.0);
+        let ahx: f64 = alx + rndr(0.05,3.0); let ahy: f64 = aly + rndr(0.05,3.0); let ahz: f64 = alz + rndr(0.05,3.0);
+        let blx: f64 = rndr(-5.0,5.0); let bly: f64 = rndr(-5.0,5.0); let blz: f64 = rndr(-5.0,5.0);
+        let bhx: f64 = blx + rndr(0.05,3.0); let bhy: f64 = bly + rndr(0.05,3.0); let bhz: f64 = blz + rndr(0.05,3.0);
+        // brute force: sample the intersection region directly
+        let rx0: f64 = alx; if (blx > rx0) { rx0 = blx; }
+        let rx1: f64 = ahx; if (bhx < rx1) { rx1 = bhx; }
+        let ry0: f64 = aly; if (bly > ry0) { ry0 = bly; }
+        let ry1: f64 = ahy; if (bhy < ry1) { ry1 = bhy; }
+        let rz0: f64 = alz; if (blz > rz0) { rz0 = blz; }
+        let rz1: f64 = ahz; if (bhz < rz1) { rz1 = bhz; }
+        let want: i32 = 1;
+        if (rx0 > rx1) { want = 0; }
+        if (ry0 > ry1) { want = 0; }
+        if (rz0 > rz1) { want = 0; }
+        let got: i32 = aabb_overlap_xyz(alx,aly,alz, ahx,ahy,ahz, blx,bly,blz, bhx,bhy,bhz);
+        if (got != want) { bad_ov = bad_ov + 1; }
+        let got2: i32 = aabb_overlap(v3(alx,aly,alz), v3(ahx,ahy,ahz), v3(blx,bly,blz), v3(bhx,bhy,bhz));
+        if (got2 != got) { bad_ov = bad_ov + 1; }
+    }
+    chk("aabb_overlap matches an interval-intersection reference on 5000 cases", 1 - bad_ov);
+
+    // --- mat_rot_z
+    let rz = mat_rot_z(PI * 0.5);
+    let px = mat_apply_dir(rz, v3(1.0, 0.0, 0.0));
+    chk("mat_rot_z(+90) sends +X to +Y",
+        near(px.x, 0.0, 1.0e-15) * near(px.y, 1.0, 1.0e-15) * near(px.z, 0.0, 1.0e-15));
+    let rzi = mat_mul(mat_rot_z(1.234), mat_rot_z(-1.234));
+    chk("mat_rot_z(a) . mat_rot_z(-a) == I", near(ident_error(rzi), 0.0, 1.0e-15));
+    chk("mat_rot_z(0) == I", same16(mat_rot_z(0.0), mat_identity()));
+    // handedness must match mat_rot_x (Y->Z) and mat_rot_y (Z->X)
+    let qx = mat_apply_dir(mat_rot_x(PI * 0.5), v3(0.0, 1.0, 0.0));
+    let qy = mat_apply_dir(mat_rot_y(PI * 0.5), v3(0.0, 0.0, 1.0));
+    chk("mat_rot_x/y/z share one handedness",
+        near(qx.z, 1.0, 1.0e-15) * near(qy.x, 1.0, 1.0e-15) * near(px.y, 1.0, 1.0e-15));
+    // rot_z is rigid, so mat_invert_rigid must undo it
+    let rzr = mat_mul(mat_translate(2.0, 3.0, 4.0), mat_rot_z(0.77));
+    chk("mat_invert_rigid undoes translate*rot_z",
+        near(ident_error(mat_mul(mat_invert_rigid(rzr), rzr)), 0.0, 1.0e-15));
+}
+
+// ===========================================================================
+// 6. cost — informational, so the task report can quote a number
+// ===========================================================================
+
+fn test_cost() {
+    print("[6] cost of the hot scalar entry points");
+    rnd_seed(5150);
+    let n: i32 = 200000;
+    let t0: f64 = clock();
+    let acc: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        acc = acc + ray_aabb_xyz(0.0, 0.0, 9.0, 0.01, 0.02, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0);
+    }
+    let t1: f64 = clock();
+    let acc2: f64 = 0.0;
+    for (let i2 = 0; i2 < n; i2++) {
+        acc2 = acc2 + v_dist2_xyz(1.0, 2.0, 3.0, 4.0, 5.0, 6.5);
+    }
+    let t2: f64 = clock();
+    let m = mat_look_dir(v3(1.0, 2.0, 3.0), 0.4, 0.2);
+    let mp = mat_perspective(1.22, 1.3333, 0.1, 76.32);
+    let acc3: f64 = 0.0;
+    for (let i3 = 0; i3 < 20000; i3++) {
+        let mm = mat_mul(mp, m);
+        acc3 = acc3 + mm[0];
+    }
+    let t3: f64 = clock();
+    let ns_ray: f64 = (t1 - t0) * 1.0e9 / f64(n);
+    let ns_d2: f64 = (t2 - t1) * 1.0e9 / f64(n);
+    let ns_mul: f64 = (t3 - t2) * 1.0e9 / 20000.0;
+    note(`cost: ray_aabb_xyz ${ns_ray} ns/call, v_dist2_xyz ${ns_d2} ns/call, mat_mul ${ns_mul} ns/call (acc ${acc} ${acc2} ${acc3})`);
+    chk("cost probe ran", 1);
+}
+
+// ===========================================================================
+
+fn main() {
+    print("probe_vec — src/vec.hml (W0-2 / G20)");
+    test_regression();
+    test_look_dir();
+    test_invert_rigid();
+    test_ray_aabb();
+    test_misc();
+    test_cost();
+
+    print("");
+    print("measurements:");
+    let nn: i32 = g_notes.length;
+    for (let i = 0; i < nn; i++) { print(`  ${g_notes[i]}`); }
+    print("");
+    let total: i32 = g_pass + g_fail;
+    if (g_fail == 0) {
+        print(`PASS ${g_pass}/${total}`);
+    } else {
+        print(`FAIL ${g_pass}/${total}`);
+        exit(1);
+    }
+}
+
+main();

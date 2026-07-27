@@ -1,0 +1,27 @@
+import { window_open, upload_texture, clear, read_pixels, window_close } from "../src/sdl.hml";
+import { tex_sky, tex_grass, tex_checker } from "../src/texture.hml";
+import { batch_new, batch_flush, batch_tri } from "../src/geom.hml";
+import { write_png } from "../src/png.hml";
+fn skv(x: f64, y: f64, u: f64, v: f64, z: f64) { return { x: x, y: y, z: z, u: u, v: v, r: 255, g: 255, b: 255 }; }
+fn main() {
+    let W = 320.0; let H = 240.0;
+    let win = window_open("sky3", 320, 240, 1);
+    let gtex = upload_texture(win, tex_grass(64,64));
+    let ctex = upload_texture(win, tex_checker(64,64,4));
+    let st = upload_texture(win, tex_sky(320, 128));
+    let b = batch_new(2048);
+    clear(win, 0, 0, 0);
+    // sky, full uv, depth 2
+    batch_tri(b, st, skv(0.0,0.0,0.0,0.0,2.0), skv(320.0,0.0,1.0,0.0,2.0), skv(320.0,240.0,1.0,1.0,2.0));
+    batch_tri(b, st, skv(0.0,0.0,0.0,0.0,2.0), skv(320.0,240.0,1.0,1.0,2.0), skv(0.0,240.0,0.0,1.0,2.0));
+    // a grass quad in front, lower half
+    batch_tri(b, gtex, skv(0.0,150.0,0.0,0.0,0.5), skv(320.0,150.0,1.0,0.0,0.5), skv(320.0,240.0,1.0,1.0,0.5));
+    batch_tri(b, gtex, skv(0.0,150.0,0.0,0.0,0.5), skv(320.0,240.0,1.0,1.0,0.5), skv(0.0,240.0,0.0,1.0,0.5));
+    batch_flush(win, b);
+    let px = buffer(320*240*3);
+    read_pixels(win, px);
+    write_png("/tmp/sky_quad3.png", px, 320, 240);
+    print(`top-left px = ${px[0]},${px[1]},${px[2]}   mid px = ${px[(60*320+160)*3]},${px[(60*320+160)*3+1]},${px[(60*320+160)*3+2]}`);
+    window_close(win);
+}
+main();

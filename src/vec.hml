@@ -3,68 +3,204 @@
 // Vectors are plain objects { x, y, z }. Matrices are flat arrays of 16 f64 in
 // row-major order. Everything here is pure (no I/O), so it's straightforward to
 // unit-test.
+//
+// PERFORMANCE CONTRACT (CLAUDE.md §4). This module sits under the emit kernel and
+// under hitscan, so every function follows the hot skeleton:
+//   * every parameter is `p_`-prefixed (rule F / A3),
+//   * a parameter or field is copied into a typed `f64` local exactly when it is
+//     read MORE THAN ONCE (rule A1 — see the measured note above v_add: on a
+//     single-use read the copy is a net loss),
+//   * scalar returns go through a named copy-out local (`return acc;` re-boxes),
+//   * no closures, no `defer`, no `try`, no `throw`, no template strings,
+//   * min / max / abs / swap are hand-inlined; nothing here calls out except to
+//     `sin` / `cos` / `sqrt` / `tan`,
+//   * the only allocations are the result objects / arrays the API is defined to
+//     return. Every predicate and every distance returns a scalar and allocates
+//     nothing, and the `_xyz` scalar entry points let a hot caller avoid building
+//     argument objects at all.
+//
+// hemlockc codegen note, verified on this build with `--emit-c`: `let x: f64 = p`
+// unboxes to a C `double` only when `p` is a scalar `f64` PARAMETER. A read of an
+// object field or an array element (`p_v.x`, `p_m[0]`) stays a boxed `HmlValue`
+// even with an `f64` annotation and even from an `array<f64>`. That is why the
+// `_xyz` entry points exist and why the object-shaped functions are tuned by
+// measurement rather than by applying A1 mechanically.
+//
+// Every export that existed before the Nightshade work is unchanged in name,
+// arity, argument order and produced value. `examples/probe_vec.hml` carries a
+// verbatim copy of the previous implementations and diffs against them; three
+// legacy renderers (cube_png, ground_png, scene_png) also produce byte-identical
+// PNGs against the pre-change build.
 
 import { sin, cos, sqrt, tan } from "@stdlib/math";
 
-// --- vec3 ---
+// ---------------------------------------------------------------------------
+// vec3
+// ---------------------------------------------------------------------------
+
 export fn v3(x: f64, y: f64, z: f64): object { return { x: x, y: y, z: z }; }
-export fn v_add(a, b)  { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
-export fn v_sub(a, b)  { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
-export fn v_scale(a, s) { return { x: a.x * s, y: a.y * s, z: a.z * s }; }
-export fn v_dot(a, b): f64 { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
-export fn v_cross(a, b) {
-    return { x: a.y * b.z - a.z * b.y,
-             y: a.z * b.x - a.x * b.z,
-             z: a.x * b.y - a.y * b.x };
+// NOTE on A1 (see the header): a field is copied into an f64 local only where it
+// is read MORE THAN ONCE. On a single-use field the copy is a net loss — the
+// `hml_to_f64` conversion costs more than the unboxed arithmetic saves, and if
+// the other operand is still boxed the value is re-boxed anyway. Measured, this
+// file, 500 k calls, compiled -O1:
+//     v_dot   fields copied 114 ns   read directly  88 ns
+//     v_add   fields copied 191 ns   read directly 165 ns
+//     v_len   fields copied  80 ns   read directly  95 ns   (two uses each)
+//     v_norm  fields copied 206 ns   read directly 246 ns   (two uses each)
+// So: copy in v_len / v_norm / v_cross / v_reflect / mat_mul / the ray tests,
+// do not copy in v_add / v_sub / v_scale / v_dot.
+
+export fn v_add(p_a, p_b) {
+    return { x: p_a.x + p_b.x, y: p_a.y + p_b.y, z: p_a.z + p_b.z };
 }
 
-export fn v_len(a): f64 { return sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
+export fn v_sub(p_a, p_b) {
+    return { x: p_a.x - p_b.x, y: p_a.y - p_b.y, z: p_a.z - p_b.z };
+}
 
-export fn v_norm(a) {
-    let l = v_len(a);
+export fn v_scale(p_a, p_s) {
+    return { x: p_a.x * p_s, y: p_a.y * p_s, z: p_a.z * p_s };
+}
+
+export fn v_dot(p_a, p_b): f64 {
+    let out: f64 = p_a.x * p_b.x + p_a.y * p_b.y + p_a.z * p_b.z;
+    return out;
+}
+
+export fn v_cross(p_a, p_b) {
+    let ax: f64 = p_a.x; let ay: f64 = p_a.y; let az: f64 = p_a.z;
+    let bx: f64 = p_b.x; let by: f64 = p_b.y; let bz: f64 = p_b.z;
+    return { x: ay * bz - az * by,
+             y: az * bx - ax * bz,
+             z: ax * by - ay * bx };
+}
+
+export fn v_len(p_a): f64 {
+    let ax: f64 = p_a.x; let ay: f64 = p_a.y; let az: f64 = p_a.z;
+    let out: f64 = sqrt(ax * ax + ay * ay + az * az);
+    return out;
+}
+
+export fn v_norm(p_a) {
+    let ax: f64 = p_a.x; let ay: f64 = p_a.y; let az: f64 = p_a.z;
+    let l: f64 = sqrt(ax * ax + ay * ay + az * az);
     if (l < 1.0e-9) { return { x: 0.0, y: 0.0, z: 0.0 }; }
-    let inv = 1.0 / l;
-    return { x: a.x * inv, y: a.y * inv, z: a.z * inv };
+    let inv: f64 = 1.0 / l;
+    return { x: ax * inv, y: ay * inv, z: az * inv };
 }
 
-// --- 4x4 matrices (row-major flat array of 16) ---
+// --- added for Nightshade (G20) -------------------------------------------
+
+// Squared distance. Allocates nothing; use this for every comparison and keep
+// `v_dist` for the cases that genuinely need the metre value.
+export fn v_dist2(p_a, p_b): f64 {
+    let dx: f64 = p_a.x - p_b.x;
+    let dy: f64 = p_a.y - p_b.y;
+    let dz: f64 = p_a.z - p_b.z;
+    let out: f64 = dx * dx + dy * dy + dz * dz;
+    return out;
+}
+
+// Scalar-argument form: no argument objects, so it is safe in an inner loop.
+export fn v_dist2_xyz(p_ax: f64, p_ay: f64, p_az: f64,
+                      p_bx: f64, p_by: f64, p_bz: f64): f64 {
+    let dx: f64 = p_ax - p_bx;
+    let dy: f64 = p_ay - p_by;
+    let dz: f64 = p_az - p_bz;
+    let out: f64 = dx * dx + dy * dy + dz * dz;
+    return out;
+}
+
+export fn v_dist(p_a, p_b): f64 {
+    let dx: f64 = p_a.x - p_b.x;
+    let dy: f64 = p_a.y - p_b.y;
+    let dz: f64 = p_a.z - p_b.z;
+    let out: f64 = sqrt(dx * dx + dy * dy + dz * dz);
+    return out;
+}
+
+// (1-t)*a + t*b — exact at t == 0 and t == 1, which `a + (b-a)*t` is not.
+// `t` is not clamped; extrapolation is a legitimate caller choice.
+export fn v_lerp(p_a, p_b, p_t) {
+    let t: f64 = p_t;
+    let u: f64 = 1.0 - t;
+    return { x: u * p_a.x + t * p_b.x,
+             y: u * p_a.y + t * p_b.y,
+             z: u * p_a.z + t * p_b.z };
+}
+
+// Mirror `v` about the plane whose unit normal is `n`:  v - 2*(v.n)*n.
+// `n` must be normalised; the caller owns that.
+export fn v_reflect(p_v, p_n) {
+    let vx: f64 = p_v.x; let vy: f64 = p_v.y; let vz: f64 = p_v.z;
+    let nx: f64 = p_n.x; let ny: f64 = p_n.y; let nz: f64 = p_n.z;
+    let d: f64 = (vx * nx + vy * ny + vz * nz) * 2.0;
+    return { x: vx - d * nx, y: vy - d * ny, z: vz - d * nz };
+}
+
+// ---------------------------------------------------------------------------
+// 4x4 matrices (row-major flat array of 16)
+// ---------------------------------------------------------------------------
+
 export fn mat_identity() {
     return [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
 }
 
-// C = A · B (both row-major).
-export fn mat_mul(a, b) {
-    let c = [];
-    for (let i = 0; i < 16; i++) { c.push(0.0); }
-    for (let row = 0; row < 4; row++) {
-        for (let col = 0; col < 4; col++) {
-            let s = 0.0;
-            for (let k = 0; k < 4; k++) {
-                s = s + a[row * 4 + k] * b[k * 4 + col];
-            }
-            c[row * 4 + col] = s;
-        }
-    }
-    return c;
+// C = A · B (both row-major). Both operands are hoisted into 32 named f64
+// locals (A4) and the 16 dot products are unrolled — same operand order, same
+// accumulation order as the loop form it replaces.
+export fn mat_mul(p_a, p_b) {
+    let a0: f64 = p_a[0];   let a1: f64 = p_a[1];   let a2: f64 = p_a[2];   let a3: f64 = p_a[3];
+    let a4: f64 = p_a[4];   let a5: f64 = p_a[5];   let a6: f64 = p_a[6];   let a7: f64 = p_a[7];
+    let a8: f64 = p_a[8];   let a9: f64 = p_a[9];   let a10: f64 = p_a[10]; let a11: f64 = p_a[11];
+    let a12: f64 = p_a[12]; let a13: f64 = p_a[13]; let a14: f64 = p_a[14]; let a15: f64 = p_a[15];
+    let b0: f64 = p_b[0];   let b1: f64 = p_b[1];   let b2: f64 = p_b[2];   let b3: f64 = p_b[3];
+    let b4: f64 = p_b[4];   let b5: f64 = p_b[5];   let b6: f64 = p_b[6];   let b7: f64 = p_b[7];
+    let b8: f64 = p_b[8];   let b9: f64 = p_b[9];   let b10: f64 = p_b[10]; let b11: f64 = p_b[11];
+    let b12: f64 = p_b[12]; let b13: f64 = p_b[13]; let b14: f64 = p_b[14]; let b15: f64 = p_b[15];
+    return [
+        0.0 + a0*b0  + a1*b4  + a2*b8   + a3*b12,
+        0.0 + a0*b1  + a1*b5  + a2*b9   + a3*b13,
+        0.0 + a0*b2  + a1*b6  + a2*b10  + a3*b14,
+        0.0 + a0*b3  + a1*b7  + a2*b11  + a3*b15,
+        0.0 + a4*b0  + a5*b4  + a6*b8   + a7*b12,
+        0.0 + a4*b1  + a5*b5  + a6*b9   + a7*b13,
+        0.0 + a4*b2  + a5*b6  + a6*b10  + a7*b14,
+        0.0 + a4*b3  + a5*b7  + a6*b11  + a7*b15,
+        0.0 + a8*b0  + a9*b4  + a10*b8  + a11*b12,
+        0.0 + a8*b1  + a9*b5  + a10*b9  + a11*b13,
+        0.0 + a8*b2  + a9*b6  + a10*b10 + a11*b14,
+        0.0 + a8*b3  + a9*b7  + a10*b11 + a11*b15,
+        0.0 + a12*b0 + a13*b4 + a14*b8  + a15*b12,
+        0.0 + a12*b1 + a13*b5 + a14*b9  + a15*b13,
+        0.0 + a12*b2 + a13*b6 + a14*b10 + a15*b14,
+        0.0 + a12*b3 + a13*b7 + a14*b11 + a15*b15
+    ];
 }
 
 // Transform a vec3 as a point (w=1) by a row-major matrix. Returns {x,y,z,w}.
-export fn mat_apply(m, v) {
+// The three vector components are read four times each, so they are copied; the
+// sixteen matrix elements are read once each, so they are not (copying them
+// measured 490 ns/call against 428 ns for this form).
+export fn mat_apply(p_m, p_v) {
+    let vx: f64 = p_v.x; let vy: f64 = p_v.y; let vz: f64 = p_v.z;
     return {
-        x: m[0]*v.x + m[1]*v.y + m[2]*v.z + m[3],
-        y: m[4]*v.x + m[5]*v.y + m[6]*v.z + m[7],
-        z: m[8]*v.x + m[9]*v.y + m[10]*v.z + m[11],
-        w: m[12]*v.x + m[13]*v.y + m[14]*v.z + m[15],
+        x: p_m[0]*vx + p_m[1]*vy + p_m[2]*vz + p_m[3],
+        y: p_m[4]*vx + p_m[5]*vy + p_m[6]*vz + p_m[7],
+        z: p_m[8]*vx + p_m[9]*vy + p_m[10]*vz + p_m[11],
+        w: p_m[12]*vx + p_m[13]*vy + p_m[14]*vz + p_m[15],
     };
 }
 
 // Transform a vec3 as a direction (w=0; ignores translation).
-export fn mat_apply_dir(m, v) {
+export fn mat_apply_dir(p_m, p_v) {
+    let vx: f64 = p_v.x; let vy: f64 = p_v.y; let vz: f64 = p_v.z;
     return {
-        x: m[0]*v.x + m[1]*v.y + m[2]*v.z,
-        y: m[4]*v.x + m[5]*v.y + m[6]*v.z,
-        z: m[8]*v.x + m[9]*v.y + m[10]*v.z,
+        x: p_m[0]*vx + p_m[1]*vy + p_m[2]*vz,
+        y: p_m[4]*vx + p_m[5]*vy + p_m[6]*vz,
+        z: p_m[8]*vx + p_m[9]*vy + p_m[10]*vz,
     };
 }
 
@@ -86,6 +222,12 @@ export fn mat_rot_x(a: f64) {
     return [1.0,0.0,0.0,0.0, 0.0,c,0.0-s,0.0, 0.0,s,c,0.0, 0.0,0.0,0.0,1.0];
 }
 
+// Rotation about +Z, same handedness as mat_rot_x / mat_rot_y (+X turns toward +Y).
+export fn mat_rot_z(a: f64) {
+    let c = cos(a); let s = sin(a);
+    return [c,0.0-s,0.0,0.0, s,c,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+}
+
 // Right-handed perspective, looking down -Z. fov in radians.
 export fn mat_perspective(fov: f64, aspect: f64, near: f64, far: f64) {
     let f = 1.0 / tan(fov * 0.5);
@@ -97,6 +239,11 @@ export fn mat_perspective(fov: f64, aspect: f64, near: f64, far: f64) {
 }
 
 // View matrix placing the camera at `eye` looking at `target`, up `up`.
+//
+// NOTE: this degenerates when (target - eye) is parallel to `up` — cross(f, up)
+// collapses to the zero vector and v_norm returns (0,0,0), producing a rank-2
+// matrix. A camera driven by yaw/pitch must use `mat_look_dir` instead. Kept
+// unchanged because the legacy examples import it.
 export fn mat_look_at(eye, target, up) {
     let f = v_norm(v_sub(target, eye));     // forward
     let r = v_norm(v_cross(f, up));         // right
@@ -105,4 +252,181 @@ export fn mat_look_at(eye, target, up) {
              u.x,  u.y,  u.z, 0.0 - v_dot(u, eye),
             0.0-f.x, 0.0-f.y, 0.0-f.z, v_dot(f, eye),
             0.0, 0.0, 0.0, 1.0];
+}
+
+// --- added for Nightshade (G20) -------------------------------------------
+
+// View matrix from an eye position and a yaw/pitch pair. The basis is built
+// straight from the angles, so there is no cross product to collapse and no
+// pitch that degenerates — including exactly +/-pi/2, where mat_look_at fails.
+//
+// Convention (identical to mat_look_at + mat_perspective: +Y up, the camera
+// looks down -Z in view space, and at yaw = pitch = 0 it looks along world -Z;
+// this is the convention examples/walk_gpu.hml already uses):
+//     forward = ( sin(yaw)*cos(pitch),  sin(pitch), -cos(yaw)*cos(pitch) )
+//     right   = ( cos(yaw),             0,           sin(yaw)            )
+//     up      = right x forward
+// right is independent of pitch, so the basis stays orthonormal for every
+// finite pitch. Yaw increases clockwise seen from above; pitch increases upward.
+export fn mat_look_dir(p_eye, p_yaw: f64, p_pitch: f64) {
+    let ex: f64 = p_eye.x; let ey: f64 = p_eye.y; let ez: f64 = p_eye.z;
+    let cy: f64 = cos(p_yaw);   let sy: f64 = sin(p_yaw);
+    let cp: f64 = cos(p_pitch); let sp: f64 = sin(p_pitch);
+
+    let fx: f64 = sy * cp;      let fy: f64 = sp;   let fz: f64 = -(cy * cp);
+    let rx: f64 = cy;           let ry: f64 = 0.0;  let rz: f64 = sy;
+    let ux: f64 = -(sy * sp);   let uy: f64 = cp;   let uz: f64 = cy * sp;
+
+    return [ rx, ry, rz, -(rx*ex + ry*ey + rz*ez),
+             ux, uy, uz, -(ux*ex + uy*ey + uz*ez),
+             -fx, -fy, -fz, fx*ex + fy*ey + fz*ez,
+             0.0, 0.0, 0.0, 1.0 ];
+}
+
+// Inverse of a RIGID transform (orthonormal 3x3 rotation + translation, last
+// row 0 0 0 1): [R|t]^-1 = [R^T | -R^T t]. No determinant, no division, exact
+// to rounding. It is the caller's job not to hand this a scaled or projective
+// matrix — for those the result is meaningless, not merely inaccurate.
+export fn mat_invert_rigid(p_m) {
+    let m0: f64 = p_m[0]; let m1: f64 = p_m[1]; let m2: f64 = p_m[2];   let m3: f64 = p_m[3];
+    let m4: f64 = p_m[4]; let m5: f64 = p_m[5]; let m6: f64 = p_m[6];   let m7: f64 = p_m[7];
+    let m8: f64 = p_m[8]; let m9: f64 = p_m[9]; let m10: f64 = p_m[10]; let m11: f64 = p_m[11];
+    return [ m0, m4, m8,  -(m0*m3 + m4*m7 + m8*m11),
+             m1, m5, m9,  -(m1*m3 + m5*m7 + m9*m11),
+             m2, m6, m10, -(m2*m3 + m6*m7 + m10*m11),
+             0.0, 0.0, 0.0, 1.0 ];
+}
+
+// ---------------------------------------------------------------------------
+// Ray / AABB / plane
+// ---------------------------------------------------------------------------
+
+// Slab test. Returns the parametric distance to the first intersection with the
+// box, or -1.0 for a miss. An origin inside the box returns 0.0. The ray is
+// infinite; clamp the result yourself. `d` need not be normalised, but if it is
+// not, the returned t is in units of |d|.
+//
+// Axis-parallel rays are handled by an explicit branch rather than by relying on
+// inf/NaN arithmetic, so the result never depends on IEEE corner cases.
+// Requires bmin <= bmax on every axis.
+export fn ray_aabb_xyz(p_ox: f64, p_oy: f64, p_oz: f64,
+                       p_dx: f64, p_dy: f64, p_dz: f64,
+                       p_lox: f64, p_loy: f64, p_loz: f64,
+                       p_hix: f64, p_hiy: f64, p_hiz: f64): f64 {
+    let ox: f64 = p_ox; let oy: f64 = p_oy; let oz: f64 = p_oz;
+    let dx: f64 = p_dx; let dy: f64 = p_dy; let dz: f64 = p_dz;
+    let lox: f64 = p_lox; let loy: f64 = p_loy; let loz: f64 = p_loz;
+    let hix: f64 = p_hix; let hiy: f64 = p_hiy; let hiz: f64 = p_hiz;
+
+    let tmin: f64 = 0.0;
+    let tmax: f64 = 1.0e300;
+    let t1: f64 = 0.0;
+    let t2: f64 = 0.0;
+    let sw: f64 = 0.0;
+    let miss: i32 = 0;
+
+    // X
+    if (dx == 0.0) {
+        if (ox < lox) { miss = 1; }
+        if (ox > hix) { miss = 1; }
+    } else {
+        t1 = (lox - ox) / dx;
+        t2 = (hix - ox) / dx;
+        if (t1 > t2) { sw = t1; t1 = t2; t2 = sw; }
+        if (t1 > tmin) { tmin = t1; }
+        if (t2 < tmax) { tmax = t2; }
+        if (tmin > tmax) { miss = 1; }
+    }
+    // Y
+    if (miss == 0) {
+        if (dy == 0.0) {
+            if (oy < loy) { miss = 1; }
+            if (oy > hiy) { miss = 1; }
+        } else {
+            t1 = (loy - oy) / dy;
+            t2 = (hiy - oy) / dy;
+            if (t1 > t2) { sw = t1; t1 = t2; t2 = sw; }
+            if (t1 > tmin) { tmin = t1; }
+            if (t2 < tmax) { tmax = t2; }
+            if (tmin > tmax) { miss = 1; }
+        }
+    }
+    // Z
+    if (miss == 0) {
+        if (dz == 0.0) {
+            if (oz < loz) { miss = 1; }
+            if (oz > hiz) { miss = 1; }
+        } else {
+            t1 = (loz - oz) / dz;
+            t2 = (hiz - oz) / dz;
+            if (t1 > t2) { sw = t1; t1 = t2; t2 = sw; }
+            if (t1 > tmin) { tmin = t1; }
+            if (t2 < tmax) { tmax = t2; }
+            if (tmin > tmax) { miss = 1; }
+        }
+    }
+
+    let out: f64 = -1.0;
+    if (miss == 0) { out = tmin; }
+    return out;
+}
+
+// Object-argument form of ray_aabb_xyz. Same contract, same numbers.
+export fn ray_aabb(p_ro, p_rd, p_bmin, p_bmax): f64 {
+    let out: f64 = ray_aabb_xyz(p_ro.x, p_ro.y, p_ro.z,
+                                p_rd.x, p_rd.y, p_rd.z,
+                                p_bmin.x, p_bmin.y, p_bmin.z,
+                                p_bmax.x, p_bmax.y, p_bmax.z);
+    return out;
+}
+
+// Ray vs the plane  dot(n, x) + d = 0  (the Gribb-Hartmann / frustum.hml plane
+// convention: a,b,c,d with a*x + b*y + c*z + d = 0, normal pointing to the
+// positive half-space). Returns t >= 0, or -1.0 when the ray is parallel to the
+// plane or the plane is behind the origin.
+export fn ray_plane_xyz(p_ox: f64, p_oy: f64, p_oz: f64,
+                        p_dx: f64, p_dy: f64, p_dz: f64,
+                        p_nx: f64, p_ny: f64, p_nz: f64, p_pd: f64): f64 {
+    let nx: f64 = p_nx; let ny: f64 = p_ny; let nz: f64 = p_nz;
+    let den: f64 = nx * p_dx + ny * p_dy + nz * p_dz;
+    let ad: f64 = den;
+    if (ad < 0.0) { ad = -ad; }
+    let out: f64 = -1.0;
+    if (ad > 1.0e-12) {
+        let num: f64 = nx * p_ox + ny * p_oy + nz * p_oz + p_pd;
+        let t: f64 = -num / den;
+        if (t >= 0.0) { out = t; }
+    }
+    return out;
+}
+
+export fn ray_plane(p_ro, p_rd, p_n, p_d): f64 {
+    let out: f64 = ray_plane_xyz(p_ro.x, p_ro.y, p_ro.z,
+                                 p_rd.x, p_rd.y, p_rd.z,
+                                 p_n.x, p_n.y, p_n.z, p_d);
+    return out;
+}
+
+// Inclusive AABB overlap test. Returns 1 when the boxes touch or interpenetrate,
+// 0 otherwise. Requires lo <= hi on every axis for both boxes.
+export fn aabb_overlap_xyz(p_alox: f64, p_aloy: f64, p_aloz: f64,
+                           p_ahix: f64, p_ahiy: f64, p_ahiz: f64,
+                           p_blox: f64, p_bloy: f64, p_bloz: f64,
+                           p_bhix: f64, p_bhiy: f64, p_bhiz: f64): i32 {
+    let out: i32 = 1;
+    if (p_ahix < p_blox) { out = 0; }
+    if (p_bhix < p_alox) { out = 0; }
+    if (p_ahiy < p_bloy) { out = 0; }
+    if (p_bhiy < p_aloy) { out = 0; }
+    if (p_ahiz < p_bloz) { out = 0; }
+    if (p_bhiz < p_aloz) { out = 0; }
+    return out;
+}
+
+export fn aabb_overlap(p_amin, p_amax, p_bmin, p_bmax): i32 {
+    let out: i32 = aabb_overlap_xyz(p_amin.x, p_amin.y, p_amin.z,
+                                    p_amax.x, p_amax.y, p_amax.z,
+                                    p_bmin.x, p_bmin.y, p_bmin.z,
+                                    p_bmax.x, p_bmax.y, p_bmax.z);
+    return out;
 }

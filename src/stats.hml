@@ -1,0 +1,395 @@
+// stats.hml — per-frame counters and stage timers. Compiled into shipping
+// builds, not stripped, because losing the ability to ablate the pipeline is
+// losing the ability to answer "why is it slow" ever again (ENGINE_GAPS G22).
+//
+// GENERIC ENGINE MODULE. Every name here is a rendering/simulation noun that
+// any PS1-style engine would use. No game words, no colours (R1).
+//
+// -----------------------------------------------------------------------------
+// THE SHAPE, AND WHY
+// -----------------------------------------------------------------------------
+// Two flat, fixed-length arrays indexed by compile-time constants:
+//
+//     g_stat_c : array<i32>   counters, indexed by STAT_*
+//     g_stat_t : array<f64>   accumulated milliseconds, indexed by STAT_T_*
+//
+// NO string keys and NO objects. A string-keyed map costs a hash per bump; an
+// object costs an allocation. Both run thousands of times a frame, which is
+// exactly the budget this module exists to protect. An `array<i32>` index has
+// an inlined fast path in the compiled backend and is measured faster than a
+// raw buffer for this access pattern.
+//
+// Counters are bumped with `v++` on a typed local, never `v = v + 1`: `+`
+// emits an i32 overflow check (measured 89 vs 209 ms / 50 M), `++` wraps.
+//
+// `stat_report_string` builds a template string and is therefore throttled to
+// 4 Hz. A template string is ~165 ns; hundreds per frame is real money. Call it
+// every frame if you like — it returns the cached text until 250 ms have
+// elapsed. `stat_report_string_now` forces a rebuild for tools.
+//
+// Timers nest safely only if you do not re-`stat_begin` an index that is still
+// open; each index owns one start slot. Aggregates (STAT_T_EMIT, STAT_T_SORT,
+// STAT_T_FLUSH) are separate indices, so wrapping a group of stages in an
+// aggregate timer is legal and costs one more counter read.
+
+import { clock_now, clock_ms_per_count } from "./time.hml";
+
+// ---------------------------------------------------------------------------
+// COUNTER INDICES  (STAT_*)
+// Covers every counter named in ARCHITECTURE.md §4 and ENGINE_GAPS G22:
+// triangles submitted per layer, rejections per cull stage, straddle-fallback
+// count, batch overflows, draw calls.
+// ---------------------------------------------------------------------------
+
+// Triangles pushed into each batch this frame (ARCHITECTURE §2.4 layers).
+export let STAT_TRIS_SKY        = 0;
+export let STAT_TRIS_WORLD      = 1;
+export let STAT_TRIS_FX         = 2;
+export let STAT_TRIS_HUD        = 3;
+export let STAT_TRIS_SUBMITTED  = 4;   // sum offered to the batches
+export let STAT_TRIS_DRAWN      = 5;   // sum actually handed to the renderer
+export let STAT_VERTS_DRAWN     = 6;
+
+// Rejections, one index per cull stage (§4 stage 13/14, ENGINE_GAPS G8).
+export let STAT_REJ_FRUSTUM     = 7;
+export let STAT_REJ_BACKFACE    = 8;
+export let STAT_REJ_NEAR        = 9;
+export let STAT_REJ_GUARD       = 10;
+export let STAT_REJ_DISTANCE    = 11;
+
+// Clipping (ENGINE_GAPS G7). If STAT_CLIP_SLOW exceeds 10 % of
+// STAT_TRIS_SUBMITTED that is a bug report, not a tuning knob.
+export let STAT_CLIP_STRADDLE   = 12;
+export let STAT_CLIP_SLOW       = 13;
+
+// Batch overflow (ENGINE_GAPS G2). Overflow drops a triangle and counts it;
+// it never corrupts.
+export let STAT_BATCH_OVERFLOW  = 14;  // total across layers
+export let STAT_OVERFLOW_SKY    = 15;
+export let STAT_OVERFLOW_WORLD  = 16;
+export let STAT_OVERFLOW_FX     = 17;
+export let STAT_OVERFLOW_HUD    = 18;
+
+// Submission (§4 stages 20-25).
+export let STAT_DRAW_CALLS      = 19;
+export let STAT_TEX_RUNS        = 20;
+
+// Ring walk / streaming (§4 stage 13).
+export let STAT_CHUNKS_TESTED   = 21;
+export let STAT_CHUNKS_CULLED   = 22;
+export let STAT_CHUNKS_DRAWN    = 23;
+export let STAT_CHUNKS_MESHED   = 24;
+
+// Instances (§4 stage 14).
+export let STAT_ENTS_TESTED     = 25;
+export let STAT_ENTS_CULLED     = 26;
+export let STAT_ENTS_DRAWN      = 27;
+
+// Client-side effects and lighting (§4 stages 5, 16).
+export let STAT_PARTICLES       = 28;
+export let STAT_LIGHTS          = 29;
+
+// Loop bookkeeping (§4 stages 3, 7).
+export let STAT_SIM_TICKS       = 30;
+export let STAT_SKY_ROWS        = 31;
+export let STAT_SOUNDS          = 32;
+
+export let STAT_COUNT           = 33;
+
+// ---------------------------------------------------------------------------
+// TIMER INDICES  (STAT_T_*)
+// One index per stage of the ARCHITECTURE.md §4 frame graph. §4 requires
+// timings for stages 11-17, 21, 22 and 26; the rest are here because
+// benchframe must be able to report every line of the graph.
+// ---------------------------------------------------------------------------
+
+export let STAT_T_FRAME          = 0;   // whole frame
+export let STAT_T_INPUT          = 1;   // §4  1-2   input_sample / make_command
+export let STAT_T_SIM            = 2;   // §4  3     sim_step, all N of them
+export let STAT_T_SNAPSHOT       = 3;   // §4  4     snapshot_build
+export let STAT_T_FX_UPDATE      = 4;   // §4  5     fx_update
+export let STAT_T_TOD            = 5;   // §4  6     env evaluation
+export let STAT_T_SKYBAKE        = 6;   // §4  7     incremental sky re-bake
+export let STAT_T_VIEW           = 7;   // §4  8-10  view / mvp / frustum
+export let STAT_T_BATCH_RESET    = 8;   // §4 11
+export let STAT_T_EMIT_SKY       = 9;   // §4 12
+export let STAT_T_EMIT_TERRAIN   = 10;  // §4 13
+export let STAT_T_EMIT_ENTITY    = 11;  // §4 14
+export let STAT_T_EMIT_VIEWMODEL = 12;  // §4 15
+export let STAT_T_EMIT_FX        = 13;  // §4 16
+export let STAT_T_EMIT           = 14;  // §4 11-17 aggregate
+export let STAT_T_TARGET_BEGIN   = 15;  // §4 18
+export let STAT_T_CLEAR          = 16;  // §4 19
+export let STAT_T_FLUSH_SKY      = 17;  // §4 20
+export let STAT_T_SORT_WORLD     = 18;  // §4 21 sort half
+export let STAT_T_FLUSH_WORLD    = 19;  // §4 21 flush half
+export let STAT_T_SORT_FX        = 20;  // §4 22 sort half
+export let STAT_T_FLUSH_FX       = 21;  // §4 22 flush half
+export let STAT_T_POSTFX         = 22;  // §4 23
+export let STAT_T_HUD            = 23;  // §4 24
+export let STAT_T_FLUSH_HUD      = 24;  // §4 25
+export let STAT_T_PRESENT        = 25;  // §4 26-27 target_end + present
+export let STAT_T_SORT           = 26;  // aggregate of all sorts
+export let STAT_T_FLUSH          = 27;  // aggregate of all flushes
+
+export let STAT_T_COUNT          = 28;
+
+// How often stat_report_string is allowed to rebuild its text (4 Hz).
+export let STAT_REPORT_INTERVAL_MS = 250.0;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let g_stat_c: array<i32> = [];      // counters, index STAT_*
+let g_stat_t: array<f64> = [];      // accumulated ms, index STAT_T_*
+let g_stat_t0: array = [];          // open timer starts, raw u64 counts
+let g_stat_open: array<i32> = [];   // 1 while a timer index is open
+let g_stat_cname: array = [];       // counter labels, report only
+let g_stat_tname: array = [];       // timer labels, report only
+
+let g_stat_mspc: f64 = clock_ms_per_count();
+let g_stat_report_txt: string = "";
+let g_stat_report_at: u64 = 0;
+let g_stat_frames: i32 = 0;
+
+fn stats_module_init() {
+    for (let i = 0; i < STAT_COUNT; i++) {
+        g_stat_c.push(0);
+        g_stat_cname.push("stat");
+    }
+    for (let j = 0; j < STAT_T_COUNT; j++) {
+        g_stat_t.push(0.0);
+        g_stat_t0.push(0);
+        g_stat_open.push(0);
+        g_stat_tname.push("timer");
+    }
+    g_stat_cname[STAT_TRIS_SKY]        = "tris.sky";
+    g_stat_cname[STAT_TRIS_WORLD]      = "tris.world";
+    g_stat_cname[STAT_TRIS_FX]         = "tris.fx";
+    g_stat_cname[STAT_TRIS_HUD]        = "tris.hud";
+    g_stat_cname[STAT_TRIS_SUBMITTED]  = "tris.submitted";
+    g_stat_cname[STAT_TRIS_DRAWN]      = "tris.drawn";
+    g_stat_cname[STAT_VERTS_DRAWN]     = "verts.drawn";
+    g_stat_cname[STAT_REJ_FRUSTUM]     = "rej.frustum";
+    g_stat_cname[STAT_REJ_BACKFACE]    = "rej.backface";
+    g_stat_cname[STAT_REJ_NEAR]        = "rej.near";
+    g_stat_cname[STAT_REJ_GUARD]       = "rej.guard";
+    g_stat_cname[STAT_REJ_DISTANCE]    = "rej.distance";
+    g_stat_cname[STAT_CLIP_STRADDLE]   = "clip.straddle";
+    g_stat_cname[STAT_CLIP_SLOW]       = "clip.slow";
+    g_stat_cname[STAT_BATCH_OVERFLOW]  = "batch.overflow";
+    g_stat_cname[STAT_OVERFLOW_SKY]    = "overflow.sky";
+    g_stat_cname[STAT_OVERFLOW_WORLD]  = "overflow.world";
+    g_stat_cname[STAT_OVERFLOW_FX]     = "overflow.fx";
+    g_stat_cname[STAT_OVERFLOW_HUD]    = "overflow.hud";
+    g_stat_cname[STAT_DRAW_CALLS]      = "draw.calls";
+    g_stat_cname[STAT_TEX_RUNS]        = "draw.texruns";
+    g_stat_cname[STAT_CHUNKS_TESTED]   = "chunks.tested";
+    g_stat_cname[STAT_CHUNKS_CULLED]   = "chunks.culled";
+    g_stat_cname[STAT_CHUNKS_DRAWN]    = "chunks.drawn";
+    g_stat_cname[STAT_CHUNKS_MESHED]   = "chunks.meshed";
+    g_stat_cname[STAT_ENTS_TESTED]     = "ents.tested";
+    g_stat_cname[STAT_ENTS_CULLED]     = "ents.culled";
+    g_stat_cname[STAT_ENTS_DRAWN]      = "ents.drawn";
+    g_stat_cname[STAT_PARTICLES]       = "particles";
+    g_stat_cname[STAT_LIGHTS]          = "lights";
+    g_stat_cname[STAT_SIM_TICKS]       = "sim.ticks";
+    g_stat_cname[STAT_SKY_ROWS]        = "sky.rows";
+    g_stat_cname[STAT_SOUNDS]          = "sounds";
+
+    g_stat_tname[STAT_T_FRAME]          = "frame";
+    g_stat_tname[STAT_T_INPUT]          = "input";
+    g_stat_tname[STAT_T_SIM]            = "sim";
+    g_stat_tname[STAT_T_SNAPSHOT]       = "snapshot";
+    g_stat_tname[STAT_T_FX_UPDATE]      = "fx.update";
+    g_stat_tname[STAT_T_TOD]            = "env";
+    g_stat_tname[STAT_T_SKYBAKE]        = "sky.bake";
+    g_stat_tname[STAT_T_VIEW]           = "view";
+    g_stat_tname[STAT_T_BATCH_RESET]    = "batch.reset";
+    g_stat_tname[STAT_T_EMIT_SKY]       = "emit.sky";
+    g_stat_tname[STAT_T_EMIT_TERRAIN]   = "emit.terrain";
+    g_stat_tname[STAT_T_EMIT_ENTITY]    = "emit.entity";
+    g_stat_tname[STAT_T_EMIT_VIEWMODEL] = "emit.viewmodel";
+    g_stat_tname[STAT_T_EMIT_FX]        = "emit.fx";
+    g_stat_tname[STAT_T_EMIT]           = "emit.total";
+    g_stat_tname[STAT_T_TARGET_BEGIN]   = "target.begin";
+    g_stat_tname[STAT_T_CLEAR]          = "clear";
+    g_stat_tname[STAT_T_FLUSH_SKY]      = "flush.sky";
+    g_stat_tname[STAT_T_SORT_WORLD]     = "sort.world";
+    g_stat_tname[STAT_T_FLUSH_WORLD]    = "flush.world";
+    g_stat_tname[STAT_T_SORT_FX]        = "sort.fx";
+    g_stat_tname[STAT_T_FLUSH_FX]       = "flush.fx";
+    g_stat_tname[STAT_T_POSTFX]         = "postfx";
+    g_stat_tname[STAT_T_HUD]            = "hud";
+    g_stat_tname[STAT_T_FLUSH_HUD]      = "flush.hud";
+    g_stat_tname[STAT_T_PRESENT]        = "present";
+    g_stat_tname[STAT_T_SORT]           = "sort.total";
+    g_stat_tname[STAT_T_FLUSH]          = "flush.total";
+}
+stats_module_init();
+
+// ---------------------------------------------------------------------------
+// Hot API — everything below runs inside the frame
+// ---------------------------------------------------------------------------
+
+// Zero every counter and timer. Call once at the top of the frame.
+export fn stat_reset() {
+    for (let i = 0; i < STAT_COUNT; i++) { g_stat_c[i] = 0; }
+    for (let j = 0; j < STAT_T_COUNT; j++) { g_stat_t[j] = 0.0; g_stat_open[j] = 0; }
+    g_stat_frames++;
+}
+
+// Bump a counter by one. `v++` and not `v = v + 1` — see the header note.
+export fn stat_inc(p_i: i32) {
+    let i: i32 = p_i;
+    let v: i32 = g_stat_c[i];
+    v++;
+    g_stat_c[i] = v;
+}
+
+// Add n to a counter.
+export fn stat_add(p_i: i32, p_n: i32) {
+    let i: i32 = p_i;
+    let v: i32 = g_stat_c[i];
+    let n: i32 = p_n;
+    v = v + n;
+    g_stat_c[i] = v;
+}
+
+// Read a counter.
+export fn stat_get(p_i: i32): i32 {
+    let i: i32 = p_i;
+    let out: i32 = g_stat_c[i];
+    return out;
+}
+
+// Overwrite a counter (for gauges: live particle count, loaded chunk count).
+export fn stat_set(p_i: i32, p_n: i32) {
+    let i: i32 = p_i;
+    let n: i32 = p_n;
+    g_stat_c[i] = n;
+}
+
+// Open a stage timer.
+export fn stat_begin(p_i: i32) {
+    let i: i32 = p_i;
+    g_stat_t0[i] = clock_now();
+    g_stat_open[i] = 1;
+}
+
+// Close a stage timer and accumulate the elapsed milliseconds. Closing a timer
+// that was never opened adds nothing rather than adding garbage.
+export fn stat_end(p_i: i32) {
+    let i: i32 = p_i;
+    if (g_stat_open[i] == 0) { return; }
+    let b: u64 = clock_now();
+    let a: u64 = g_stat_t0[i];
+    g_stat_open[i] = 0;
+    if (b <= a) { return; }
+    let d: f64 = f64(b - a) * g_stat_mspc;
+    g_stat_t[i] = g_stat_t[i] + d;
+}
+
+// Read an accumulated stage time, in milliseconds.
+export fn stat_ms(p_i: i32): f64 {
+    let i: i32 = p_i;
+    let out: f64 = g_stat_t[i];
+    return out;
+}
+
+// Add a stage time measured elsewhere (e.g. by a caller that already had the
+// two counter samples in hand).
+export fn stat_add_ms(p_i: i32, p_ms: f64) {
+    let i: i32 = p_i;
+    let ms: f64 = p_ms;
+    g_stat_t[i] = g_stat_t[i] + ms;
+}
+
+// Frames since the process started.
+export fn stat_frame_count(): i32 { let out: i32 = g_stat_frames; return out; }
+
+// Convenience bookends for the frame graph. ARCHITECTURE.md §4 stage 28 is
+// `stats_frame_end()`; this is that call, spelled with the module's `stat_`
+// prefix. stat_frame_begin() is stat_reset() plus opening the frame timer.
+export fn stat_frame_begin() {
+    stat_reset();
+    stat_begin(STAT_T_FRAME);
+}
+
+// Closes the frame timer and refreshes the throttled report. Returns the frame
+// time in milliseconds so the caller does not need a second lookup.
+export fn stat_frame_end(): f64 {
+    stat_end(STAT_T_FRAME);
+    stat_report_string();
+    let out: f64 = g_stat_t[STAT_T_FRAME];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Report — COLD. Template strings live here and nowhere else in this file.
+// ---------------------------------------------------------------------------
+
+// 3-decimal fixed formatting without pulling in a formatter. Cold path only.
+fn fmt3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let f: string = `${frac}`;
+    while (f.length < 3) { f = "0" + f; }
+    let s: string = `${whole}.${f}`;
+    if (neg == 1) { s = "-" + s; }
+    let out: string = s;
+    return out;
+}
+
+// Build the report text unconditionally. Tools and probes call this; the frame
+// loop should call stat_report_string() so it is throttled.
+export fn stat_report_string_now(): string {
+    let s: string = "-- counters --\n";
+    for (let i = 0; i < STAT_COUNT; i++) {
+        let v: i32 = g_stat_c[i];
+        s = s + `  ${g_stat_cname[i]} = ${v}\n`;
+    }
+    s = s + "-- stage ms --\n";
+    for (let j = 0; j < STAT_T_COUNT; j++) {
+        let t: f64 = g_stat_t[j];
+        s = s + `  ${g_stat_tname[j]} = ${fmt3(t)}\n`;
+    }
+    g_stat_report_txt = s;
+    g_stat_report_at = clock_now();
+    let out: string = s;
+    return out;
+}
+
+// The frame-loop entry point. Rebuilds at most STAT_REPORT_INTERVAL_MS apart
+// (4 Hz) and returns the cached text in between. Safe to call every frame.
+export fn stat_report_string(): string {
+    let now: u64 = clock_now();
+    let last: u64 = g_stat_report_at;
+    if (last != 0 && now > last) {
+        let age: f64 = f64(now - last) * g_stat_mspc;
+        if (age < STAT_REPORT_INTERVAL_MS) {
+            let cached: string = g_stat_report_txt;
+            return cached;
+        }
+    }
+    let out: string = stat_report_string_now();
+    return out;
+}
+
+// Milliseconds since the report text was last rebuilt. Diagnostics only.
+export fn stat_report_age_ms(): f64 {
+    let now: u64 = clock_now();
+    let last: u64 = g_stat_report_at;
+    if (last == 0 || now <= last) { let z: f64 = 0.0; return z; }
+    let out: f64 = f64(now - last) * g_stat_mspc;
+    return out;
+}
+
+// Label lookups, for tools that lay the report out themselves.
+export fn stat_name(p_i: i32): string { let i: i32 = p_i; let out: string = g_stat_cname[i]; return out; }
+export fn stat_timer_name(p_i: i32): string { let i: i32 = p_i; let out: string = g_stat_tname[i]; return out; }

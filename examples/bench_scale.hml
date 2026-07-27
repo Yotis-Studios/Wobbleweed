@@ -1,0 +1,83 @@
+// _bench_scale.hml — GPU path scaling vs triangle count (scratch).
+import { floor, sin, cos } from "@stdlib/math";
+import { time_ms } from "@stdlib/time";
+import { v3, v_add, v_norm, v_dot, mat_apply, mat_mul, mat_perspective, mat_look_at } from "../src/vec.hml";
+import { tex_grass } from "../src/texture.hml";
+import { batch_new, batch_tri, batch_flush } from "../src/geom.hml";
+import { clip_tri_near, clip_tri_rect } from "../src/clip.hml";
+import { window_open, upload_texture, clear, present_geom, window_close } from "../src/sdl.hml";
+
+let W = 320; let H = 240;
+
+fn cv(mvp, p, u: f64, v: f64, l: f64) {
+    let c = mat_apply(mvp, p);
+    return { x: c.x, y: c.y, z: c.z, w: c.w, u: u, v: v, l: l };
+}
+fn to_screen(v, Wf: f64, Hf: f64) {
+    let inv = 1.0 / v.w;
+    let c = i32(v.l * 255.0);
+    if (c > 255) { c = 255; } if (c < 0) { c = 0; }
+    return { x: floor((v.x * inv * 0.5 + 0.5) * Wf + 0.5),
+             y: floor((1.0 - (v.y * inv * 0.5 + 0.5)) * Hf + 0.5),
+             z: v.z * inv, u: v.u, v: v.v, r: c, g: c, b: c };
+}
+fn draw_tri(b, tex, va, vb, vc, Wf: f64, Hf: f64) {
+    let m = 2.0 * Wf;
+    let tris = clip_tri_near(va, vb, vc);
+    for (t in tris) {
+        let p0 = to_screen(t[0], Wf, Hf);
+        let p1 = to_screen(t[1], Wf, Hf);
+        let p2 = to_screen(t[2], Wf, Hf);
+        let st = clip_tri_rect(p0, p1, p2, 0.0 - m, 0.0 - m, Wf + m, Hf + m);
+        for (s in st) { batch_tri(b, tex, s[0], s[1], s[2]); }
+    }
+}
+fn emit_quad(b, tex, mvp, p0, p1, p2, p3, l: f64, Wf: f64, Hf: f64) {
+    let a = cv(mvp, p0, 0.0, 0.0, l); let bb = cv(mvp, p1, 1.0, 0.0, l);
+    let c = cv(mvp, p2, 1.0, 1.0, l); let d = cv(mvp, p3, 0.0, 1.0, l);
+    draw_tri(b, tex, a, bb, c, Wf, Hf);
+    draw_tri(b, tex, a, c, d, Wf, Hf);
+}
+
+fn run(win, gtex, b, N: i32, frames: i32) {
+    let G = 26.0; let step = (2.0 * G) / N;
+    let pos = v3(0.0, 2.0, 26.0);
+    let yaw = 0.0;
+    let t_emit = 0; let t_sort_flush = 0; let tris_total = 0;
+    let wall0 = time_ms();
+    for (let f = 0; f < frames; f++) {
+        yaw = yaw + 0.004;
+        let look = v3(sin(yaw), 0.0 - 0.15, 0.0 - cos(yaw));
+        let proj = mat_perspective(1.15, W / H, 0.1, 200.0);
+        let view = mat_look_at(pos, v_add(pos, look), v3(0.0, 1.0, 0.0));
+        let mvp = mat_mul(proj, view);
+        clear(win, 0, 0, 0);
+        let t0 = time_ms();
+        for (let i = 0; i < N; i++) {
+            for (let j = 0; j < N; j++) {
+                let x0 = 0.0 - G + i * step; let x1 = x0 + step;
+                let z0 = 0.0 - G + j * step; let z1 = z0 + step;
+                emit_quad(b, gtex, mvp, v3(x0,0.0,z0), v3(x1,0.0,z0), v3(x1,0.0,z1), v3(x0,0.0,z1), 0.9, W, H);
+            }
+        }
+        t_emit = t_emit + (time_ms() - t0);
+        tris_total = tris_total + b.tris.length;
+        t0 = time_ms();
+        batch_flush(win, b);
+        t_sort_flush = t_sort_flush + (time_ms() - t0);
+        present_geom(win);
+    }
+    let wall = time_ms() - wall0;
+    print(`N=${N}  tris/frame=${i32(tris_total / frames)}  fps=${i32(frames * 1000.0 / wall)}  emit=${t_emit/(frames*1.0)}ms  flush=${t_sort_flush/(frames*1.0)}ms`);
+}
+
+fn main() {
+    let win = window_open("bench", W, H, 1);
+    if (win == null) { eprint("window failed"); return; }
+    let gtex = upload_texture(win, tex_grass(64, 64));
+    let b = batch_new(65536);
+    let sizes = [8, 16, 24, 32, 40, 48, 64];
+    for (n in sizes) { run(win, gtex, b, n, 60); }
+    window_close(win);
+}
+main();

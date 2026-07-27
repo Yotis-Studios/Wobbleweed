@@ -1,0 +1,594 @@
+// probe_time.hml — verification program for W0-3 (src/time.hml, src/stats.hml).
+//
+// Run COMPILED. Headless is fine; nothing here opens a window.
+//     hemlockc -O1 examples/probe_time.hml -o /tmp/probe_time
+//     SDL_VIDEODRIVER=dummy /tmp/probe_time
+//
+// Prints one line per measurement, then `PASS n/n`, and exits 0 only if every
+// assertion held.
+
+import { exit } from "@stdlib/env";
+import {
+    clock_now, clock_freq, clock_ms_between, clock_ms_per_count, clock_sleep_ms,
+    clock_new, clock_reset, clock_advance_ms, clock_accumulate, clock_alpha,
+    clock_frame_ms, clock_raw_frame_ms, clock_acc_ms, clock_total_ticks,
+    clock_total_ms, clock_stall_count, clock_tick_ms, clock_set_max_frame_ms,
+    FIXED_TICK_MS, FIXED_TICK_HZ, CLOCK_MAX_FRAME_MS
+} from "../src/time.hml";
+import {
+    stat_reset, stat_inc, stat_add, stat_set, stat_get, stat_begin, stat_end,
+    stat_ms, stat_add_ms, stat_report_string, stat_report_string_now,
+    stat_report_age_ms, stat_name, stat_timer_name, stat_frame_count,
+    stat_frame_begin, stat_frame_end,
+    STAT_COUNT, STAT_T_COUNT, STAT_REPORT_INTERVAL_MS,
+    STAT_TRIS_SKY, STAT_TRIS_WORLD, STAT_TRIS_FX, STAT_TRIS_HUD,
+    STAT_TRIS_SUBMITTED, STAT_TRIS_DRAWN, STAT_VERTS_DRAWN,
+    STAT_REJ_FRUSTUM, STAT_REJ_BACKFACE, STAT_REJ_NEAR, STAT_REJ_GUARD,
+    STAT_REJ_DISTANCE, STAT_CLIP_STRADDLE, STAT_CLIP_SLOW,
+    STAT_BATCH_OVERFLOW, STAT_OVERFLOW_SKY, STAT_OVERFLOW_WORLD,
+    STAT_OVERFLOW_FX, STAT_OVERFLOW_HUD, STAT_DRAW_CALLS, STAT_TEX_RUNS,
+    STAT_CHUNKS_TESTED, STAT_CHUNKS_CULLED, STAT_CHUNKS_DRAWN,
+    STAT_CHUNKS_MESHED, STAT_ENTS_TESTED, STAT_ENTS_CULLED, STAT_ENTS_DRAWN,
+    STAT_PARTICLES, STAT_LIGHTS, STAT_SIM_TICKS, STAT_SKY_ROWS, STAT_SOUNDS,
+    STAT_T_FRAME, STAT_T_INPUT, STAT_T_SIM, STAT_T_SNAPSHOT, STAT_T_FX_UPDATE,
+    STAT_T_TOD, STAT_T_SKYBAKE, STAT_T_VIEW, STAT_T_BATCH_RESET,
+    STAT_T_EMIT_SKY, STAT_T_EMIT_TERRAIN, STAT_T_EMIT_ENTITY,
+    STAT_T_EMIT_VIEWMODEL, STAT_T_EMIT_FX, STAT_T_EMIT, STAT_T_TARGET_BEGIN,
+    STAT_T_CLEAR, STAT_T_FLUSH_SKY, STAT_T_SORT_WORLD, STAT_T_FLUSH_WORLD,
+    STAT_T_SORT_FX, STAT_T_FLUSH_FX, STAT_T_POSTFX, STAT_T_HUD,
+    STAT_T_FLUSH_HUD, STAT_T_PRESENT, STAT_T_SORT, STAT_T_FLUSH
+} from "../src/stats.hml";
+
+let g_pass: i32 = 0;
+let g_total: i32 = 0;
+
+fn ok(cond: bool, label: string) {
+    g_total++;
+    if (cond) { g_pass++; } else { print(`  FAIL  ${label}`); }
+}
+
+fn near(a: f64, b: f64, tol: f64): bool {
+    let d: f64 = a - b;
+    if (d < 0.0) { d = 0.0 - d; }
+    return d <= tol;
+}
+
+// Reference implementation of the acceptance criterion, written independently
+// of time.hml: floor(total_clamped_ms / TICK_MS).
+fn ref_ticks(total_ms: f64, tick_ms: f64): i64 {
+    return i64((total_ms + tick_ms * 0.000000001) / tick_ms);
+}
+
+// ---------------------------------------------------------------------------
+// 1. Raw clock
+// ---------------------------------------------------------------------------
+fn test_raw_clock() {
+    print("[1] raw clock");
+    let f: u64 = clock_freq();
+    print(`  perf frequency        = ${f} Hz`);
+    ok(f > 0, "clock_freq > 0");
+
+    let mspc: f64 = clock_ms_per_count();
+    ok(near(mspc * f64(f), 1000.0, 0.000001), "ms_per_count * freq == 1000");
+
+    let a: u64 = clock_now();
+    let b: u64 = clock_now();
+    ok(b >= a, "clock_now is monotonic");
+
+    // A real 20 ms sleep must measure as roughly 20 ms.
+    let t0: u64 = clock_now();
+    clock_sleep_ms(20);
+    let t1: u64 = clock_now();
+    let slept: f64 = clock_ms_between(t0, t1);
+    print(`  measured 20 ms sleep  = ${slept} ms`);
+    ok(slept > 15.0 && slept < 80.0, "20 ms sleep measures 15..80 ms");
+
+    // Reversed arguments must yield 0, not a wrapped u64 turned into 1e10 ms.
+    ok(clock_ms_between(t1, t0) == 0.0, "clock_ms_between reversed == 0");
+    ok(clock_ms_between(t0, t0) == 0.0, "clock_ms_between equal == 0");
+
+    // u64 exactness. The counter itself is ~1.2e15 here, below 2^53, so the
+    // decisive test is that u64 arithmetic stays exact ABOVE 2^53 — which is
+    // what makes "no 2^53 workaround needed" true for any uptime.
+    let big: u64 = 9007199254740993;          // 2^53 + 1
+    let base: u64 = 9007199254740992;         // 2^53
+    ok(big - base == 1, "u64 exact above 2^53");
+    let huge: u64 = 18446744073709551615;     // u64 max
+    ok(huge - 18446744073709551614 == 1, "u64 exact at u64 max");
+
+    // The FFI return must preserve the full width — a value that had passed
+    // through i32 or f32 could not increase by single counts.
+    let odd: i32 = 0;
+    let prev: u64 = clock_now();
+    for (let i = 0; i < 4000; i++) {
+        let cur: u64 = clock_now();
+        let d: u64 = cur - prev;
+        if (d > 0 && (d & 1) == 1) { odd++; }
+        prev = cur;
+    }
+    print(`  odd-valued deltas     = ${odd} / 4000 samples`);
+    ok(odd > 0, "counter deltas carry odd values (full u64 width)");
+}
+
+// ---------------------------------------------------------------------------
+// 2. The three injected stalls (the headline acceptance criterion)
+// ---------------------------------------------------------------------------
+fn test_injected_stalls() {
+    print("[2] injected stalls 5 / 50 / 500 ms");
+    let tick: f64 = FIXED_TICK_MS;
+
+    let c5 = clock_new(tick);
+    let n5: i32 = clock_advance_ms(c5, 5.0);
+    print(`    5 ms  -> ticks ${n5}  (expected ${ref_ticks(5.0, tick)})  acc ${clock_acc_ms(c5)} ms`);
+    ok(i64(n5) == ref_ticks(5.0, tick), "5 ms advances floor(5/TICK_MS)");
+    ok(n5 == 0, "5 ms advances 0 ticks");
+    ok(clock_stall_count(c5) == 0, "5 ms is not a stall");
+    ok(near(clock_frame_ms(c5), 5.0, 0.0), "5 ms not clamped");
+
+    let c50 = clock_new(tick);
+    let n50: i32 = clock_advance_ms(c50, 50.0);
+    print(`   50 ms  -> ticks ${n50}  (expected ${ref_ticks(50.0, tick)})  acc ${clock_acc_ms(c50)} ms`);
+    ok(i64(n50) == ref_ticks(50.0, tick), "50 ms advances floor(50/TICK_MS)");
+    ok(n50 == 3, "50 ms advances 3 ticks");
+    ok(clock_stall_count(c50) == 0, "50 ms is not a stall");
+
+    let c500 = clock_new(tick);
+    let n500: i32 = clock_advance_ms(c500, 500.0);
+    print(`  500 ms  -> ticks ${n500}  (expected ${ref_ticks(250.0, tick)})  clamped to ${clock_frame_ms(c500)} ms, raw ${clock_raw_frame_ms(c500)} ms`);
+    ok(near(clock_frame_ms(c500), CLOCK_MAX_FRAME_MS, 0.0), "500 ms clamps to 250 ms");
+    ok(near(clock_raw_frame_ms(c500), 500.0, 0.0), "raw delta preserved as 500 ms");
+    ok(i64(n500) == ref_ticks(250.0, tick), "500 ms advances floor(250/TICK_MS)");
+    ok(n500 == 15, "500 ms advances 15 ticks");
+    ok(clock_stall_count(c500) == 1, "500 ms counted as one stall");
+    ok(clock_acc_ms(c500) >= 0.0 && clock_acc_ms(c500) < tick, "residual < one tick after the clamp");
+
+    // The same three stalls fed to ONE accumulator in sequence: the running
+    // tick total must equal floor(total_clamped_ms / TICK_MS) after every step.
+    let c = clock_new(tick);
+    let total: f64 = 0.0;
+    let seq_ok: i32 = 1;
+    for (let r = 0; r < 200; r++) {
+        let ms: f64 = 5.0;
+        let m: i32 = r % 3;
+        if (m == 1) { ms = 50.0; }
+        if (m == 2) { ms = 500.0; }
+        clock_advance_ms(c, ms);
+        let clamped: f64 = ms;
+        if (clamped > CLOCK_MAX_FRAME_MS) { clamped = CLOCK_MAX_FRAME_MS; }
+        total = total + clamped;
+        if (clock_total_ticks(c) != ref_ticks(total, tick)) { seq_ok = 0; }
+    }
+    print(`  200-frame mixed sequence: total ${clock_total_ms(c)} ms -> ${clock_total_ticks(c)} ticks (expected ${ref_ticks(total, tick)})`);
+    ok(seq_ok == 1, "running total == floor(total_ms/TICK_MS) at every step");
+    ok(clock_total_ticks(c) == ref_ticks(total, tick), "final total ticks exact");
+    ok(near(clock_total_ms(c), total, 0.000001), "clamped total_ms matches reference");
+    ok(clock_stall_count(c) == 66, "stall count == number of 500 ms frames");
+}
+
+// ---------------------------------------------------------------------------
+// 3. No death spiral
+// ---------------------------------------------------------------------------
+fn test_no_spiral() {
+    print("[3] spiral-of-death clamp");
+    let tick: f64 = FIXED_TICK_MS;
+    let c = clock_new(tick);
+    let worst: i32 = 0;
+    let acc_ok: i32 = 1;
+    for (let i = 0; i < 1000; i++) {
+        let n: i32 = clock_advance_ms(c, 500.0);
+        if (n > worst) { worst = n; }
+        if (clock_acc_ms(c) < 0.0 || clock_acc_ms(c) >= tick) { acc_ok = 0; }
+    }
+    print(`  1000 consecutive 500 ms frames: worst ticks/frame = ${worst}, residual = ${clock_acc_ms(c)} ms`);
+    ok(worst <= 15, "never more than 15 ticks in one frame");
+    ok(acc_ok == 1, "residual stays in [0, TICK_MS) for 1000 stalled frames");
+    ok(clock_stall_count(c) == 1000, "every stalled frame counted");
+
+    // A 60 s hang is bounded by exactly the same 15 ticks.
+    let c2 = clock_new(tick);
+    let n60: i32 = clock_advance_ms(c2, 60000.0);
+    print(`  single 60 s hang -> ${n60} ticks`);
+    ok(n60 == 15, "a 60 s hang still only queues 15 ticks");
+
+    // An overridable clamp still clamps.
+    let c3 = clock_new(tick);
+    clock_set_max_frame_ms(c3, 100.0);
+    let n3: i32 = clock_advance_ms(c3, 500.0);
+    ok(near(clock_frame_ms(c3), 100.0, 0.0), "clock_set_max_frame_ms takes effect");
+    ok(i64(n3) == ref_ticks(100.0, tick), "custom clamp advances floor(100/TICK_MS)");
+}
+
+// ---------------------------------------------------------------------------
+// 4. Drift, alpha, frame-rate independence
+// ---------------------------------------------------------------------------
+fn test_accumulator_quality() {
+    print("[4] accumulator quality");
+    let tick: f64 = FIXED_TICK_MS;
+
+    // 200 000 frames of exactly one tick must issue exactly 200 000 ticks.
+    // A naive `acc -= tick` loop fails this within a few thousand frames.
+    let c = clock_new(tick);
+    let exact: i32 = 1;
+    for (let i = 0; i < 200000; i++) {
+        if (clock_advance_ms(c, tick) != 1) { exact = 0; }
+    }
+    print(`  200000 x TICK_MS -> ${clock_total_ticks(c)} ticks`);
+    ok(exact == 1, "every exact-tick frame issues exactly 1 tick");
+    ok(clock_total_ticks(c) == 200000, "no drift over 200000 ticks");
+
+    // alpha is always a legal interpolation factor.
+    let c2 = clock_new(tick);
+    let alpha_ok: i32 = 1;
+    for (let j = 0; j < 5000; j++) {
+        clock_advance_ms(c2, 7.3);
+        let a: f64 = clock_alpha(c2);
+        if (a < 0.0 || a >= 1.0) { alpha_ok = 0; }
+    }
+    ok(alpha_ok == 1, "clock_alpha stays in [0,1) over 5000 frames");
+    ok(near(clock_alpha(c2), clock_acc_ms(c2) / tick, 0.000001), "alpha == acc / tick_ms");
+
+    // 10 seconds of simulated time at 30 fps and at 240 fps must issue the
+    // same number of ticks (ARCHITECTURE §3: the sim runs 0, 1 or N times).
+    let c30 = clock_new(tick);
+    for (let k = 0; k < 300; k++) { clock_advance_ms(c30, 1000.0 / 30.0); }
+    let c240 = clock_new(tick);
+    for (let m = 0; m < 2400; m++) { clock_advance_ms(c240, 1000.0 / 240.0); }
+    print(`  10 s @ 30 fps  -> ${clock_total_ticks(c30)} ticks`);
+    print(`  10 s @ 240 fps -> ${clock_total_ticks(c240)} ticks`);
+    ok(clock_total_ticks(c30) == clock_total_ticks(c240), "30 fps and 240 fps agree");
+    ok(clock_total_ticks(c30) == 600, "10 s at 60 Hz is 600 ticks");
+
+    // Negative or zero deltas are absorbed, not propagated.
+    let c4 = clock_new(tick);
+    ok(clock_advance_ms(c4, -5.0) == 0, "negative delta issues no ticks");
+    ok(clock_total_ms(c4) == 0.0, "negative delta adds no time");
+    ok(clock_advance_ms(c4, 0.0) == 0, "zero delta issues no ticks");
+
+    // clock_new / clock_reset defaults.
+    ok(near(clock_tick_ms(c4), FIXED_TICK_MS, 0.0), "clock_tick_ms reports the configured tick");
+    ok(near(FIXED_TICK_MS * FIXED_TICK_HZ, 1000.0, 0.000000001), "FIXED_TICK_MS * FIXED_TICK_HZ == 1000");
+    let cbad = clock_new(0.0);
+    ok(near(clock_tick_ms(cbad), FIXED_TICK_MS, 0.0), "clock_new(0) falls back to FIXED_TICK_MS");
+    clock_advance_ms(c4, 100.0);
+    clock_reset(c4);
+    ok(clock_total_ticks(c4) == 0 && clock_total_ms(c4) == 0.0 && clock_stall_count(c4) == 0,
+       "clock_reset clears the accumulator");
+}
+
+// ---------------------------------------------------------------------------
+// 5. The real-clock path
+// ---------------------------------------------------------------------------
+fn test_real_clock_path() {
+    print("[5] clock_accumulate on the real clock");
+    let c = clock_new(FIXED_TICK_MS);
+    clock_reset(c);
+    let ticks: i32 = 0;
+    for (let i = 0; i < 5; i++) {
+        clock_sleep_ms(20);
+        ticks = ticks + clock_accumulate(c, clock_now());
+    }
+    print(`  5 x 20 ms of real sleep -> ${ticks} ticks over ${clock_total_ms(c)} ms`);
+    ok(ticks >= 4 && ticks <= 12, "~100 ms of real time yields 4..12 ticks");
+    ok(clock_total_ticks(c) == i64(ticks), "returned ticks sum to the running total");
+
+    // Feeding the same sample twice must add zero time.
+    let now: u64 = clock_now();
+    clock_accumulate(c, now);
+    let before: f64 = clock_total_ms(c);
+    let n: i32 = clock_accumulate(c, now);
+    ok(n == 0 && clock_total_ms(c) == before, "a repeated counter sample adds nothing");
+}
+
+// ---------------------------------------------------------------------------
+// 6. stats.hml behaviour
+// ---------------------------------------------------------------------------
+fn test_stats_basics() {
+    print("[6] stats counters and timers");
+    stat_reset();
+    ok(stat_get(STAT_TRIS_WORLD) == 0, "stat_reset zeroes counters");
+    ok(stat_ms(STAT_T_EMIT) == 0.0, "stat_reset zeroes timers");
+
+    stat_inc(STAT_TRIS_WORLD);
+    stat_inc(STAT_TRIS_WORLD);
+    stat_add(STAT_TRIS_WORLD, 40);
+    ok(stat_get(STAT_TRIS_WORLD) == 42, "stat_inc + stat_add");
+    stat_set(STAT_PARTICLES, 311);
+    ok(stat_get(STAT_PARTICLES) == 311, "stat_set");
+
+    stat_add(STAT_BATCH_OVERFLOW, 7);
+    ok(stat_get(STAT_BATCH_OVERFLOW) == 7, "STAT_BATCH_OVERFLOW is a live counter");
+
+    // A timer must measure a real sleep.
+    stat_begin(STAT_T_SORT_WORLD);
+    clock_sleep_ms(12);
+    stat_end(STAT_T_SORT_WORLD);
+    let m: f64 = stat_ms(STAT_T_SORT_WORLD);
+    print(`  stat_begin/end around a 12 ms sleep = ${m} ms`);
+    ok(m > 8.0 && m < 60.0, "stage timer measures a 12 ms sleep");
+
+    // Timers accumulate across several begin/end pairs in one frame.
+    stat_begin(STAT_T_SORT_WORLD);
+    clock_sleep_ms(4);
+    stat_end(STAT_T_SORT_WORLD);
+    ok(stat_ms(STAT_T_SORT_WORLD) > m, "stage timer accumulates");
+
+    // stat_end without stat_begin adds nothing.
+    let before: f64 = stat_ms(STAT_T_POSTFX);
+    stat_end(STAT_T_POSTFX);
+    ok(stat_ms(STAT_T_POSTFX) == before, "unmatched stat_end is a no-op");
+
+    stat_add_ms(STAT_T_POSTFX, 1.5);
+    ok(near(stat_ms(STAT_T_POSTFX), before + 1.5, 0.0000001), "stat_add_ms");
+
+    let f0: i32 = stat_frame_count();
+    stat_reset();
+    ok(stat_frame_count() == f0 + 1, "stat_reset counts a frame");
+    ok(stat_get(STAT_TRIS_WORLD) == 0 && stat_ms(STAT_T_SORT_WORLD) == 0.0, "stat_reset clears both arrays");
+
+    // ARCHITECTURE §4 stage 28 bookends.
+    stat_frame_begin();
+    stat_add(STAT_TRIS_WORLD, 5);
+    clock_sleep_ms(3);
+    let fms: f64 = stat_frame_end();
+    print(`  stat_frame_begin/end around a 3 ms sleep = ${fms} ms`);
+    ok(fms > 1.0 && fms < 40.0, "stat_frame_begin/stat_frame_end time the frame");
+    ok(near(fms, stat_ms(STAT_T_FRAME), 0.0), "stat_frame_end returns STAT_T_FRAME");
+    ok(stat_get(STAT_TRIS_WORLD) == 5, "stat_frame_begin resets then accumulates");
+}
+
+// ---------------------------------------------------------------------------
+// 7. STAT_* index coverage of ARCHITECTURE.md §4
+// ---------------------------------------------------------------------------
+fn test_stat_coverage() {
+    print("[7] STAT_* index coverage");
+
+    // Every §4 / G22 counter, listed by hand from the frame graph.
+    let cidx: array<i32> = [
+        STAT_TRIS_SKY, STAT_TRIS_WORLD, STAT_TRIS_FX, STAT_TRIS_HUD,
+        STAT_TRIS_SUBMITTED, STAT_TRIS_DRAWN, STAT_VERTS_DRAWN,
+        STAT_REJ_FRUSTUM, STAT_REJ_BACKFACE, STAT_REJ_NEAR, STAT_REJ_GUARD,
+        STAT_REJ_DISTANCE, STAT_CLIP_STRADDLE, STAT_CLIP_SLOW,
+        STAT_BATCH_OVERFLOW, STAT_OVERFLOW_SKY, STAT_OVERFLOW_WORLD,
+        STAT_OVERFLOW_FX, STAT_OVERFLOW_HUD, STAT_DRAW_CALLS, STAT_TEX_RUNS,
+        STAT_CHUNKS_TESTED, STAT_CHUNKS_CULLED, STAT_CHUNKS_DRAWN,
+        STAT_CHUNKS_MESHED, STAT_ENTS_TESTED, STAT_ENTS_CULLED,
+        STAT_ENTS_DRAWN, STAT_PARTICLES, STAT_LIGHTS, STAT_SIM_TICKS,
+        STAT_SKY_ROWS, STAT_SOUNDS
+    ];
+    // Every §4 stage timer. §4 explicitly requires 11-17, 21, 22 and 26; the
+    // rest complete the frame graph so benchframe can print every line.
+    let tidx: array<i32> = [
+        STAT_T_FRAME, STAT_T_INPUT, STAT_T_SIM, STAT_T_SNAPSHOT,
+        STAT_T_FX_UPDATE, STAT_T_TOD, STAT_T_SKYBAKE, STAT_T_VIEW,
+        STAT_T_BATCH_RESET, STAT_T_EMIT_SKY, STAT_T_EMIT_TERRAIN,
+        STAT_T_EMIT_ENTITY, STAT_T_EMIT_VIEWMODEL, STAT_T_EMIT_FX,
+        STAT_T_EMIT, STAT_T_TARGET_BEGIN, STAT_T_CLEAR, STAT_T_FLUSH_SKY,
+        STAT_T_SORT_WORLD, STAT_T_FLUSH_WORLD, STAT_T_SORT_FX,
+        STAT_T_FLUSH_FX, STAT_T_POSTFX, STAT_T_HUD, STAT_T_FLUSH_HUD,
+        STAT_T_PRESENT, STAT_T_SORT, STAT_T_FLUSH
+    ];
+
+    print(`  counters declared = ${STAT_COUNT}, listed = ${cidx.length}`);
+    print(`  timers   declared = ${STAT_T_COUNT}, listed = ${tidx.length}`);
+    ok(cidx.length == STAT_COUNT, "every declared counter index is in the §4 list");
+    ok(tidx.length == STAT_T_COUNT, "every declared timer index is in the §4 list");
+
+    // Indices are dense, in range, and unique — a duplicated index would make
+    // two stages silently share a slot.
+    let seen: array<i32> = [];
+    for (let z = 0; z < STAT_COUNT; z++) { seen.push(0); }
+    let dup: i32 = 0;
+    let oob: i32 = 0;
+    for (let i = 0; i < cidx.length; i++) {
+        let v: i32 = cidx[i];
+        if (v < 0 || v >= STAT_COUNT) { oob++; } else { seen[v] = seen[v] + 1; if (seen[v] > 1) { dup++; } }
+    }
+    ok(oob == 0, "no counter index out of range");
+    ok(dup == 0, "no duplicated counter index");
+
+    let seent: array<i32> = [];
+    for (let z2 = 0; z2 < STAT_T_COUNT; z2++) { seent.push(0); }
+    let dupt: i32 = 0;
+    let oobt: i32 = 0;
+    for (let j = 0; j < tidx.length; j++) {
+        let v2: i32 = tidx[j];
+        if (v2 < 0 || v2 >= STAT_T_COUNT) { oobt++; } else { seent[v2] = seent[v2] + 1; if (seent[v2] > 1) { dupt++; } }
+    }
+    ok(oobt == 0, "no timer index out of range");
+    ok(dupt == 0, "no duplicated timer index");
+
+    // Every index has a distinct, non-placeholder label, so the report is
+    // readable and no stage is anonymous.
+    let unnamed: i32 = 0;
+    for (let k = 0; k < STAT_COUNT; k++) { if (stat_name(k) == "stat") { unnamed++; } }
+    for (let n = 0; n < STAT_T_COUNT; n++) { if (stat_timer_name(n) == "timer") { unnamed++; } }
+    ok(unnamed == 0, "every counter and timer index has a real label");
+}
+
+// ---------------------------------------------------------------------------
+// 8. stat_report_string is throttled to 4 Hz
+// ---------------------------------------------------------------------------
+fn test_report_throttle() {
+    print("[8] report throttling");
+    stat_reset();
+    stat_add(STAT_TRIS_WORLD, 1900);
+    stat_add(STAT_DRAW_CALLS, 6);
+    stat_add_ms(STAT_T_EMIT, 2.83);
+
+    let first: string = stat_report_string_now();
+    ok(first.length > 0, "stat_report_string_now returns text");
+
+    // Everything named must appear in the text.
+    let missing: i32 = 0;
+    for (let i = 0; i < STAT_COUNT; i++) { if (first.contains(stat_name(i)) == false) { missing++; } }
+    for (let j = 0; j < STAT_T_COUNT; j++) { if (first.contains(stat_timer_name(j)) == false) { missing++; } }
+    ok(missing == 0, "report names every counter and every timer");
+    ok(first.contains("1900"), "report carries counter values");
+    ok(first.contains("2.830"), "report carries stage times to 3 dp");
+
+    // Now change the numbers and hammer the throttled entry point: the text
+    // must NOT change, because less than 250 ms has passed.
+    stat_add(STAT_TRIS_WORLD, 77);
+    let t0: u64 = clock_now();
+    let same: i32 = 1;
+    for (let k = 0; k < 2000; k++) {
+        let s: string = stat_report_string();
+        if (s != first) { same = 0; }
+    }
+    let hammer_ms: f64 = clock_ms_between(t0, clock_now());
+    print(`  2000 throttled calls in ${hammer_ms} ms (${hammer_ms / 2000.0} ms each)`);
+    ok(same == 1, "stat_report_string returns the cached text inside 250 ms");
+    ok(hammer_ms < STAT_REPORT_INTERVAL_MS, "the hammer loop itself stayed inside one interval");
+    ok(stat_report_age_ms() < STAT_REPORT_INTERVAL_MS, "report age below the interval");
+
+    // Past the interval it must rebuild and pick up the new value.
+    clock_sleep_ms(i32(STAT_REPORT_INTERVAL_MS) + 30);
+    let second: string = stat_report_string();
+    ok(second != first, "stat_report_string rebuilds after 250 ms");
+    ok(second.contains("1977"), "rebuilt report carries the new value");
+    ok(STAT_REPORT_INTERVAL_MS >= 250.0, "report interval is at most 4 Hz");
+}
+
+// ---------------------------------------------------------------------------
+// 9. Instrumentation overhead over 10 000 frames
+// ---------------------------------------------------------------------------
+
+// One frame's worth of instrumentation as ARCHITECTURE.md §4 prescribes it:
+// reset, the frame timer, thirteen stage timers, and per-stage counter updates
+// (counters are aggregated per stage by the producer, never bumped per
+// triangle — see the note printed below).
+fn instrument_one_frame() {
+    stat_reset();
+    stat_begin(STAT_T_FRAME);
+
+    stat_begin(STAT_T_INPUT);   stat_end(STAT_T_INPUT);
+    stat_begin(STAT_T_SIM);     stat_add(STAT_SIM_TICKS, 1);        stat_end(STAT_T_SIM);
+    stat_begin(STAT_T_SNAPSHOT); stat_end(STAT_T_SNAPSHOT);
+    stat_begin(STAT_T_VIEW);    stat_end(STAT_T_VIEW);
+
+    stat_begin(STAT_T_EMIT);
+    stat_begin(STAT_T_BATCH_RESET); stat_end(STAT_T_BATCH_RESET);
+    stat_begin(STAT_T_EMIT_SKY);
+    stat_add(STAT_TRIS_SKY, 4);
+    stat_end(STAT_T_EMIT_SKY);
+    stat_begin(STAT_T_EMIT_TERRAIN);
+    stat_add(STAT_CHUNKS_TESTED, 25); stat_add(STAT_CHUNKS_CULLED, 14);
+    stat_add(STAT_CHUNKS_DRAWN, 11);  stat_add(STAT_TRIS_WORLD, 512);
+    stat_add(STAT_REJ_FRUSTUM, 900);  stat_add(STAT_REJ_BACKFACE, 700);
+    stat_end(STAT_T_EMIT_TERRAIN);
+    stat_begin(STAT_T_EMIT_ENTITY);
+    stat_add(STAT_ENTS_TESTED, 40); stat_add(STAT_ENTS_CULLED, 22);
+    stat_add(STAT_ENTS_DRAWN, 18);  stat_add(STAT_TRIS_WORLD, 1100);
+    stat_add(STAT_REJ_NEAR, 12);    stat_add(STAT_REJ_GUARD, 30);
+    stat_add(STAT_CLIP_STRADDLE, 9); stat_add(STAT_CLIP_SLOW, 9);
+    stat_end(STAT_T_EMIT_ENTITY);
+    stat_begin(STAT_T_EMIT_VIEWMODEL); stat_add(STAT_TRIS_WORLD, 260); stat_end(STAT_T_EMIT_VIEWMODEL);
+    stat_begin(STAT_T_EMIT_FX);
+    stat_add(STAT_TRIS_FX, 120); stat_set(STAT_PARTICLES, 300); stat_add(STAT_LIGHTS, 2);
+    stat_end(STAT_T_EMIT_FX);
+    stat_end(STAT_T_EMIT);
+
+    stat_begin(STAT_T_TARGET_BEGIN); stat_end(STAT_T_TARGET_BEGIN);
+    stat_begin(STAT_T_CLEAR);        stat_end(STAT_T_CLEAR);
+    stat_begin(STAT_T_FLUSH_SKY);    stat_inc(STAT_DRAW_CALLS); stat_end(STAT_T_FLUSH_SKY);
+    stat_begin(STAT_T_SORT_WORLD);   stat_end(STAT_T_SORT_WORLD);
+    stat_begin(STAT_T_FLUSH_WORLD);  stat_add(STAT_DRAW_CALLS, 3); stat_add(STAT_TEX_RUNS, 3); stat_end(STAT_T_FLUSH_WORLD);
+    stat_begin(STAT_T_SORT_FX);      stat_end(STAT_T_SORT_FX);
+    stat_begin(STAT_T_FLUSH_FX);     stat_inc(STAT_DRAW_CALLS); stat_end(STAT_T_FLUSH_FX);
+    stat_begin(STAT_T_POSTFX);       stat_end(STAT_T_POSTFX);
+    stat_begin(STAT_T_HUD);          stat_add(STAT_TRIS_HUD, 250); stat_end(STAT_T_HUD);
+    stat_begin(STAT_T_FLUSH_HUD);    stat_inc(STAT_DRAW_CALLS); stat_end(STAT_T_FLUSH_HUD);
+    stat_begin(STAT_T_PRESENT);      stat_end(STAT_T_PRESENT);
+
+    stat_add(STAT_TRIS_SUBMITTED, 1996);
+    stat_add(STAT_TRIS_DRAWN, 1996);
+    stat_add(STAT_VERTS_DRAWN, 5988);
+    stat_end(STAT_T_FRAME);
+    stat_report_string();
+}
+
+fn test_overhead() {
+    print("[9] instrumentation overhead, 10000 frames");
+    let n: i32 = 10000;
+
+    // Warm up so the first-touch page faults are not in the measurement.
+    for (let w = 0; w < 200; w++) { instrument_one_frame(); }
+
+    let t0: u64 = clock_now();
+    for (let i = 0; i < n; i++) { instrument_one_frame(); }
+    let total: f64 = clock_ms_between(t0, clock_now());
+    let per: f64 = total / f64(n);
+    print(`  full frame instrumentation : ${total} ms total, ${per} ms/frame`);
+    ok(per <= 0.05, "instrumentation overhead <= 0.05 ms/frame");
+
+    // Per-primitive costs, so downstream tasks can budget their own call counts.
+    let c0: u64 = clock_now();
+    for (let a = 0; a < 100000; a++) { stat_inc(STAT_TRIS_WORLD); }
+    let inc_ns: f64 = clock_ms_between(c0, clock_now()) * 1000000.0 / 100000.0;
+
+    let c1: u64 = clock_now();
+    for (let b = 0; b < 100000; b++) { stat_add(STAT_TRIS_WORLD, 3); }
+    let add_ns: f64 = clock_ms_between(c1, clock_now()) * 1000000.0 / 100000.0;
+
+    let c2: u64 = clock_now();
+    for (let d = 0; d < 100000; d++) { stat_begin(STAT_T_SORT); stat_end(STAT_T_SORT); }
+    let pair_ns: f64 = clock_ms_between(c2, clock_now()) * 1000000.0 / 100000.0;
+
+    let c3: u64 = clock_now();
+    for (let e = 0; e < 100000; e++) { stat_reset(); }
+    let reset_ns: f64 = clock_ms_between(c3, clock_now()) * 1000000.0 / 100000.0;
+
+    let c4: u64 = clock_now();
+    for (let g = 0; g < 100000; g++) { clock_now(); }
+    let now_ns: f64 = clock_ms_between(c4, clock_now()) * 1000000.0 / 100000.0;
+
+    // The report rebuild is the one expensive thing in this module. It is
+    // throttled to 4 Hz, so at 60 fps it lands on one frame in fifteen; the
+    // honest per-frame figure is the frame cost plus 4/60 of a rebuild.
+    let c5: u64 = clock_now();
+    for (let h = 0; h < 2000; h++) { stat_report_string_now(); }
+    let rebuild_ms: f64 = clock_ms_between(c5, clock_now()) / 2000.0;
+    let amortized: f64 = per + rebuild_ms * 4.0 / 60.0;
+    print(`  stat_report_string_now     : ${rebuild_ms} ms per rebuild`);
+    print(`  amortized incl. 4 Hz report: ${amortized} ms/frame at 60 fps`);
+    ok(amortized <= 0.05, "overhead incl. amortized 4 Hz report <= 0.05 ms/frame");
+
+    print(`  stat_inc                   : ${inc_ns} ns`);
+    print(`  stat_add                   : ${add_ns} ns`);
+    print(`  stat_begin + stat_end      : ${pair_ns} ns`);
+    print(`  stat_reset                 : ${reset_ns} ns`);
+    print(`  clock_now (FFI)            : ${now_ns} ns`);
+    print(`  NOTE: at ${inc_ns} ns, a per-TRIANGLE stat_inc at 2500 tris would cost`);
+    print(`        ${inc_ns * 2500.0 / 1000000.0} ms/frame. Aggregate per stage, never per triangle.`);
+    ok(pair_ns > 0.0, "timer pair cost measured");
+
+    // The clock itself must be cheap enough to call twice per stage.
+    ok(now_ns < 1000.0, "clock_now costs under 1 us");
+}
+
+fn main() {
+    print("probe_time — W0-3 clock and instrumentation");
+    print("");
+    test_raw_clock();
+    test_injected_stalls();
+    test_no_spiral();
+    test_accumulator_quality();
+    test_real_clock_path();
+    test_stats_basics();
+    test_stat_coverage();
+    test_report_throttle();
+    test_overhead();
+    print("");
+    print("sample report:");
+    stat_reset();
+    stat_add(STAT_TRIS_WORLD, 1872);
+    stat_add(STAT_TRIS_SKY, 4);
+    stat_add(STAT_TRIS_HUD, 214);
+    stat_add(STAT_DRAW_CALLS, 6);
+    stat_add_ms(STAT_T_FRAME, 8.412);
+    print(stat_report_string_now());
+    print(`PASS ${g_pass}/${g_total}`);
+    if (g_pass != g_total) { exit(1); }
+}
+
+main();

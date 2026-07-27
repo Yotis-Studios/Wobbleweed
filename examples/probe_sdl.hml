@@ -1,0 +1,690 @@
+// probe_sdl.hml — the acceptance probe for the SDL + SDL_mixer FFI surface.
+//
+// It calls EVERY extern declared in src/sdl.hml at least once (through the
+// exported wrappers), so a symbol that fails to resolve fails the probe rather
+// than a game three months from now.
+//
+// Run it four ways. All four must print the same PASS n/n:
+//   hemlock  examples/probe_sdl.hml                             # interp, real display
+//   SDL_VIDEODRIVER=dummy hemlock  examples/probe_sdl.hml       # interp, headless
+//   hemlockc examples/probe_sdl.hml -o /tmp/probe_sdl && /tmp/probe_sdl
+//   SDL_VIDEODRIVER=dummy /tmp/probe_sdl
+//
+// Run it from the wobbleweed repo root (it reads src/sdl.hml back for the G5
+// regression assertions).
+
+import { read_file, exists } from "@stdlib/fs";
+import { exit } from "@stdlib/process";
+import { window_open, window_open_ex, window_close,
+         sdl_clear, sdl_present, set_draw_color, set_draw_blend, fill_rect,
+         draw_tris_at,
+         create_static_tex, create_streaming_tex, create_target, destroy_tex,
+         set_target, get_target, update_tex, update_tex_rect, query_tex,
+         set_tex_blend, set_tex_alpha, set_tex_color,
+         copy_ex, copy_scaled, read_pixels_rect,
+         poll_events, pump_events, keystate, held,
+         set_relative_mouse, get_relative_mouse, rel_mouse_delta,
+         mouse_buttons, mouse_pos, show_cursor,
+         perf_counter, perf_freq,
+         set_hint, get_hint, sdl_error, sdl_clear_error, sdl_version_string,
+         set_window_title, window_size, set_logical_size, set_vsync,
+         mix_version_string, mix_open, mix_query_spec, mix_alloc_channels,
+         mix_quickload_raw, mix_load_wav_rw, rw_from_mem,
+         mix_play, mix_play_timed, mix_set_panning, mix_set_volume,
+         mix_set_chunk_volume, mix_playing, mix_halt, mix_free_chunk, mix_close,
+         qaudio_open, qaudio_queue, qaudio_size, qaudio_clear, qaudio_pause,
+         qaudio_close, qaudio_mix,
+         present, upload_texture, clear, draw_tris, present_geom, read_pixels,
+         poll, ticks, delay,
+         FMT_RGBA32, FMT_ARGB8888, FMT_RGB24,
+         BLEND_NONE, BLEND_BLEND, BLEND_ADD, BLEND_MOD,
+         TEXACCESS_STATIC, TEXACCESS_STREAMING, TEXACCESS_TARGET,
+         AUDIO_S16LSB, MIX_MAX_VOLUME,
+         SC_A, SC_ESCAPE, EV_QUIT } from "../src/sdl.hml";
+
+let g_n = 0;
+let g_pass = 0;
+let g_notes = [];
+
+// D4: the probe must run exactly this many assertions. Both the numerator and
+// the denominator are checked at the end, so a skipped branch cannot shrink both
+// and still print a green "PASS n/n". Update deliberately when adding checks.
+let EXPECTED_ASSERTIONS = 157;
+
+fn ok(name: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}`); }
+}
+
+fn eq(name: string, got, want) {
+    g_n = g_n + 1;
+    if (got == want) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}: got ${got}, want ${want}`); }
+}
+
+// Pixel readbacks are compared with a +/-1 tolerance: SDL's software and OpenGL
+// renderers round the blend arithmetic in the last bit on some GPUs. Every
+// value below was measured exact on this box on both renderers.
+fn near(name: string, got, want) {
+    g_n = g_n + 1;
+    let d = got - want;
+    if (d < 0) { d = 0 - d; }
+    if (d <= 1) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}: got ${got}, want ${want}`); }
+}
+
+fn note(s: string) { g_notes.push(s); }
+
+// ---------------------------------------------------------------------------
+// Read one RGBA pixel out of the current render target.
+// g_px is 4 bytes; returns nothing, the caller reads px_r/px_g/px_b.
+// ---------------------------------------------------------------------------
+let g_px = alloc(16);
+
+fn px_at(w: object, x: i32, y: i32): i32 {
+    memset(g_px, 0, 16);
+    return read_pixels_rect(w, x, y, 1, 1, FMT_RGBA32, g_px, 4);
+}
+fn px_r(): i32 { return ptr_deref_u8(g_px); }
+fn px_g(): i32 { return ptr_deref_u8(ptr_offset(g_px, 1, 1)); }
+fn px_b(): i32 { return ptr_deref_u8(ptr_offset(g_px, 2, 1)); }
+
+fn check_rgb(w: object, label: string, x: i32, y: i32, r: i32, g: i32, b: i32) {
+    px_at(w, x, y);
+    near(`${label} R`, px_r(), r);
+    near(`${label} G`, px_g(), g);
+    near(`${label} B`, px_b(), b);
+}
+
+// Fill an RGBA32 buffer of n pixels with one colour and return it.
+fn solid_rgba(n: i32, r: i32, g: i32, b: i32, a: i32): ptr {
+    let p = alloc(n * 4);
+    let i = 0;
+    while (i < n) {
+        let o = i * 4;
+        ptr_write_u8(ptr_offset(p, o, 1), r);
+        ptr_write_u8(ptr_offset(p, o + 1, 1), g);
+        ptr_write_u8(ptr_offset(p, o + 2, 1), b);
+        ptr_write_u8(ptr_offset(p, o + 3, 1), a);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn make_tex(w: object, size: i32, r: i32, g: i32, b: i32): ptr {
+    let t = create_static_tex(w, FMT_RGBA32, size, size);
+    let px = solid_rgba(size * size, r, g, b, 255);
+    update_tex(t, px, size * 4);
+    return t;
+}
+
+// Write one SDL_Vertex (20 bytes) at vertex index `i` of `base`.
+//   pos.x f32@0  pos.y f32@4  color r,g,b,a u8@8..11  uv.u f32@12  uv.v f32@16
+fn put_vert(base: ptr, i: i32, x: f64, y: f64, r: i32, g: i32, b: i32, a: i32) {
+    let o = i * 20;
+    ptr_write_f32(ptr_offset(base, o, 1), x);
+    ptr_write_f32(ptr_offset(base, o + 4, 1), y);
+    ptr_write_u8(ptr_offset(base, o + 8, 1), r);
+    ptr_write_u8(ptr_offset(base, o + 9, 1), g);
+    ptr_write_u8(ptr_offset(base, o + 10, 1), b);
+    ptr_write_u8(ptr_offset(base, o + 11, 1), a);
+    ptr_write_f32(ptr_offset(base, o + 12, 1), 0.0);
+    ptr_write_f32(ptr_offset(base, o + 16, 1), 0.0);
+}
+
+// Minimal 16-bit mono PCM WAV in memory, so Mix_LoadWAV_RW has something real
+// to parse. `n` = sample count.
+fn make_wav(n: i32): ptr {
+    let total = 44 + n * 2;
+    let p = alloc(total);
+    memset(p, 0, total);
+    // "RIFF"
+    ptr_write_u8(p, 82); ptr_write_u8(ptr_offset(p, 1, 1), 73);
+    ptr_write_u8(ptr_offset(p, 2, 1), 70); ptr_write_u8(ptr_offset(p, 3, 1), 70);
+    ptr_write_u32(ptr_offset(p, 4, 1), 36 + n * 2);
+    // "WAVE"
+    ptr_write_u8(ptr_offset(p, 8, 1), 87); ptr_write_u8(ptr_offset(p, 9, 1), 65);
+    ptr_write_u8(ptr_offset(p, 10, 1), 86); ptr_write_u8(ptr_offset(p, 11, 1), 69);
+    // "fmt "
+    ptr_write_u8(ptr_offset(p, 12, 1), 102); ptr_write_u8(ptr_offset(p, 13, 1), 109);
+    ptr_write_u8(ptr_offset(p, 14, 1), 116); ptr_write_u8(ptr_offset(p, 15, 1), 32);
+    ptr_write_u32(ptr_offset(p, 16, 1), 16);
+    ptr_write_u16(ptr_offset(p, 20, 1), 1);        // PCM
+    ptr_write_u16(ptr_offset(p, 22, 1), 1);        // mono
+    ptr_write_u32(ptr_offset(p, 24, 1), 22050);
+    ptr_write_u32(ptr_offset(p, 28, 1), 44100);
+    ptr_write_u16(ptr_offset(p, 32, 1), 2);
+    ptr_write_u16(ptr_offset(p, 34, 1), 16);
+    // "data"
+    ptr_write_u8(ptr_offset(p, 36, 1), 100); ptr_write_u8(ptr_offset(p, 37, 1), 97);
+    ptr_write_u8(ptr_offset(p, 38, 1), 116); ptr_write_u8(ptr_offset(p, 39, 1), 97);
+    ptr_write_u32(ptr_offset(p, 40, 1), n * 2);
+    let i = 0;
+    while (i < n) {
+        ptr_write_i16(ptr_offset(p, 44 + i * 2, 1), 3000);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn read_source(): string {
+    // D2: cwd-independent. The absolute path is authoritative; the relatives are
+    // kept as fallbacks for a relocated checkout. Previously this probe silently
+    // "passed" from any other cwd, because the two negative G5 assertions below
+    // are vacuously true on an empty string.
+    let paths = ["/home/nbeerbower/Projects/wobbleweed/src/sdl.hml",
+                 "src/sdl.hml", "../src/sdl.hml", "wobbleweed/src/sdl.hml"];
+    let i = 0;
+    while (i < paths.length) {
+        if (exists(paths[i])) {
+            let s = read_file(paths[i]);
+            return s;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn main() {
+    print("=== probe_sdl : W0-1 SDL + SDL_mixer FFI surface ===");
+
+    // -----------------------------------------------------------------------
+    // 1. Window / renderer lifecycle
+    // -----------------------------------------------------------------------
+    let w = window_open("probe_sdl", 320, 240, 1);
+    ok("window_open returns a handle", w != null);
+    if (w == null) { print("FATAL: no window; nothing else can run"); return; }
+    // NOTE: an FFI-returned pointer must be tested with ptr_null(), never with
+    // the `null` literal: the interpreter treats NULL as equal to null and
+    // hemlockc does not. This probe would pass interpreted and fail compiled.
+    ok("renderer created", w.ren != ptr_null());
+    ok("legacy streaming texture created (logical=1 path)", w.tex != ptr_null());
+    ok("event scratch allocated", w.ev != ptr_null());
+
+    let ver = sdl_version_string();
+    print(`  SDL runtime version      : ${ver}`);
+    print(`  SDL_mixer linked version : ${mix_version_string()}`);
+    ok("SDL runtime is SDL2", ver.contains("2."));
+    ok("SDL_mixer linked version is 2.0.4", mix_version_string() == "2.0.4");
+
+    // -----------------------------------------------------------------------
+    // 2. G5 REGRESSION GUARD — do not re-introduce SDL_SetTextureScaleMode.
+    //    It segfaults on SDL's internal format-conversion textures. The
+    //    SDL_RENDER_SCALE_QUALITY hint is the sanctioned replacement and it is
+    //    read by SDL_CreateTexture, so it covers every texture.
+    // -----------------------------------------------------------------------
+    eq("G5: SDL_RENDER_SCALE_QUALITY hint is '0' after window_open",
+       get_hint("SDL_RENDER_SCALE_QUALITY"), "0");
+    let src = read_source();
+    ok("G5: src/sdl.hml is readable for the regression grep", src.length > 0);
+    ok("G5: sdl.hml declares NO SDL_SetTextureScaleMode extern",
+       src.contains("extern fn SDL_SetTextureScaleMode") == false);
+    ok("G5: sdl.hml never CALLS SDL_SetTextureScaleMode(",
+       src.contains("SDL_SetTextureScaleMode(tex") == false);
+    ok("G5: sdl.hml still sets the SDL_RENDER_SCALE_QUALITY hint",
+       src.contains("SDL_SetHint(\"SDL_RENDER_SCALE_QUALITY\", \"0\")"));
+
+    // -----------------------------------------------------------------------
+    // 3. Hints, error channel, window queries
+    // -----------------------------------------------------------------------
+    set_hint("SDL_HINT_PROBE_SCRATCH", "wobbleweed");
+    eq("set_hint / get_hint round-trip", get_hint("SDL_HINT_PROBE_SCRATCH"), "wobbleweed");
+    sdl_clear_error();
+    eq("sdl_clear_error empties sdl_error", sdl_error(), "");
+
+    set_window_title(w, "probe_sdl (running)");
+    let wsz = alloc(8);
+    memset(wsz, 0, 8);
+    window_size(w, wsz);
+    eq("window_size width", ptr_deref_i32(wsz), 320);
+    eq("window_size height", ptr_deref_i32(ptr_offset(wsz, 4, 1)), 240);
+    eq("set_logical_size returns 0", set_logical_size(w, 320, 240), 0);
+
+    // Non-zero means "vsync unavailable on this renderer", never fatal.
+    let vs = set_vsync(w, 0);
+    ok("set_vsync returns 0 or -1 (non-fatal either way)", vs == 0 || vs == -1);
+    note(`set_vsync(0) -> ${vs}`);
+
+    // -----------------------------------------------------------------------
+    // 4. Textures: creation, format query, upload
+    // -----------------------------------------------------------------------
+    let q = alloc(16);
+    let t_stat = create_static_tex(w, FMT_RGBA32, 8, 8);
+    ok("create_static_tex non-null", t_stat != ptr_null());
+    memset(q, 0, 16);
+    eq("query_tex returns 0", query_tex(t_stat, q), 0);
+    eq("static texture format is RGBA32", ptr_deref_u32(q), FMT_RGBA32);
+    eq("static texture access is STATIC", ptr_deref_i32(ptr_offset(q, 4, 1)), TEXACCESS_STATIC);
+    eq("static texture width", ptr_deref_i32(ptr_offset(q, 8, 1)), 8);
+    eq("static texture height", ptr_deref_i32(ptr_offset(q, 12, 1)), 8);
+
+    let t_stream = create_streaming_tex(w, FMT_RGBA32, 8, 8);
+    ok("create_streaming_tex non-null", t_stream != ptr_null());
+    memset(q, 0, 16);
+    query_tex(t_stream, q);
+    eq("streaming texture access is STREAMING",
+       ptr_deref_i32(ptr_offset(q, 4, 1)), TEXACCESS_STREAMING);
+
+    let solid = solid_rgba(64, 1, 2, 3, 255);
+    eq("update_tex returns 0", update_tex(t_stat, solid, 32), 0);
+    eq("update_tex_rect returns 0", update_tex_rect(t_stat, 2, 2, 2, 2, solid, 32), 0);
+
+    // Render target — ARGB8888 is renderer-native, so SDL allocates no
+    // conversion texture and the G5 crash class cannot occur.
+    let target = create_target(w, 64, 64);
+    ok("create_target non-null", target != ptr_null());
+    memset(q, 0, 16);
+    query_tex(target, q);
+    eq("target format is ARGB8888", ptr_deref_u32(q), FMT_ARGB8888);
+    eq("target access is TARGET", ptr_deref_i32(ptr_offset(q, 4, 1)), TEXACCESS_TARGET);
+
+    eq("set_target(target) returns 0", set_target(w, target), 0);
+    eq("get_target reports the target", get_target(w), target);
+    eq("set_target(null) restores the backbuffer", set_target(w, null), 0);
+    eq("get_target is null on the backbuffer", get_target(w), ptr_null());
+
+    // -----------------------------------------------------------------------
+    // 5. Clear + readback on the backbuffer, and the legacy RGB24 readback
+    // -----------------------------------------------------------------------
+    set_draw_blend(w, BLEND_NONE);
+    sdl_clear(w, 12, 34, 56, 255);
+    check_rgb(w, "sdl_clear backbuffer", 10, 10, 12, 34, 56);
+
+    let fb = buffer(320 * 240 * 3);
+    read_pixels(w, fb);
+    eq("legacy read_pixels RGB24 R", fb[0], 12);
+    eq("legacy read_pixels RGB24 G", fb[1], 34);
+    eq("legacy read_pixels RGB24 B", fb[2], 56);
+
+    // -----------------------------------------------------------------------
+    // 6. Everything else renders into the 64x64 target.
+    // -----------------------------------------------------------------------
+    set_target(w, target);
+
+    // fill_rect + draw colour
+    sdl_clear(w, 0, 0, 0, 255);
+    set_draw_blend(w, BLEND_NONE);
+    eq("set_draw_color returns 0", set_draw_color(w, 7, 9, 11, 255), 0);
+    eq("fill_rect returns 0", fill_rect(w, 10, 10, 4, 4), 0);
+    check_rgb(w, "fill_rect", 11, 11, 7, 9, 11);
+    check_rgb(w, "fill_rect leaves outside untouched", 30, 30, 0, 0, 0);
+
+    // ---- SDL_RenderGeometry, including the vertex-offset form --------------
+    sdl_clear(w, 0, 0, 0, 255);
+    let vb = alloc(6 * 20);
+    put_vert(vb, 0,  0.0,  0.0, 10, 200, 30, 255);
+    put_vert(vb, 1, 64.0,  0.0, 10, 200, 30, 255);
+    put_vert(vb, 2,  0.0, 64.0, 10, 200, 30, 255);
+    put_vert(vb, 3, 64.0,  0.0, 220, 40, 110, 255);
+    put_vert(vb, 4, 64.0, 64.0, 220, 40, 110, 255);
+    put_vert(vb, 5,  0.0, 64.0, 220, 40, 110, 255);
+    eq("draw_tris_at(first=0) returns 0", draw_tris_at(w, null, vb, 0, 3), 0);
+    eq("draw_tris_at(first=3) returns 0", draw_tris_at(w, null, vb, 3, 3), 0);
+    check_rgb(w, "RenderGeometry tri A", 8, 8, 10, 200, 30);
+    check_rgb(w, "RenderGeometry tri B (vertex offset)", 55, 55, 220, 40, 110);
+
+    // legacy draw_tris (no offset) must still work
+    sdl_clear(w, 0, 0, 0, 255);
+    draw_tris(w, null, vb, 3);
+    check_rgb(w, "legacy draw_tris", 8, 8, 10, 200, 30);
+
+    // ---- Blend-mode pixel readbacks ---------------------------------------
+    let t_red = make_tex(w, 8, 255, 0, 0);
+    let t_g60 = make_tex(w, 8, 60, 60, 60);
+    let t_g128 = make_tex(w, 8, 128, 128, 128);
+    let t_white = make_tex(w, 8, 255, 255, 255);
+
+    // BLEND: 50% red over blue -> 255*128/255 = 128 red, 255*127/255 = 127 blue
+    sdl_clear(w, 0, 0, 255, 255);
+    eq("set_tex_blend(BLEND) returns 0", set_tex_blend(t_red, BLEND_BLEND), 0);
+    eq("set_tex_alpha returns 0", set_tex_alpha(t_red, 128), 0);
+    eq("copy_ex(angle 0.0) returns 0", copy_ex(w, t_red, null, null, 0.0, null, 0), 0);
+    check_rgb(w, "BLEND 50% red over blue", 32, 32, 128, 0, 127);
+
+    // Fully transparent must change nothing.
+    sdl_clear(w, 200, 30, 90, 255);
+    set_tex_alpha(t_white, 0);
+    set_tex_blend(t_white, BLEND_BLEND);
+    copy_ex(w, t_white, null, null, 0.0, null, 0);
+    check_rgb(w, "BLEND alpha=0 changes nothing", 32, 32, 200, 30, 90);
+
+    // AlphaMod on white over black -> 64,64,64
+    sdl_clear(w, 0, 0, 0, 255);
+    set_tex_alpha(t_white, 64);
+    copy_ex(w, t_white, null, null, 0.0, null, 0);
+    check_rgb(w, "AlphaMod 64 white over black", 32, 32, 64, 64, 64);
+    set_tex_alpha(t_white, 255);
+
+    // ADD: 40 + 60 = 100
+    sdl_clear(w, 40, 40, 40, 255);
+    eq("set_tex_blend(ADD) returns 0", set_tex_blend(t_g60, BLEND_ADD), 0);
+    copy_ex(w, t_g60, null, null, 0.0, null, 0);
+    check_rgb(w, "ADD 40+60", 32, 32, 100, 100, 100);
+
+    // MOD: dst * src / 255
+    sdl_clear(w, 200, 100, 50, 255);
+    eq("set_tex_blend(MOD) returns 0", set_tex_blend(t_g128, BLEND_MOD), 0);
+    copy_ex(w, t_g128, null, null, 0.0, null, 0);
+    check_rgb(w, "MOD 128 over (200,100,50)", 32, 32, 100, 50, 25);
+
+    // ColorMod on an opaque white texture -> the colour mod itself
+    sdl_clear(w, 0, 0, 0, 255);
+    set_tex_blend(t_white, BLEND_NONE);
+    eq("set_tex_color returns 0", set_tex_color(t_white, 0, 128, 0), 0);
+    copy_ex(w, t_white, null, null, 0.0, null, 0);
+    check_rgb(w, "ColorMod (0,128,0) on white", 32, 32, 0, 128, 0);
+    set_tex_color(t_white, 255, 255, 255);
+
+    // ---- copy_scaled: nearest-neighbour integer upscale (the chunky look) --
+    let t2 = create_static_tex(w, FMT_RGBA32, 2, 2);
+    let px2 = alloc(16);
+    ptr_write_u8(px2, 240); ptr_write_u8(ptr_offset(px2, 1, 1), 10);
+    ptr_write_u8(ptr_offset(px2, 2, 1), 10); ptr_write_u8(ptr_offset(px2, 3, 1), 255);
+    ptr_write_u8(ptr_offset(px2, 4, 1), 10); ptr_write_u8(ptr_offset(px2, 5, 1), 240);
+    ptr_write_u8(ptr_offset(px2, 6, 1), 10); ptr_write_u8(ptr_offset(px2, 7, 1), 255);
+    ptr_write_u8(ptr_offset(px2, 8, 1), 10); ptr_write_u8(ptr_offset(px2, 9, 1), 10);
+    ptr_write_u8(ptr_offset(px2, 10, 1), 240); ptr_write_u8(ptr_offset(px2, 11, 1), 255);
+    ptr_write_u8(ptr_offset(px2, 12, 1), 240); ptr_write_u8(ptr_offset(px2, 13, 1), 240);
+    ptr_write_u8(ptr_offset(px2, 14, 1), 10); ptr_write_u8(ptr_offset(px2, 15, 1), 255);
+    update_tex(t2, px2, 8);
+    set_tex_blend(t2, BLEND_NONE);
+    sdl_clear(w, 0, 0, 0, 255);
+    eq("copy_scaled returns 0", copy_scaled(w, t2, 0, 0, 2, 2, 8), 0);
+    // Nearest: the whole 8x8 top-left block is texel (0,0), and (8..15, 0..7)
+    // is texel (1,0). Any filtering would smear the boundary.
+    check_rgb(w, "copy_scaled texel(0,0) at (0,0)", 0, 0, 240, 10, 10);
+    check_rgb(w, "copy_scaled texel(0,0) still at (7,7)", 7, 7, 240, 10, 10);
+    check_rgb(w, "copy_scaled texel(1,0) at (8,0)", 8, 0, 10, 240, 10);
+    check_rgb(w, "copy_scaled texel(0,1) at (0,8)", 0, 8, 10, 10, 240);
+
+    set_target(w, null);
+
+    // -----------------------------------------------------------------------
+    // 7. Legacy CPU-framebuffer surface (kept alive for the frozen modules)
+    // -----------------------------------------------------------------------
+    let legacy_tex = upload_texture(w, { width: 4, height: 4, data: buffer(48) });
+    ok("legacy upload_texture non-null", legacy_tex != ptr_null());
+    memset(q, 0, 16);
+    query_tex(legacy_tex, q);
+    eq("legacy upload_texture is RGB24", ptr_deref_u32(q), FMT_RGB24);
+
+    clear(w, 3, 4, 5);
+    check_rgb(w, "legacy clear()", 5, 5, 3, 4, 5);
+
+    let fbp = alloc(320 * 240 * 3);
+    memset(fbp, 128, 320 * 240 * 3);
+    present(w, fbp);
+    ok("legacy present() executed without crashing", true);
+    present_geom(w);
+    ok("legacy present_geom() executed without crashing", true);
+    sdl_present(w);
+    ok("sdl_present() executed without crashing", true);
+
+    // -----------------------------------------------------------------------
+    // 8. Events, keyboard, mouse
+    // -----------------------------------------------------------------------
+    pump_events();
+    let evs = [];
+    let i = 0;
+    while (i < 96) { evs.push(0); i = i + 1; }
+    let nev = poll_events(w, evs, 32);
+    ok("poll_events returns a sane count", nev >= 0 && nev <= 32);
+    note(`poll_events drained ${nev} event(s)`);
+    // Every recorded type must be a real SDL event id (>= SDL_QUIT); the wrapper
+    // must never leave a slot half-written.
+    let bad_ev = 0;
+    let e = 0;
+    while (e < nev) {
+        if (evs[e * 3] < EV_QUIT) { bad_ev = bad_ev + 1; }
+        e = e + 1;
+    }
+    eq("every event poll_events recorded has a valid type id", bad_ev, 0);
+
+    let legacy_poll = poll(w);
+    ok("legacy poll() returns an object", legacy_poll != null);
+    ok("legacy poll().keys is an array", legacy_poll.keys != null);
+
+    let ks = keystate();
+    ok("keystate() non-null", ks != ptr_null());
+    // SDL's keyboard state is one byte per scancode, each strictly 0 or 1.
+    let bad_ks = 0;
+    let sc = 0;
+    while (sc < 512) {
+        let v = ptr_deref_u8(ptr_offset(ks, sc, 1));
+        if (v > 1) { bad_ks = bad_ks + 1; }
+        sc = sc + 1;
+    }
+    eq("keystate array is 512 bytes of 0/1", bad_ks, 0);
+    let hA = held(ks, SC_A);
+    ok("held(SC_A) agrees with the raw byte",
+       hA == (ptr_deref_u8(ptr_offset(ks, SC_A, 1)) != 0));
+    let hE = held(ks, SC_ESCAPE);
+    ok("held(SC_ESCAPE) agrees with the raw byte",
+       hE == (ptr_deref_u8(ptr_offset(ks, SC_ESCAPE, 1)) != 0));
+
+    // SDL_SetRelativeMouseMode returns -1 under SDL_VIDEODRIVER=dummy ("No
+    // relative mode implementation available"). REPORT IT, NEVER FATAL.
+    let rm = set_relative_mouse(1);
+    ok("set_relative_mouse(1) returns 0 or -1 (never fatal)", rm == 0 || rm == -1);
+    if (rm == 0) { note("relative mouse mode: ENABLED (real display)"); }
+    else { note(`relative mouse mode: UNAVAILABLE, ret ${rm} — expected headless, non-fatal`); }
+    let grm = get_relative_mouse();
+    ok("get_relative_mouse returns 0 or 1", grm == 0 || grm == 1);
+    let expect_grm = 0;
+    if (rm == 0) { expect_grm = 1; }
+    eq("get_relative_mouse agrees with what set_relative_mouse reported",
+       grm, expect_grm);
+    eq("set_relative_mouse(0) returns 0", set_relative_mouse(0), 0);
+
+    let mxy = alloc(8);
+    memset(mxy, 0, 8);
+    let rmask = rel_mouse_delta(mxy);
+    ok("rel_mouse_delta button mask has only the 5 button bits",
+       rmask >= 0 && rmask < 32);
+    let mb = mouse_buttons();
+    ok("mouse_buttons mask has only the 5 button bits", mb >= 0 && mb < 32);
+    memset(mxy, 0, 8);
+    let pmask = mouse_pos(mxy);
+    ok("mouse_pos returns the same mask shape", pmask >= 0 && pmask < 32);
+    eq("mouse_pos and mouse_buttons agree", pmask, mb);
+
+    let sc0 = show_cursor(0);
+    ok("show_cursor(0) returns a state, never an error", sc0 >= 0);
+    // Under SDL_VIDEODRIVER=dummy there is no cursor at all, so SDL_ShowCursor(1)
+    // still reports 0. Non-fatal, exactly like relative mouse mode.
+    let sc1 = show_cursor(1);
+    ok("show_cursor(1) returns a state, never an error", sc1 >= 0);
+    note(`show_cursor: hide -> ${sc0}, show -> ${sc1}`);
+
+    // -----------------------------------------------------------------------
+    // 9. Time
+    // -----------------------------------------------------------------------
+    let f = perf_freq();
+    ok("perf_freq > 0", f > 0);
+    note(`perf_freq = ${f}`);
+    let c0 = perf_counter();
+    delay(3);
+    let c1 = perf_counter();
+    ok("perf_counter is monotonically increasing", c1 > c0);
+    let elapsed_ms = f64(c1 - c0) * 1000.0 / f64(f);
+    ok("perf_counter measures delay(3) as 1..250 ms", elapsed_ms > 1.0 && elapsed_ms < 250.0);
+    note(`delay(3) measured as ${elapsed_ms} ms`);
+    ok("ticks() is non-negative", ticks() >= 0);
+
+    // -----------------------------------------------------------------------
+    // 10. Raw SDL audio (the documented fallback path behind audio.hml)
+    // -----------------------------------------------------------------------
+    let want = alloc(64);
+    memset(want, 0, 64);
+    ptr_write_i32(want, 22050);
+    ptr_write_u16(ptr_offset(want, 4, 1), AUDIO_S16LSB);
+    ptr_write_u8(ptr_offset(want, 6, 1), 1);
+    ptr_write_u16(ptr_offset(want, 8, 1), 512);
+    // callback @16 stays NULL -> queue mode, so Hemlock never hands C a
+    // function pointer.
+    let have = alloc(64);
+    memset(have, 0, 64);
+    sdl_clear_error();
+    let dev = qaudio_open(want, have);
+    if (dev != 0) {
+        note(`SDL_OpenAudioDevice -> device ${dev}, ${ptr_deref_i32(have)} Hz`);
+        ok("qaudio_open produced a positive sample rate", ptr_deref_i32(have) > 0);
+        let pcm = alloc(4410);
+        memset(pcm, 0, 4410);
+        qaudio_pause(dev, 0);
+        eq("qaudio_queue returns 0", qaudio_queue(dev, pcm, 4410), 0);
+        ok("qaudio_size is readable", qaudio_size(dev) >= 0);
+        qaudio_clear(dev);
+        eq("qaudio_clear empties the queue", qaudio_size(dev), 0);
+        qaudio_pause(dev, 1);
+        qaudio_close(dev);
+        ok("qaudio_close completed", true);
+    } else {
+        // Reported, never fatal — but it IS a failed acceptance criterion on a
+        // box that is supposed to have an audio device, so it counts as FAIL.
+        note(`SDL_OpenAudioDevice failed (${sdl_error()}) — reported, not fatal`);
+        ok("qaudio_open opened a device", false);
+        ok("qaudio_queue exercised", false);
+        ok("qaudio_size exercised", false);
+        ok("qaudio_clear exercised", false);
+        ok("qaudio_close exercised", false);
+    }
+
+    // SDL_MixAudioFormat: mixing one S16 sample at full volume into silence
+    // must reproduce it exactly.
+    let mdst = alloc(8);
+    let msrc = alloc(8);
+    memset(mdst, 0, 8);
+    memset(msrc, 0, 8);
+    ptr_write_i16(msrc, 1000);
+    qaudio_mix(mdst, msrc, AUDIO_S16LSB, 2, 128);
+    eq("SDL_MixAudioFormat at full volume is identity", ptr_deref_i16(mdst), 1000);
+
+    // -----------------------------------------------------------------------
+    // 11. SDL2_mixer — the primary audio path
+    // -----------------------------------------------------------------------
+    sdl_clear_error();
+    let mo = mix_open(22050, AUDIO_S16LSB, 1, 512);
+    ok("mix_open returns 0 or -1 (failure is non-fatal)", mo == 0 || mo == -1);
+    note(`Mix_OpenAudio -> ${mo}`);
+
+    if (mo == 0) {
+        let spec = alloc(16);
+        memset(spec, 0, 16);
+        let qs = mix_query_spec(spec);
+        ok("Mix_QuerySpec reports the device open", qs >= 1);
+        eq("Mix_QuerySpec frequency", ptr_deref_i32(spec), 22050);
+        eq("Mix_QuerySpec format", ptr_deref_u16(ptr_offset(spec, 4, 1)), AUDIO_S16LSB);
+        eq("Mix_QuerySpec channels", ptr_deref_i32(ptr_offset(spec, 8, 1)), 1);
+
+        eq("mix_alloc_channels(16) returns 16", mix_alloc_channels(16), 16);
+
+        // Mix_QuickLoad_RAW does NOT copy — this buffer is deliberately never
+        // freed, exactly as audio.hml must own its PCM for the process lifetime.
+        let nsamp = 22050;
+        let raw = alloc(nsamp * 2);
+        let k = 0;
+        while (k < nsamp) {
+            let s = 0;
+            if ((k % 100) < 50) { s = 4000; } else { s = 0 - 4000; }
+            ptr_write_i16(ptr_offset(raw, k * 2, 1), s);
+            k = k + 1;
+        }
+        let chunk = mix_quickload_raw(raw, nsamp * 2);
+        ok("mix_quickload_raw returns a chunk", chunk != ptr_null());
+        ok("mix_set_chunk_volume returns the previous volume",
+           mix_set_chunk_volume(chunk, 64) >= 0);
+
+        let ch = mix_play(chunk, -1, 0);
+        ok("mix_play (Mix_PlayChannelTimed) allocated a channel", ch >= 0);
+        eq("mix_playing reports the channel live", mix_playing(ch), 1);
+        eq("mix_set_panning succeeds", mix_set_panning(ch, 200, 55), 1);
+        ok("mix_set_volume returns the previous volume",
+           mix_set_volume(ch, MIX_MAX_VOLUME) >= 0);
+
+        // Eight overlapping voices, distinct pans.
+        let v = 0;
+        let started = 0;
+        while (v < 8) {
+            let c2 = mix_play_timed(chunk, -1, 0, 900);
+            if (c2 >= 0) {
+                mix_set_panning(c2, 30 + v * 25, 250 - v * 25);
+                started = started + 1;
+            }
+            v = v + 1;
+        }
+        eq("8 additional voices all started", started, 8);
+        ok("at least 8 channels are playing simultaneously", mix_playing(-1) >= 8);
+        note(`simultaneous voices = ${mix_playing(-1)}`);
+
+        eq("mix_halt(-1) returns 0", mix_halt(-1), 0);
+        eq("no channel is playing after halt", mix_playing(-1), 0);
+
+        // Mix_LoadWAV is a macro; Mix_LoadWAV_RW is the real symbol.
+        let wavbytes = make_wav(512);
+        let rw = rw_from_mem(wavbytes, 44 + 512 * 2);
+        ok("rw_from_mem (SDL_RWFromMem) non-null", rw != ptr_null());
+        let wchunk = mix_load_wav_rw(rw, 1);
+        ok("mix_load_wav_rw (Mix_LoadWAV_RW) decoded the WAV", wchunk != ptr_null());
+        if (wchunk != ptr_null()) {
+            let wc = mix_play(wchunk, -1, 0);
+            ok("the WAV chunk plays", wc >= 0);
+            mix_halt(-1);
+            mix_free_chunk(wchunk);
+            ok("mix_free_chunk completed", true);
+        } else {
+            ok("the WAV chunk plays (skipped, load failed)", false);
+            ok("mix_free_chunk completed (skipped)", false);
+        }
+        mix_close();
+        ok("mix_close completed", true);
+    } else {
+        note(`Mix_OpenAudio failed: ${sdl_error()} — reported, not fatal`);
+        ok("Mix_OpenAudio failure reported through sdl_error", sdl_error() != "");
+        let j = 0;
+        while (j < 19) { ok("mixer check skipped (no device)", false); j = j + 1; }
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. window_open_ex with logical=0 — the shipping path's window shape
+    // -----------------------------------------------------------------------
+    let w2 = window_open_ex("probe_sdl_raw", 160, 120, 1, 0);
+    ok("window_open_ex(logical=0) returns a handle", w2 != null);
+    if (w2 != null) {
+        eq("window_open_ex(logical=0) creates no framebuffer texture", w2.tex, ptr_null());
+        ok("window_open_ex(logical=0) still creates a renderer", w2.ren != ptr_null());
+    } else {
+        ok("window_open_ex(logical=0) creates no framebuffer texture", false);
+        ok("window_open_ex(logical=0) still creates a renderer", false);
+    }
+
+    // -----------------------------------------------------------------------
+    destroy_tex(t_stat); destroy_tex(t_stream); destroy_tex(target);
+    destroy_tex(t_red); destroy_tex(t_g60); destroy_tex(t_g128);
+    destroy_tex(t_white); destroy_tex(t2); destroy_tex(legacy_tex);
+    ok("destroy_tex completed on every texture", true);
+
+    window_close(w);
+
+    print("");
+    print("--- notes ---");
+    let ni = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    // D4: assert the denominator too, so a skipped branch cannot shrink both
+    // numerator and denominator and still print a green PASS n/n.
+    if (g_n != EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        // D1: exit non-zero so `exit 0 <=> pass` holds. Without this a gate
+        // script keying on exit status reads green on a failing probe.
+        exit(1);
+    }
+}
+
+main();
