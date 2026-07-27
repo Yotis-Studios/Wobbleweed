@@ -18,6 +18,7 @@ extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32):
 extern fn SDL_RenderSetLogicalSize(ren: ptr, w: i32, h: i32): i32;
 extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32;
 extern fn SDL_SetTextureScaleMode(tex: ptr, mode: i32): i32;
+extern fn SDL_SetHint(name: string, value: string): i32;
 extern fn SDL_SetRenderDrawColor(ren: ptr, r: i32, g: i32, b: i32, a: i32): i32;
 extern fn SDL_RenderClear(ren: ptr): i32;
 extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
@@ -74,6 +75,18 @@ export fn window_open(title: string, width: i32, height: i32, scale: i32): objec
         eprint(`SDL_Init failed: ${SDL_GetError()}`);
         return null;
     }
+    // Nearest-neighbour scaling for every texture we create from here on.
+    //
+    // This replaces the per-texture SDL_SetTextureScaleMode() that
+    // upload_texture() used to call. That call SEGFAULTS on the accelerated
+    // (OpenGL) renderer: our textures are RGB24, which is not in the GL
+    // renderer's native format list, so SDL allocates an internal conversion
+    // ("native") texture for them, and the scale-mode path on that conversion
+    // texture faults in SDL 2.0.20. The software/dummy renderer never hit it,
+    // which is why headless runs were fine and every real-display run died in
+    // upload_texture. The hint is read by SDL_CreateTexture, so setting it once
+    // up front is equivalent and works on every renderer.
+    SDL_SetHint("SDL_RENDER_SCALE_QUALITY", "0");   // 0 = nearest
     let win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                width * scale, height * scale, SDL_WINDOW_SHOWN);
     if (win == null) { eprint(`CreateWindow failed: ${SDL_GetError()}`); return null; }
@@ -112,7 +125,9 @@ export fn upload_texture(w: object, tex: object): ptr {
     let t = SDL_CreateTexture(w.ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STATIC,
                               tex.width, tex.height);
     SDL_UpdateTexture(t, null, buffer_ptr(tex.data), tex.width * 3);
-    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_NEAREST);
+    // NOTE: do NOT call SDL_SetTextureScaleMode(t, ...) here — it segfaults on
+    // the OpenGL renderer for non-native formats like RGB24. Nearest filtering
+    // comes from the SDL_RENDER_SCALE_QUALITY hint set in window_open().
     return t;
 }
 
