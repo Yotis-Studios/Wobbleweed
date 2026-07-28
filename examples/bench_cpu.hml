@@ -1,0 +1,38 @@
+// _bench_cpu.hml — headless phase-timed benchmark of the CPU raster path (scratch).
+import { sin, cos } from "@stdlib/math";
+import { time_ms } from "@stdlib/time";
+import { v3, v_add } from "../src/vec.hml";
+import { fb_new } from "../src/framebuffer.hml";
+import { camera_mvp, render_world, load_tree } from "../src/scene.hml";
+import { fb_retro } from "../src/postfx.hml";
+import { draw_sky } from "../src/sky.hml";
+import { tex_grass, tex_checker } from "../src/texture.hml";
+
+fn run(W: i32, H: i32, frames: i32) {
+    let fb = fb_new(W, H);
+    let grass = tex_grass(32, 32);
+    let crate = tex_checker(32, 32, 4);
+    let tree = load_tree("assets/tree.obj");
+    let pos = v3(4.0, 2.0, 10.0);
+    let yaw = 0.0 - 0.35; let pitch = 0.0 - 0.08;
+    let t_sky = 0; let t_world = 0; let t_retro = 0;
+    let w0 = time_ms();
+    for (let f = 0; f < frames; f++) {
+        yaw = yaw + 0.01;
+        let look = v3(sin(yaw) * cos(pitch), sin(pitch), (0.0 - cos(yaw)) * cos(pitch));
+        let mvp = camera_mvp(pos, v_add(pos, look), W, H);
+        let t0 = time_ms(); draw_sky(fb, yaw, pitch); t_sky = t_sky + (time_ms() - t0);
+        t0 = time_ms(); render_world(fb, mvp, yaw, pitch, grass, crate, tree); t_world = t_world + (time_ms() - t0);
+        t0 = time_ms(); fb_retro(fb); t_retro = t_retro + (time_ms() - t0);
+    }
+    let wall = time_ms() - w0;
+    print(`${W}x${H} frames=${frames} fps=${i32(frames*1000.0/wall)}  sky=${t_sky/(frames*1.0)}ms  world(incl 2nd sky)=${t_world/(frames*1.0)}ms  postfx=${t_retro/(frames*1.0)}ms`);
+}
+
+fn main() {
+    run(160, 120, 60);
+    run(320, 240, 60);
+    run(480, 360, 30);
+    run(640, 480, 30);
+}
+main();

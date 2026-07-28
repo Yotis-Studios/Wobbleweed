@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // scene.hml — draws the demo world (textured ground + a crate) from a camera.
 // Shared by the PNG screenshot test and the real-time SDL walk demo, so what you
 // see in a still is exactly what you walk around in.

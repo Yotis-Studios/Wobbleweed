@@ -1,0 +1,517 @@
+// batch.hml — the flat triangle pool: reserve, bucket sort, texture-run flush.
+//
+// This is the CONSUMER half of the vertex-buffer contract. The producer half
+// (emit / quad / billboard / font) writes SDL_Vertex bytes; this module owns the
+// storage, the cap, the painter sort and the draw calls. Producer and consumer
+// never share a struct — they share the byte layout below and nothing else.
+//
+// It replaces src/geom.hml, which is frozen legacy: geom.hml allocated one
+// object per triangle, never enforced its cap (heap smash on overflow) and
+// sorted with array.sort(closure) — 143 ms at 2000 coplanar triangles, and a
+// stack overflow on a large presorted batch.
+//
+// ---------------------------------------------------------------------------
+// THE LAYOUT — SDL_Vertex, 20 bytes, little-endian
+// ---------------------------------------------------------------------------
+//   +0   f32  pos.x      screen px, ALREADY floor(v + 0.5)
+//   +4   f32  pos.y      ditto
+//   +8   u8   color.r
+//   +9   u8   color.g
+//   +10  u8   color.b
+//   +11  u8   color.a    fog alpha — not hardcoded 255
+//   +12  f32  uv.u       affine
+//   +16  f32  uv.v
+//
+// Triangle k occupies vbuf[k*60 .. k*60+59]: vertex A at +0, B at +20, C at +40.
+//
+// ---------------------------------------------------------------------------
+// THE POOL — allocated once at startup, never reallocated
+// ---------------------------------------------------------------------------
+//   b.vbuf    ptr           cap * 60 bytes   written at push time
+//   b.obuf    ptr           cap * 60 bytes   gather target handed to SDL
+//   b.depth   array<f64>    cap              VIEW-SPACE depth (clip w). Larger = farther.
+//   b.tex     array         cap              SDL_Texture* or ptr_null()
+//   b.order   array<i32>    cap              sort permutation
+//   b.counts  array<i32>    NB + 1           counting-sort histogram
+//   b.n       i32                            triangles pushed this frame
+//   b.cap     i32                            HARD LIMIT. Overflow drops and counts.
+//
+// ---------------------------------------------------------------------------
+// INVARIANTS
+// ---------------------------------------------------------------------------
+//  1. SDL_Vertex is 2D. There is no vertex z and there is no depth buffer.
+//     Depth lives ONLY in b.depth[k] and is ONLY the painter key. The key is
+//     view-space w (a ~3.5 cm quantum at any range), never NDC z (35 m at 100 m).
+//  2. Screen x/y stay pixel-snapped. This module never touches them.
+//  3. Push the sky at depth = far so it sorts first. Never at an NDC value.
+//  4. Push the viewmodel at depth = 0.05 so it sorts last; it needs no layer.
+//  5. Nothing writes into vbuf except through batch_reserve(), which enforces
+//     b.cap and returns -1 on overflow. Overflow DROPS a triangle and counts it.
+//     It never smashes the heap.
+//
+// ---------------------------------------------------------------------------
+// THE SORT
+// ---------------------------------------------------------------------------
+// O(n) counting sort into NB = 2048 buckets over [0, depth_far], descending in
+// depth (far first). Notes learned the hard way, obeyed here:
+//   - the bucket index is RECOMPUTED in the scatter pass. Caching it back onto
+//     a record triggers a storage grow + hash rebuild and measures ~2x slower.
+//   - counters live in a Hemlock array<i32>, not a raw buffer: array indexing
+//     has an inlined fast path, ptr_deref_i32 does not (0.78 vs 0.93 ms @ 8000).
+//   - counts and order are preallocated once; they are overwritten, never rebuilt.
+// It is O(n) and input-order independent, so random / ramp / flat depth inputs
+// all cost the same. That immunity is the whole point.
+//
+// ---------------------------------------------------------------------------
+// THE FLUSH — disjoint arena
+// ---------------------------------------------------------------------------
+// The flush walks `order`, memcpy's 60 B per triangle into obuf at k*60 (one
+// contiguous fill, no rewind), and issues one SDL_RenderGeometry per
+// same-texture run starting at vertex run_start*3.
+//
+// This is a PERFORMANCE choice, not a correctness fix. SDL_RenderGeometry
+// copies vertex data into the render command queue at call time, so rewinding
+// one staging region between calls was always safe; the "shared vertex buffer"
+// defect was a misdiagnosis of a compiler/interpreter divergence since fixed
+// upstream. batch_flush_rewind / batch_sort_flush_rewind below are the
+// rewind-in-place reference kept for that benchmark — they must produce a
+// byte-identical framebuffer.
+//
+// GENERIC: this module knows about triangles, textures, depth and layers. It
+// knows no colours, no distances and no game nouns. Every value is a parameter.
+
+import { draw_tris_at } from "./sdl.hml";
+import {
+    stat_add, stat_inc,
+    STAT_TRIS_SKY, STAT_TRIS_DRAWN, STAT_VERTS_DRAWN,
+    STAT_BATCH_OVERFLOW, STAT_OVERFLOW_SKY,
+    STAT_DRAW_CALLS, STAT_TEX_RUNS
+} from "./stats.hml";
+
+// ===========================================================================
+// CONSTANTS
+// ===========================================================================
+
+export let VSTRIDE = 20;        // bytes per SDL_Vertex
+export let TSTRIDE = 60;        // bytes per triangle (3 vertices)
+export let NB      = 2048;      // painter-sort buckets
+
+// Layer ids. They index the per-layer stat counters directly:
+// STAT_TRIS_SKY + layer and STAT_OVERFLOW_SKY + layer.
+export let LAYER_SKY   = 0;
+export let LAYER_WORLD = 1;
+export let LAYER_FX    = 2;
+export let LAYER_HUD   = 3;
+export let LAYER_COUNT = 4;
+
+// ===========================================================================
+// CONSTRUCTION
+// ===========================================================================
+
+// A batch that holds up to `p_cap` triangles per frame.
+//
+//   p_cap        hard triangle limit. Overflow drops and counts; it never grows.
+//   p_depth_far  the far end of the painter sort range, in the same units as
+//                the depths handed to batch_commit. The bucket quantum is
+//                p_depth_far / NB. Supply the render far distance.
+//   p_layer      LAYER_* — used only to pick the per-layer stat counters.
+//
+// Allocates everything once. Nothing in the frame path allocates.
+export fn batch_new(p_cap: i32, p_depth_far: f64, p_layer: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let far: f64 = p_depth_far;
+    if (far <= 0.0) { far = 1.0; }
+    let layer: i32 = p_layer;
+    if (layer < 0) { layer = 0; }
+    if (layer >= LAYER_COUNT) { layer = LAYER_COUNT - 1; }
+
+    let dep: array<f64> = [];
+    let tx: array = [];
+    let ord: array<i32> = [];
+    let i: i32 = 0;
+    while (i < cap) {
+        dep.push(0.0);
+        tx.push(ptr_null());
+        ord.push(0);
+        i = i + 1;
+    }
+    let cnt: array<i32> = [];
+    i = 0;
+    while (i <= NB) { cnt.push(0); i = i + 1; }
+
+    return {
+        vbuf: alloc(cap * TSTRIDE),
+        obuf: alloc(cap * TSTRIDE),
+        depth: dep,
+        tex: tx,
+        order: ord,
+        counts: cnt,
+        n: 0,
+        cap: cap,
+        far: far,
+        bscale: f64(NB) / far,
+        over: 0,
+        over_total: 0,
+        draws: 0,
+        layer: layer
+    };
+}
+
+// Release the two arenas. Call at shutdown only; the arrays are refcounted and
+// go with the object.
+export fn batch_free(p_b: object) {
+    let b: object = p_b;
+    free(b.vbuf);
+    free(b.obuf);
+    b.vbuf = ptr_null();
+    b.obuf = ptr_null();
+    b.n = 0;
+}
+
+// Retune the sort range. The bucket quantum becomes p_far / NB.
+export fn batch_set_depth_far(p_b: object, p_far: f64) {
+    let b: object = p_b;
+    let far: f64 = p_far;
+    if (far <= 0.0) { far = 1.0; }
+    b.far = far;
+    b.bscale = f64(NB) / far;
+}
+
+export fn batch_depth_far(p_b: object): f64 { let b: object = p_b; let out: f64 = b.far; return out; }
+export fn batch_quantum(p_b: object): f64 { let b: object = p_b; let out: f64 = b.far / f64(NB); return out; }
+export fn batch_cap(p_b: object): i32 { let b: object = p_b; let out: i32 = b.cap; return out; }
+export fn batch_count(p_b: object): i32 { let b: object = p_b; let out: i32 = b.n; return out; }
+export fn batch_layer(p_b: object): i32 { let b: object = p_b; let out: i32 = b.layer; return out; }
+
+// The vertex arena. Producers write SDL_Vertex bytes here at the cursor
+// batch_reserve() returned, and nowhere else.
+export fn batch_vbuf(p_b: object): ptr { let b: object = p_b; let out: ptr = b.vbuf; return out; }
+// The gather arena, valid only during/after a flush. Exposed for verification.
+export fn batch_obuf(p_b: object): ptr { let b: object = p_b; let out: ptr = b.obuf; return out; }
+
+// Triangles dropped since the last batch_reset.
+export fn batch_overflow_count(p_b: object): i32 { let b: object = p_b; let out: i32 = b.over; return out; }
+// Triangles dropped since the batch was created.
+export fn batch_overflow_total(p_b: object): i32 { let b: object = p_b; let out: i32 = b.over_total; return out; }
+// SDL_RenderGeometry calls issued by the last flush.
+export fn batch_draw_calls(p_b: object): i32 { let b: object = p_b; let out: i32 = b.draws; return out; }
+
+// Introspection, for probes and the frame-graph stats. Not hot.
+export fn batch_depth_at(p_b: object, p_k: i32): f64 {
+    let b: object = p_b; let d: array<f64> = b.depth; let out: f64 = d[p_k]; return out;
+}
+export fn batch_tex_at(p_b: object, p_k: i32) {
+    let b: object = p_b; let t: array = b.tex; return t[p_k];
+}
+export fn batch_order_at(p_b: object, p_k: i32): i32 {
+    let b: object = p_b; let o: array<i32> = b.order; let out: i32 = o[p_k]; return out;
+}
+
+// ===========================================================================
+// THE FRAME PATH
+// ===========================================================================
+
+// Start a frame. O(1) — no reallocation, no clearing of the arenas.
+export fn batch_reset(p_b: object) {
+    let b: object = p_b;
+    b.n = 0;
+    b.over = 0;
+    b.draws = 0;
+}
+
+// Reserve `p_ntris` consecutive triangles.
+//
+// Returns the BYTE CURSOR into vbuf of the first reserved triangle, or -1 when
+// the batch is full. On -1 the caller drops the geometry and moves on: the cap
+// is a hard limit and this is the only place it is enforced.
+//
+// The caller then writes p_ntris * TSTRIDE bytes starting at that cursor and
+// calls batch_commit once per triangle.
+export fn batch_reserve(p_b: object, p_ntris: i32): i32 {
+    let b: object = p_b;
+    let cnt: i32 = p_ntris;
+    if (cnt < 1) { return -1; }
+    let n: i32 = b.n;
+    if (n + cnt > b.cap) {
+        let ov: i32 = b.over + cnt;
+        b.over = ov;
+        b.over_total = b.over_total + cnt;
+        stat_add(STAT_BATCH_OVERFLOW, cnt);
+        stat_add(STAT_OVERFLOW_SKY + b.layer, cnt);
+        return -1;
+    }
+    b.n = n + cnt;
+    let out: i32 = n * TSTRIDE;
+    return out;
+}
+
+// Record the painter key and the texture for the triangle at byte cursor
+// `p_cursor`. Depth is VIEW-SPACE (clip w); larger is farther. `p_tex` is an
+// SDL_Texture* or ptr_null() for untextured.
+//
+// For a multi-triangle reservation call this once per triangle with
+// p_cursor + k * TSTRIDE.
+export fn batch_commit(p_b: object, p_cursor: i32, p_tex, p_depth: f64) {
+    let b: object = p_b;
+    let k: i32 = i32(f64(p_cursor) / 60.0);
+    let d: array<f64> = b.depth;
+    let t: array = b.tex;
+    d[k] = p_depth;
+    t[k] = p_tex;
+}
+
+// The reference encoder for the 20-byte SDL_Vertex layout above. `p_off` is a
+// byte offset into `p_base`. Colour channels are masked to 0..255.
+//
+// Producers with their own hoisted pointer arithmetic are free to inline this;
+// it exists so the layout has exactly one authoritative implementation.
+export fn batch_write_vertex(p_base: ptr, p_off: i32, p_x: f64, p_y: f64,
+                             p_r: i32, p_g: i32, p_b: i32, p_a: i32,
+                             p_u: f64, p_v: f64) {
+    let o: i32 = p_off;
+    ptr_write_f32(ptr_offset(p_base, o, 1), p_x);
+    ptr_write_f32(ptr_offset(p_base, o + 4, 1), p_y);
+    ptr_write_u8(ptr_offset(p_base, o + 8, 1), p_r & 255);
+    ptr_write_u8(ptr_offset(p_base, o + 9, 1), p_g & 255);
+    ptr_write_u8(ptr_offset(p_base, o + 10, 1), p_b & 255);
+    ptr_write_u8(ptr_offset(p_base, o + 11, 1), p_a & 255);
+    ptr_write_f32(ptr_offset(p_base, o + 12, 1), p_u);
+    ptr_write_f32(ptr_offset(p_base, o + 16, 1), p_v);
+}
+
+// ===========================================================================
+// THE SORT
+// ===========================================================================
+
+// Counting sort of the pushed triangles into b.order, back to front.
+//
+// O(n + NB). Immune to input order: random, ramped and coplanar depth inputs
+// all cost the same, which is the property array.sort(closure) does not have.
+// Ordering is exact to one bucket quantum (b.far / NB); within a bucket the
+// original push order is preserved.
+export fn batch_sort(p_b: object) {
+    let b: object = p_b;
+    let n: i32 = b.n;
+    if (n < 1) { return; }
+    let counts: array<i32> = b.counts;
+    let depth: array<f64> = b.depth;
+    let order: array<i32> = b.order;
+    let scale: f64 = b.bscale;
+    let nb: i32 = NB;
+    let nbm: i32 = nb - 1;
+
+    // 1. clear the histogram
+    let i: i32 = 0;
+    while (i <= nb) { counts[i] = 0; i++; }
+
+    // 2. count. bucket 0 is the farthest slice, so it is drawn first.
+    //    `c[k]++` rather than `c[k] = c[k] + 1`: `+` emits the overflow check
+    //    and measured 139 -> 112 us over this pass at 2500 triangles.
+    i = 0;
+    while (i < n) {
+        let d: f64 = depth[i];
+        let q: i32 = i32(d * scale);
+        if (q < 0) { q = 0; }
+        if (q > nbm) { q = nbm; }
+        counts[nbm - q]++;
+        i++;
+    }
+
+    // 3. exclusive prefix sum -> bucket start offsets
+    let sum: i32 = 0;
+    i = 0;
+    while (i < nb) {
+        let c2: i32 = counts[i];
+        counts[i] = sum;
+        sum = sum + c2;
+        i++;
+    }
+
+    // 4. scatter. The bucket index is RECOMPUTED here on purpose: caching it
+    //    back onto a per-triangle record measured ~2x slower.
+    i = 0;
+    while (i < n) {
+        let d2: f64 = depth[i];
+        let q2: i32 = i32(d2 * scale);
+        if (q2 < 0) { q2 = 0; }
+        if (q2 > nbm) { q2 = nbm; }
+        let bk2: i32 = nbm - q2;
+        order[counts[bk2]] = i;
+        counts[bk2]++;
+        i++;
+    }
+}
+
+// Fill b.order with the identity permutation, so an unsorted layer can share
+// the ordered flush path. O(n), no allocation.
+fn order_identity(p_b: object) {
+    let b: object = p_b;
+    let n: i32 = b.n;
+    let order: array<i32> = b.order;
+    let i: i32 = 0;
+    while (i < n) { order[i] = i; i++; }
+}
+
+// ===========================================================================
+// THE FLUSH
+// ===========================================================================
+
+// Gather + draw. `p_ordered` selects b.order (1) or push order (0).
+//
+// DISJOINT ARENA: triangle k of the output lands at obuf + k*60 for the whole
+// frame, so each texture run occupies its own region and the draw call for a
+// run starts at vertex run_start*3. One contiguous fill, no rewind.
+fn flush_arena(p_w: object, p_b: object, p_ordered: i32): i32 {
+    let w: object = p_w;
+    let b: object = p_b;
+    let n: i32 = b.n;
+    if (n < 1) { b.draws = 0; return 0; }
+    let vbuf: ptr = b.vbuf;
+    let obuf: ptr = b.obuf;
+    let tex: array = b.tex;
+    let order: array<i32> = b.order;
+    let ordered: i32 = p_ordered;
+
+    let calls: i32 = 0;
+    let run_start: i32 = 0;
+    let idx0: i32 = 0;
+    if (ordered != 0) { idx0 = order[0]; }
+    let run_tex = tex[idx0];
+
+    let k: i32 = 0;
+    while (k < n) {
+        let idx: i32 = k;
+        if (ordered != 0) { idx = order[k]; }
+        let t = tex[idx];
+        if (t != run_tex) {
+            draw_tris_at(w, run_tex, obuf, run_start * 3, (k - run_start) * 3);
+            calls++;
+            run_start = k;
+            run_tex = t;
+        }
+        memcpy(ptr_offset(obuf, k * 60, 1), ptr_offset(vbuf, idx * 60, 1), 60);
+        k++;
+    }
+    draw_tris_at(w, run_tex, obuf, run_start * 3, (n - run_start) * 3);
+    calls++;
+
+    b.draws = calls;
+    stat_add(STAT_DRAW_CALLS, calls);
+    stat_add(STAT_TEX_RUNS, calls);
+    stat_add(STAT_TRIS_DRAWN, n);
+    stat_add(STAT_VERTS_DRAWN, n * 3);
+    stat_add(STAT_TRIS_SKY + b.layer, n);
+    let out: i32 = calls;
+    return out;
+}
+
+// The rewind-in-place reference. Every texture run is staged from obuf + 0 and
+// drawn from vertex 0. Retained so the disjoint-arena layout above can be
+// benchmarked against something instead of assumed; the two must produce an
+// identical framebuffer.
+fn flush_rewind(p_w: object, p_b: object, p_ordered: i32): i32 {
+    let w: object = p_w;
+    let b: object = p_b;
+    let n: i32 = b.n;
+    if (n < 1) { b.draws = 0; return 0; }
+    let vbuf: ptr = b.vbuf;
+    let obuf: ptr = b.obuf;
+    let tex: array = b.tex;
+    let order: array<i32> = b.order;
+    let ordered: i32 = p_ordered;
+
+    let calls: i32 = 0;
+    let fill: i32 = 0;
+    let idx0: i32 = 0;
+    if (ordered != 0) { idx0 = order[0]; }
+    let run_tex = tex[idx0];
+
+    let k: i32 = 0;
+    while (k < n) {
+        let idx: i32 = k;
+        if (ordered != 0) { idx = order[k]; }
+        let t = tex[idx];
+        if (t != run_tex) {
+            draw_tris_at(w, run_tex, obuf, 0, fill * 3);
+            calls++;
+            fill = 0;
+            run_tex = t;
+        }
+        memcpy(ptr_offset(obuf, fill * 60, 1), ptr_offset(vbuf, idx * 60, 1), 60);
+        fill++;
+        k++;
+    }
+    draw_tris_at(w, run_tex, obuf, 0, fill * 3);
+    calls++;
+
+    b.draws = calls;
+    stat_add(STAT_DRAW_CALLS, calls);
+    stat_add(STAT_TEX_RUNS, calls);
+    stat_add(STAT_TRIS_DRAWN, n);
+    stat_add(STAT_VERTS_DRAWN, n * 3);
+    stat_add(STAT_TRIS_SKY + b.layer, n);
+    let out: i32 = calls;
+    return out;
+}
+
+// Draw in PUSH order — no sort. For LAYER_SKY and LAYER_HUD, where insertion
+// order is the intended order. Returns the number of draw calls issued.
+export fn batch_flush(p_w: object, p_b: object): i32 {
+    let out: i32 = flush_arena(p_w, p_b, 0);
+    return out;
+}
+
+// Bucket-sort back to front, then draw one call per same-texture run.
+// Returns the number of draw calls issued.
+export fn batch_sort_flush(p_w: object, p_b: object): i32 {
+    batch_sort(p_b);
+    let out: i32 = flush_arena(p_w, p_b, 1);
+    return out;
+}
+
+// Rewind-in-place equivalents of the two above. Benchmark references only —
+// the shipping path is the disjoint arena.
+export fn batch_flush_rewind(p_w: object, p_b: object): i32 {
+    let out: i32 = flush_rewind(p_w, p_b, 0);
+    return out;
+}
+export fn batch_sort_flush_rewind(p_w: object, p_b: object): i32 {
+    batch_sort(p_b);
+    let out: i32 = flush_rewind(p_w, p_b, 1);
+    return out;
+}
+
+// Gather into obuf in sorted order WITHOUT drawing anything, filling b.order
+// first. For offline verification of the gather and for timing the gather in
+// isolation; it issues no SDL call.
+export fn batch_gather_only(p_b: object): i32 {
+    let b: object = p_b;
+    batch_sort(b);
+    let n: i32 = b.n;
+    if (n < 1) { return 0; }
+    let vbuf: ptr = b.vbuf;
+    let obuf: ptr = b.obuf;
+    let order: array<i32> = b.order;
+    let k: i32 = 0;
+    while (k < n) {
+        memcpy(ptr_offset(obuf, k * 60, 1), ptr_offset(vbuf, order[k] * 60, 1), 60);
+        k++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// The identity-order variant, exported so a caller that wants b.order populated
+// for an unsorted layer (e.g. to reuse the ordered gather) can get it.
+export fn batch_order_identity(p_b: object) { order_identity(p_b); }
+
+// Count triangles offered but dropped, across a whole frame, without touching
+// the per-batch counters. Convenience for the frame-graph report.
+export fn batch_note_drop(p_b: object) {
+    let b: object = p_b;
+    b.over = b.over + 1;
+    b.over_total = b.over_total + 1;
+    stat_inc(STAT_BATCH_OVERFLOW);
+    stat_inc(STAT_OVERFLOW_SKY + b.layer);
+}

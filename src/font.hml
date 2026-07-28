@@ -1,0 +1,447 @@
+// font.hml — a generic bitmap font. THE ENGINE SHIPS NO GLYPH DATA.
+//
+// The caller registers glyphs as packed bitfields together with their
+// codepoints; this module bakes them into a caller-owned RGBA8 atlas, remembers
+// each glyph's texel rect, and emits 2 triangles per glyph with an optional
+// offset shadow pass. Nothing here knows an alphabet, a language, a size, a
+// colour or a cell layout — a 4x6 micro font, a 8x12 heading font, a Cyrillic
+// set and a run of icon glyphs are all the same object with different numbers
+// (RULE R1).
+//
+// GLYPH ENCODING. One i32 per row, `gh` rows, top row first. Within a row the
+// LEFTMOST pixel is the MOST significant of the `gw` used bits, so a literal
+// written in binary looks like the glyph. The sketch below is ILLUSTRATION
+// ONLY — it documents the bit order. The engine registers no glyph, knows no
+// alphabet, and contains no codepoint constant (RULE R1):
+//
+//     0b0110      .##.
+//     0b1001      #..#
+//     0b1111      ####       font_add_glyph(f, 65, rows)   // 'A', gw = 4
+//     0b1001      #..#
+//     0b1001      #..#
+//     0b0000      ....
+//
+// `font_add_glyph_packed` takes the same thing as one u64 packed row-major, top
+// row in the most significant position — convenient for cells up to 64 bits
+// (4x6, 8x8, 6x10).
+//
+// BUDGET (ENGINE_GAPS.md G14). Text is triangle-hungry: 200 characters is 400
+// triangles, 16 % of the whole frame. Every emit entry point therefore takes a
+// TRIANGLE BUDGET and truncates rather than overflowing. It also survives a full
+// batch: every glyph goes through `batch_reserve`, which returns -1 at the cap
+// and is never ignored. `font_last_dropped()` reports how many characters were
+// skipped by the most recent call so the caller can shrink the string, and
+// `font_last_truncated()` says whether it was the budget or the batch.
+//
+// PIXEL EXACTNESS. UVs are exact texel boundaries — no half-texel inset — and a
+// glyph quad is exactly `gw` x `gh` target pixels. With
+// SDL_SetHint("SDL_RENDER_SCALE_QUALITY", "0") (set by `window_open`) the
+// sampler is nearest, so texel n maps to pixel n with no filtering and no
+// bleed from the neighbouring cell. Do not scale text: build a second font.
+//
+// PERFORMANCE CONTRACT (CLAUDE.md §4): no object literal, array literal,
+// closure, defer, try, throw or template string in any emit path; the font
+// object's fields are hoisted into typed locals once per call; every loop-local
+// is `f64`/`i32`; `batch_vbuf` is hoisted out of the glyph loop (rule N4). The
+// only allocations happen in `font_new` / `font_add_glyph`, which run at boot.
+
+import { divi, floor } from "@stdlib/math";
+// §2.3: every producer reaches vbuf through batch_reserve. font.hml calls it
+// directly rather than through quad.hml so the glyph loop pays one call, not two.
+import { batch_reserve, batch_commit, batch_vbuf } from "./batch.hml";
+
+// Codepoints below this get an O(1) lookup table; above it, a linear scan over
+// the registration list. 512 covers Latin-1 + Latin Extended-A, which is every
+// font a 320x240 HUD will ever carry, and costs 2 KB.
+export let FONT_LUT_N = 512;
+
+// `font_last_truncated()` result codes.
+export let FONT_OK = 0;          // the whole string was emitted
+export let FONT_TRUNC_BUDGET = 1; // stopped by the triangle budget
+export let FONT_TRUNC_BATCH = 2;  // stopped by the batch cap
+
+let g_font_dropped: i32 = 0;
+let g_font_emitted: i32 = 0;
+let g_font_trunc: i32 = 0;
+
+// ---------------------------------------------------------------------------
+// Construction — boot time only.
+// ---------------------------------------------------------------------------
+
+// A font of fixed-size `gw` x `gh` pixel cells. `adv` is the default horizontal
+// advance in pixels (cell width plus letter spacing); `line_h` the vertical
+// advance for a newline. `cap` is the maximum number of glyphs.
+export fn font_new(gw: i32, gh: i32, adv: i32, line_h: i32, cap: i32): object {
+    let f = {
+        gw: gw, gh: gh, adv: adv, line_h: line_h,
+        cap: cap, n: 0,
+        rows: [],      // cap * gh row bitfields, glyph i at i * gh
+        cp: [],        // codepoint of glyph i
+        gadv: [],      // per-glyph advance, defaults to adv
+        lut: [],       // codepoint -> glyph index for cp < FONT_LUT_N, else -1
+        tx: [], ty: [],// baked texel origin of glyph i
+        u0: [], v0: [],// baked uv origin of glyph i
+        u1: [], v1: [],// baked uv corner of glyph i
+        baked: 0, aw: 0, ah: 0
+    };
+    for (let i = 0; i < FONT_LUT_N; i++) { f.lut.push(0 - 1); }
+    let out: object = f;
+    return out;
+}
+
+// Register one glyph. `rows` is an array of `gh` integers, top row first, the
+// leftmost pixel in bit (gw - 1). Rows past the end of the array are blank.
+// Returns the glyph index, or -1 when the font is full.
+// Re-registering a codepoint replaces the previous glyph's mapping.
+export fn font_add_glyph(f: object, codepoint: i32, rows): i32 {
+    let n: i32 = f.n;
+    if (n >= f.cap) { let full: i32 = 0 - 1; return full; }
+    let gh: i32 = f.gh;
+    let have: i32 = rows.length;
+    for (let r = 0; r < gh; r++) {
+        if (r < have) { f.rows.push(rows[r]); } else { f.rows.push(0); }
+    }
+    f.cp.push(codepoint);
+    f.gadv.push(f.adv);
+    f.tx.push(0); f.ty.push(0);
+    f.u0.push(0.0); f.v0.push(0.0); f.u1.push(0.0); f.v1.push(0.0);
+    if (codepoint >= 0 && codepoint < FONT_LUT_N) { f.lut[codepoint] = n; }
+    f.n = n + 1;
+    f.baked = 0;
+    let out: i32 = n;
+    return out;
+}
+
+// Same, from one u64 packed row-major with the TOP row in the most significant
+// used bits. Requires gw * gh <= 64.
+export fn font_add_glyph_packed(f: object, codepoint: i32, bits: u64): i32 {
+    let gw: i32 = f.gw;
+    let gh: i32 = f.gh;
+    if (gw * gh > 64) { let bad: i32 = 0 - 1; return bad; }
+    let n: i32 = f.n;
+    if (n >= f.cap) { let full: i32 = 0 - 1; return full; }
+    let one: u64 = 1;
+    let mask: u64 = (one << u64(gw)) - 1;
+    for (let r = 0; r < gh; r++) {
+        let sh: u64 = u64((gh - 1 - r) * gw);
+        let row: u64 = (bits >> sh) & mask;
+        f.rows.push(i32(row));
+    }
+    f.cp.push(codepoint);
+    f.gadv.push(f.adv);
+    f.tx.push(0); f.ty.push(0);
+    f.u0.push(0.0); f.v0.push(0.0); f.u1.push(0.0); f.v1.push(0.0);
+    if (codepoint >= 0 && codepoint < FONT_LUT_N) { f.lut[codepoint] = n; }
+    f.n = n + 1;
+    f.baked = 0;
+    let out: i32 = n;
+    return out;
+}
+
+// Override one glyph's advance (proportional fonts, or a wide space).
+export fn font_set_glyph_advance(f: object, codepoint: i32, adv: i32): i32 {
+    let gi: i32 = font_glyph_index(f, codepoint);
+    if (gi < 0) { let miss: i32 = 0 - 1; return miss; }
+    f.gadv[gi] = adv;
+    let out: i32 = gi;
+    return out;
+}
+
+// Glyph index for a codepoint, or -1. O(1) below FONT_LUT_N.
+export fn font_glyph_index(p_f: object, p_cp: i32): i32 {
+    let cp: i32 = p_cp;
+    if (cp >= 0 && cp < FONT_LUT_N) {
+        let hit: i32 = p_f.lut[cp];
+        return hit;
+    }
+    let n: i32 = p_f.n;
+    for (let i = 0; i < n; i++) {
+        if (p_f.cp[i] == cp) { let found: i32 = i; return found; }
+    }
+    let miss: i32 = 0 - 1;
+    return miss;
+}
+
+export fn font_glyph_count(f: object): i32 { let out: i32 = f.n; return out; }
+export fn font_line_height(f: object): i32 { let out: i32 = f.line_h; return out; }
+
+// ---------------------------------------------------------------------------
+// Baking — boot time only.
+// ---------------------------------------------------------------------------
+
+// Blit every registered glyph into a caller-owned RGBA8 pixel buffer (byte
+// order R,G,B,A — FMT_RGBA32, ARCHITECTURE.md D8), laying the glyphs out in a
+// grid of `cols` cells per row whose top-left cell is texel (ox, oy). Set bits
+// become (r, g, bl, a); clear bits become (r, g, bl, 0), so nothing fringes
+// dark if a caller ever does enable filtering.
+//
+// Returns the number of grid rows written, or -1 if the grid would leave the
+// buffer. After this call the glyph uv rects are valid and `font_text` works.
+export fn font_bake(f: object, pix: ptr, aw: i32, ah: i32,
+                    ox: i32, oy: i32, cols: i32,
+                    r: i32, g: i32, bl: i32, a: i32): i32 {
+    let n: i32 = f.n;
+    let gw: i32 = f.gw;
+    let gh: i32 = f.gh;
+    if (cols < 1) { let bad: i32 = 0 - 1; return bad; }
+    let grows: i32 = divi(n + cols - 1, cols);
+    if (n == 0) { grows = 0; }
+    if (ox < 0 || oy < 0) { let bad2: i32 = 0 - 1; return bad2; }
+    if (ox + cols * gw > aw) { let bad3: i32 = 0 - 1; return bad3; }
+    if (oy + grows * gh > ah) { let bad4: i32 = 0 - 1; return bad4; }
+    let faw: f64 = f64(aw);
+    let fah: f64 = f64(ah);
+    for (let i = 0; i < n; i++) {
+        let cx: i32 = ox + (i - divi(i, cols) * cols) * gw;
+        let cy: i32 = oy + divi(i, cols) * gh;
+        f.tx[i] = cx;
+        f.ty[i] = cy;
+        f.u0[i] = f64(cx) / faw;
+        f.v0[i] = f64(cy) / fah;
+        f.u1[i] = f64(cx + gw) / faw;
+        f.v1[i] = f64(cy + gh) / fah;
+        let base: i32 = i * gh;
+        for (let ry = 0; ry < gh; ry++) {
+            let bits: i32 = f.rows[base + ry];
+            let row0: i32 = ((cy + ry) * aw + cx) * 4;
+            for (let rx = 0; rx < gw; rx++) {
+                let on: i32 = (bits >> (gw - 1 - rx)) & 1;
+                let o: i32 = row0 + rx * 4;
+                ptr_write_u8(ptr_offset(pix, o, 1), r & 255);
+                ptr_write_u8(ptr_offset(pix, o + 1, 1), g & 255);
+                ptr_write_u8(ptr_offset(pix, o + 2, 1), bl & 255);
+                if (on == 1) {
+                    ptr_write_u8(ptr_offset(pix, o + 3, 1), a & 255);
+                } else {
+                    ptr_write_u8(ptr_offset(pix, o + 3, 1), 0);
+                }
+            }
+        }
+    }
+    f.baked = 1;
+    f.aw = aw;
+    f.ah = ah;
+    let out: i32 = grows;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Measurement
+// ---------------------------------------------------------------------------
+
+// Pixel width of `s` on this font, honouring per-glyph advances. A newline
+// restarts the measurement, so the result is the width of the widest line.
+// Unmapped codepoints advance by the font default (that is how a space with no
+// registered glyph still moves the cursor).
+export fn font_width(p_f: object, p_s: string): i32 {
+    let n: i32 = p_s.length;
+    let adv: i32 = p_f.adv;
+    let w: i32 = 0;
+    let best: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let cp: i32 = i32(p_s.char_at(i));
+        if (cp == 10) {
+            if (w > best) { best = w; }
+            w = 0;
+        } else {
+            let gi: i32 = font_glyph_index(p_f, cp);
+            if (gi < 0) { w = w + adv; } else { w = w + p_f.gadv[gi]; }
+        }
+    }
+    if (w > best) { best = w; }
+    let out: i32 = best;
+    return out;
+}
+
+// Number of lines `s` occupies.
+export fn font_height(p_f: object, p_s: string): i32 {
+    let n: i32 = p_s.length;
+    let lines: i32 = 1;
+    for (let i = 0; i < n; i++) {
+        if (i32(p_s.char_at(i)) == 10) { lines++; }
+    }
+    let out: i32 = lines * p_f.line_h;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Emit
+// ---------------------------------------------------------------------------
+
+// Draw `s` with its top-left corner at (x, y), tinted (r, g, bl, a), into
+// batch `b` against texture `tex`. `tri_budget` is a HARD cap on triangles: the
+// string is truncated at the last glyph that fits and the remainder is counted,
+// never emitted. Returns the number of triangles written (2 per drawn glyph).
+//
+// Unmapped codepoints advance the cursor and draw nothing. Codepoint 10 starts
+// a new line at the original x.
+export fn font_text(p_f: object, p_b, p_tex, p_x: f64, p_y: f64, p_s: string,
+                    p_r: i32, p_g: i32, p_bl: i32, p_a: i32,
+                    p_tri_budget: i32): i32 {
+    let n: i32 = p_s.length;
+    let budget: i32 = p_tri_budget;
+    let gw: f64 = f64(p_f.gw);
+    let gh: f64 = f64(p_f.gh);
+    let adv: i32 = p_f.adv;
+    let line_h: i32 = p_f.line_h;
+    let x0: f64 = floor(p_x + 0.5);
+    let cx: f64 = x0;
+    let cy: f64 = floor(p_y + 0.5);
+    // The four colour bytes are constant for the whole string and contiguous
+    // at vertex +8, so they are packed ONCE and stored as one little-endian
+    // u32 per vertex (memory order r,g,b,a) instead of four u8 stores.
+    let rgba: u32 = u32(p_r & 255) | (u32(p_g & 255) << 8)
+                    | (u32(p_bl & 255) << 16) | (u32(p_a & 255) << 24);
+    let buf: ptr = batch_vbuf(p_b);
+    // Hoist the per-glyph tables out of the loop (rule N4). They are
+    // DELIBERATELY UNANNOTATED: `let t: array<f64> = obj.field` is O(len) in
+    // the compiled backend — it revalidates every element on every assignment
+    // — while the unannotated form is O(1). Measured, 250 assignments:
+    // 0.436 ms annotated vs 0.003 ms unannotated at length 4096.
+    let lut = p_f.lut;
+    let gu0 = p_f.u0;
+    let gv0 = p_f.v0;
+    let gu1 = p_f.u1;
+    let gv1 = p_f.v1;
+    let gadv = p_f.gadv;
+    let tris: i32 = 0;
+    let dropped: i32 = 0;
+    let trunc: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let cp: i32 = i32(p_s.char_at(i));
+        if (cp == 10) {
+            cx = x0;
+            cy = cy + f64(line_h);
+        } else {
+            let gi: i32 = 0 - 1;
+            if (cp >= 0 && cp < FONT_LUT_N) { gi = lut[cp]; }
+            else { gi = font_glyph_index(p_f, cp); }
+            if (gi < 0) {
+                cx = cx + f64(adv);
+            } else {
+                if (tris + 2 > budget) {
+                    trunc = FONT_TRUNC_BUDGET;
+                    dropped = dropped + 1;
+                } else {
+                    let cur: i32 = batch_reserve(p_b, 2);
+                    if (cur < 0) {
+                        trunc = FONT_TRUNC_BATCH;
+                        dropped = dropped + 1;
+                    } else {
+                        // The glyph quad, written inline. This is byte-for-byte
+                        // what quad_write_rect produces — that function stays
+                        // the reference implementation and probe_font.hml
+                        // asserts the two agree on every field — but the glyph
+                        // loop is the one per-element path in this module, so
+                        // it pays neither the 14-argument call nor the colour
+                        // packing per glyph (CLAUDE.md N9: if it must be
+                        // inlined, write it inline). Measured, 125 glyphs:
+                        // 0.272 ms -> 0.243 ms.
+                        //
+                        // No floor() here, and that is a proof, not a shortcut:
+                        // cx starts at floor(p_x + 0.5), advances only by
+                        // f64(i32) amounts and is offset only by f64(gw)/f64(gh),
+                        // so all four corners are already integral. The §2.3
+                        // pixel-snap invariant holds exactly.
+                        let x1: f64 = cx + gw;
+                        let y1: f64 = cy + gh;
+                        let au: f64 = gu0[gi];
+                        let av: f64 = gv0[gi];
+                        let bu: f64 = gu1[gi];
+                        let bv: f64 = gv1[gi];
+                        ptr_write_f32(ptr_offset(buf, cur, 1), cx);
+                        ptr_write_f32(ptr_offset(buf, cur + 4, 1), cy);
+                        ptr_write_u32(ptr_offset(buf, cur + 8, 1), rgba);
+                        ptr_write_f32(ptr_offset(buf, cur + 12, 1), au);
+                        ptr_write_f32(ptr_offset(buf, cur + 16, 1), av);
+                        ptr_write_f32(ptr_offset(buf, cur + 20, 1), x1);
+                        ptr_write_f32(ptr_offset(buf, cur + 24, 1), cy);
+                        ptr_write_u32(ptr_offset(buf, cur + 28, 1), rgba);
+                        ptr_write_f32(ptr_offset(buf, cur + 32, 1), bu);
+                        ptr_write_f32(ptr_offset(buf, cur + 36, 1), av);
+                        ptr_write_f32(ptr_offset(buf, cur + 40, 1), x1);
+                        ptr_write_f32(ptr_offset(buf, cur + 44, 1), y1);
+                        ptr_write_u32(ptr_offset(buf, cur + 48, 1), rgba);
+                        ptr_write_f32(ptr_offset(buf, cur + 52, 1), bu);
+                        ptr_write_f32(ptr_offset(buf, cur + 56, 1), bv);
+                        ptr_write_f32(ptr_offset(buf, cur + 60, 1), cx);
+                        ptr_write_f32(ptr_offset(buf, cur + 64, 1), cy);
+                        ptr_write_u32(ptr_offset(buf, cur + 68, 1), rgba);
+                        ptr_write_f32(ptr_offset(buf, cur + 72, 1), au);
+                        ptr_write_f32(ptr_offset(buf, cur + 76, 1), av);
+                        ptr_write_f32(ptr_offset(buf, cur + 80, 1), x1);
+                        ptr_write_f32(ptr_offset(buf, cur + 84, 1), y1);
+                        ptr_write_u32(ptr_offset(buf, cur + 88, 1), rgba);
+                        ptr_write_f32(ptr_offset(buf, cur + 92, 1), bu);
+                        ptr_write_f32(ptr_offset(buf, cur + 96, 1), bv);
+                        ptr_write_f32(ptr_offset(buf, cur + 100, 1), cx);
+                        ptr_write_f32(ptr_offset(buf, cur + 104, 1), y1);
+                        ptr_write_u32(ptr_offset(buf, cur + 108, 1), rgba);
+                        ptr_write_f32(ptr_offset(buf, cur + 112, 1), au);
+                        ptr_write_f32(ptr_offset(buf, cur + 116, 1), bv);
+                        batch_commit(p_b, cur, p_tex, 0.0);
+                        batch_commit(p_b, cur + 60, p_tex, 0.0);
+                        tris = tris + 2;
+                    }
+                    cx = cx + f64(gadv[gi]);
+                }
+            }
+        }
+    }
+    g_font_dropped = dropped;
+    g_font_emitted = tris;
+    g_font_trunc = trunc;
+    let out: i32 = tris;
+    return out;
+}
+
+// The same string twice: a shadow at (+dx, +dy) in (sr, sg, sbl, sa) first, then
+// the face on top. `tri_budget` covers BOTH passes, so a 40-triangle budget is
+// 10 shadowed characters, not 20. The shadow is emitted first so it is behind
+// the face in the HUD layer's insertion order.
+//
+// ART note for callers, not a rule of this module: a 1-pixel offset in the UI's
+// darkest colour is what makes small text readable over a bright sky.
+export fn font_text_shadowed(p_f: object, p_b, p_tex, p_x: f64, p_y: f64,
+                             p_s: string,
+                             p_r: i32, p_g: i32, p_bl: i32, p_a: i32,
+                             p_sr: i32, p_sg: i32, p_sbl: i32, p_sa: i32,
+                             p_dx: f64, p_dy: f64, p_tri_budget: i32): i32 {
+    let half: i32 = divi(p_tri_budget, 4) * 2;
+    let sh: i32 = font_text(p_f, p_b, p_tex, p_x + p_dx, p_y + p_dy, p_s,
+                            p_sr, p_sg, p_sbl, p_sa, half);
+    let sh_dropped: i32 = g_font_dropped;
+    let sh_trunc: i32 = g_font_trunc;
+    let fc: i32 = font_text(p_f, p_b, p_tex, p_x, p_y, p_s,
+                            p_r, p_g, p_bl, p_a, p_tri_budget - sh);
+    if (sh_dropped > g_font_dropped) { g_font_dropped = sh_dropped; }
+    if (g_font_trunc == FONT_OK) { g_font_trunc = sh_trunc; }
+    g_font_emitted = sh + fc;
+    let out: i32 = sh + fc;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Reporting — the truncation contract (G14)
+// ---------------------------------------------------------------------------
+
+// Characters the most recent emit call refused to draw.
+export fn font_last_dropped(): i32 { let out: i32 = g_font_dropped; return out; }
+// Triangles the most recent emit call wrote.
+export fn font_last_emitted(): i32 { let out: i32 = g_font_emitted; return out; }
+// FONT_OK / FONT_TRUNC_BUDGET / FONT_TRUNC_BATCH for the most recent call.
+export fn font_last_truncated(): i32 { let out: i32 = g_font_trunc; return out; }
+
+// Triangles `s` would cost with no budget, for callers that plan ahead.
+export fn font_tri_cost(p_f: object, p_s: string): i32 {
+    let n: i32 = p_s.length;
+    let c: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let cp: i32 = i32(p_s.char_at(i));
+        if (cp != 10) {
+            if (font_glyph_index(p_f, cp) >= 0) { c = c + 2; }
+        }
+    }
+    let out: i32 = c;
+    return out;
+}

@@ -1,0 +1,239 @@
+// time.hml — monotonic clock + fixed-step accumulator.
+//
+// GENERIC ENGINE MODULE. It knows about counters, milliseconds and ticks and
+// nothing else. The tick rate is a parameter; the caller supplies the value.
+//
+// -----------------------------------------------------------------------------
+// FFI NOTE (W0-3 / W0-1 boundary)
+// -----------------------------------------------------------------------------
+// The three perf-counter externs below are declared LOCALLY, under this file's
+// own `import "libSDL2-2.0.so.0";`, so that time.hml is independent of the
+// concurrent rewrite of src/sdl.hml. `extern fn` binds to the most recently
+// declared `import` (HEMLOCK_ISSUES H-6), so each library must own its own
+// block — which is exactly what this is. These duplicate the `perf_counter` /
+// `perf_freq` surface that sdl.hml will also expose; consolidating them onto
+// sdl.hml later is a one-line change (replace the import block with
+// `import { perf_counter, perf_freq } from "./sdl.hml";`) and changes no
+// behaviour, because both bind the same two C symbols.
+//
+// Symbol audit (runtime is SDL 2.0.18; never bind anything newer):
+//   SDL_GetPerformanceCounter    \since 2.0.0   resolves in 2.0.18  OK
+//   SDL_GetPerformanceFrequency  \since 2.0.0   resolves in 2.0.18  OK
+//   SDL_Delay                    \since 2.0.0   resolves in 2.0.18  OK
+// None of the three requires SDL_Init() — verified by calling them from a
+// program that never inits SDL.
+//
+// -----------------------------------------------------------------------------
+// WHY u64 AND NOT f64
+// -----------------------------------------------------------------------------
+// SDL_GetPerformanceFrequency() is 1e9 on this box, so the counter is a
+// nanosecond count since boot. Hemlock's FFI returns u64 exactly (verified: a
+// 1.2e15 counter round-trips bit-for-bit), so there is no 2^53 problem and no
+// workaround is needed. Deltas are taken in u64 and only then converted to f64
+// milliseconds, which keeps full precision for the ~1e7 ns a frame actually is.
+// u64 subtraction wraps, so `clock_ms_between` guards b < a and returns 0.
+
+import "libSDL2-2.0.so.0";
+
+extern fn SDL_GetPerformanceCounter(): u64;
+extern fn SDL_GetPerformanceFrequency(): u64;
+extern fn SDL_Delay(ms: u32): void;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// The engine's default fixed tick. The game may pass its own to clock_new().
+export let FIXED_TICK_HZ = 60.0;
+export let FIXED_TICK_MS = 1000.0 / 60.0;      // 16.666666666666668
+
+// Spiral-of-death clamp. A frame delta larger than this is truncated, so a
+// stall (alt-tab, a page fault, a debugger breakpoint) can never queue more
+// than CLOCK_MAX_FRAME_MS / tick_ms ticks — 15 at 60 Hz — and the sim never
+// falls further behind by trying to catch up.
+export let CLOCK_MAX_FRAME_MS = 250.0;
+
+// Clock object field layout, for readers of this file:
+//   tick_ms   f64  milliseconds per fixed tick
+//   eps       f64  rounding guard, tick_ms * 1e-9 (see clock_advance_ms)
+//   clamp_ms  f64  per-frame delta ceiling
+//   prev      u64  last performance-counter sample
+//   total_ms  f64  clamped wall time accumulated since reset
+//   comp      f64  Kahan compensation term for total_ms
+//   ticks     i64  fixed ticks issued since reset
+//   acc       f64  residual, total_ms - ticks*tick_ms, always in [0, tick_ms)
+//   frame_ms  f64  last frame delta AFTER the clamp
+//   raw_ms    f64  last frame delta BEFORE the clamp
+//   stalls    i32  number of frames whose delta hit the clamp
+
+// ---------------------------------------------------------------------------
+// Raw monotonic clock
+// ---------------------------------------------------------------------------
+
+let g_clock_freq: u64 = SDL_GetPerformanceFrequency();
+let g_clock_mspc: f64 = 1000.0 / f64(g_clock_freq);   // milliseconds per count
+
+// The only clock. Monotonic, never wraps in any plausible uptime, exact.
+export fn clock_now(): u64 {
+    let out: u64 = SDL_GetPerformanceCounter();
+    return out;
+}
+
+// Counter ticks per second (1e9 here).
+export fn clock_freq(): u64 { let out: u64 = g_clock_freq; return out; }
+
+// Milliseconds represented by one counter tick. Hoist this into a local if you
+// are converting counts in a loop.
+export fn clock_ms_per_count(): f64 { let out: f64 = g_clock_mspc; return out; }
+
+// Milliseconds elapsed from a to b. Returns 0.0 if b precedes a (u64 wraps, so
+// the guard is not optional).
+export fn clock_ms_between(p_a: u64, p_b: u64): f64 {
+    let a: u64 = p_a;
+    let b: u64 = p_b;
+    if (b <= a) { let z: f64 = 0.0; return z; }
+    let d: f64 = f64(b - a) * g_clock_mspc;
+    let out: f64 = d;
+    return out;
+}
+
+// Coarse sleep. Present for tools and for injecting real stalls in tests; the
+// frame loop must never depend on it for pacing.
+export fn clock_sleep_ms(p_ms: i32) {
+    let ms: i32 = p_ms;
+    if (ms > 0) { SDL_Delay(u32(ms)); }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-step accumulator
+// ---------------------------------------------------------------------------
+
+// New accumulator running at p_tick_ms milliseconds per tick.
+export fn clock_new(p_tick_ms: f64): object {
+    let t: f64 = p_tick_ms;
+    if (t <= 0.0) { t = FIXED_TICK_MS; }
+    return { tick_ms: t, eps: t * 0.000000001, clamp_ms: CLOCK_MAX_FRAME_MS,
+             prev: clock_now(), total_ms: 0.0, comp: 0.0, ticks: 0, acc: 0.0,
+             frame_ms: 0.0, raw_ms: 0.0, stalls: 0 };
+}
+
+// Re-baseline: drop the accumulated debt and re-sample the clock. Call this
+// after a known-long, non-simulated pause (asset boot, level load, a menu).
+export fn clock_reset(p_c: object) {
+    let c: object = p_c;
+    c.prev = clock_now();
+    c.total_ms = 0.0;
+    c.comp = 0.0;
+    c.ticks = 0;
+    c.acc = 0.0;
+    c.frame_ms = 0.0;
+    c.raw_ms = 0.0;
+    c.stalls = 0;
+}
+
+// Override the spiral-of-death clamp (default CLOCK_MAX_FRAME_MS).
+export fn clock_set_max_frame_ms(p_c: object, p_ms: f64) {
+    let c: object = p_c;
+    let ms: f64 = p_ms;
+    if (ms > 0.0) { c.clamp_ms = ms; }
+}
+
+// Feed the accumulator a measured millisecond delta and return how many fixed
+// ticks are due THIS call. The caller runs exactly that many sim steps.
+//
+// Why this is not `acc += ms; while (acc >= tick) { acc -= tick; n++; }`:
+// repeated subtraction of an inexact tick_ms drifts, so after enough frames the
+// issued tick count no longer equals floor(total_ms / tick_ms). This form keeps
+// the running total and derives the tick index from it, so the invariant
+//
+//     total ticks issued == floor(total_clamped_ms / tick_ms)
+//
+// holds exactly, forever, by construction.
+//
+// The `eps` term repairs one specific IEEE artifact: 250.0 / (1000.0/60.0)
+// evaluates to 14.999999999999998, so a naive truncation would report 14 ticks
+// for an exact 250 ms. eps is tick_ms * 1e-9 (17 picoseconds at 60 Hz), which
+// is large enough to absorb the rounding and far too small to fire a tick
+// early — verified over 200 000 consecutive ticks with zero misses and zero
+// early fires.
+//
+// total_ms is summed with Kahan compensation. Naive `total += ms` accumulates
+// ~1e-7 ms of error over 200 000 frames, which is larger than eps and costs a
+// whole tick across an hour of play (measured: 199 999 ticks instead of
+// 200 000). Compensated summation keeps the total within one ulp indefinitely
+// for three extra flops once per frame.
+export fn clock_advance_ms(p_c: object, p_ms: f64): i32 {
+    let c: object = p_c;
+    let ms: f64 = p_ms;
+    if (ms < 0.0) { ms = 0.0; }
+    c.raw_ms = ms;
+    let cap: f64 = c.clamp_ms;
+    if (ms > cap) { ms = cap; c.stalls = c.stalls + 1; }
+    c.frame_ms = ms;
+
+    let prev_total: f64 = c.total_ms;
+    let comp: f64 = c.comp;
+    let y: f64 = ms - comp;
+    let total: f64 = prev_total + y;
+    c.comp = (total - prev_total) - y;
+    c.total_ms = total;
+
+    let tick: f64 = c.tick_ms;
+    let target: i64 = i64((total + c.eps) / tick);
+    let issued: i64 = c.ticks;
+    let n: i32 = i32(target - issued);
+    c.ticks = target;
+    // The eps nudge can push `target` a fraction past `total`, so the residual
+    // is clamped: alpha must never be negative.
+    let acc: f64 = total - f64(target) * tick;
+    if (acc < 0.0) { acc = 0.0; }
+    c.acc = acc;
+    let out: i32 = n;
+    return out;
+}
+
+// Same, driven by the real clock: sample clock_now(), diff against the previous
+// sample, advance. Returns the number of fixed ticks due this frame.
+export fn clock_accumulate(p_c: object, p_now: u64): i32 {
+    let c: object = p_c;
+    let now: u64 = p_now;
+    let prev: u64 = c.prev;
+    c.prev = now;
+    let ms: f64 = 0.0;
+    if (now > prev) { ms = f64(now - prev) * g_clock_mspc; }
+    let out: i32 = clock_advance_ms(c, ms);
+    return out;
+}
+
+// Interpolation factor for the render pass: how far the renderer is between the
+// last completed tick and the next one. Always in [0, 1).
+export fn clock_alpha(p_c: object): f64 {
+    let c: object = p_c;
+    let a: f64 = c.acc / c.tick_ms;
+    if (a < 0.0) { a = 0.0; }
+    if (a >= 1.0) { a = 0.999999999; }
+    let out: f64 = a;
+    return out;
+}
+
+// Last frame's delta after the clamp — the number to drive client-only
+// cosmetics (particles, shake, sway) with. Never feed it to the sim.
+export fn clock_frame_ms(p_c: object): f64 { let c: object = p_c; let out: f64 = c.frame_ms; return out; }
+
+// Last frame's delta before the clamp. Useful only for diagnostics.
+export fn clock_raw_frame_ms(p_c: object): f64 { let c: object = p_c; let out: f64 = c.raw_ms; return out; }
+
+// Residual milliseconds not yet consumed by a tick, in [0, tick_ms).
+export fn clock_acc_ms(p_c: object): f64 { let c: object = p_c; let out: f64 = c.acc; return out; }
+
+// Total fixed ticks issued since the last reset.
+export fn clock_total_ticks(p_c: object): i64 { let c: object = p_c; let out: i64 = c.ticks; return out; }
+
+// Total clamped wall time accumulated since the last reset.
+export fn clock_total_ms(p_c: object): f64 { let c: object = p_c; let out: f64 = c.total_ms; return out; }
+
+// How many frames have hit the spiral-of-death clamp since the last reset.
+export fn clock_stall_count(p_c: object): i32 { let c: object = p_c; let out: i32 = c.stalls; return out; }
+
+// The configured tick length in milliseconds.
+export fn clock_tick_ms(p_c: object): f64 { let c: object = p_c; let out: f64 = c.tick_ms; return out; }

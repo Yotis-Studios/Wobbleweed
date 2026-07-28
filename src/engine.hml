@@ -1,0 +1,418 @@
+// engine.hml — engine lifecycle: bring-up order, teardown order, and the
+// resource registry that makes teardown complete.
+//
+// This module is GENERIC (R1). It knows about a window, a renderer, textures,
+// an audio device and an ordering between them. It knows nothing about any
+// particular game: no colours, no nouns, no content. Every value is a
+// parameter.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS FILE EXISTS  (ENGINE_GAPS.md G21)
+// ---------------------------------------------------------------------------
+// Before this module there was no owner of shutdown. `window_close` destroys
+// exactly one texture — the legacy streaming framebuffer `w.tex`. Every texture
+// a caller created with `create_static_tex` / `create_streaming_tex` /
+// `create_target` leaked, the `alloc()`d event scratch `w.ev` leaked, and there
+// was no defined order between closing the mixer and destroying the renderer.
+//
+// Nothing here is clever. It is a registry and an order. The value is that the
+// order is written down once, executed once, and observable by a test.
+//
+// ---------------------------------------------------------------------------
+// THE TEARDOWN ORDER — this is the contract
+// ---------------------------------------------------------------------------
+//   1  AUDIO      Mix_CloseAudio(). First, because a playing channel can be
+//                 pointing at a PCM buffer the caller is about to release, and
+//                 because the mixer runs on its own thread: stop it before
+//                 anything it might touch goes away.
+//   2  TARGET     The render target texture, destroyed BEFORE the ordinary
+//                 texture sweep. A texture that is currently bound as the
+//                 render target must be unbound first (we reset the target to
+//                 the backbuffer, then destroy it), otherwise the renderer is
+//                 left holding a dangling target.
+//   3  TEXTURES   The registry sweep: SDL_DestroyTexture on every texture still
+//                 registered, newest first (reverse of creation order, so a
+//                 texture created from another cannot outlive its source).
+//   4  RENDERER   SDL_DestroyRenderer.
+//   5  WINDOW     SDL_DestroyWindow.
+//   6  QUIT       SDL_Quit, then free() the event scratch.
+//
+// Steps 4, 5 and 6 are performed by `sdl.hml`'s `window_close`, which does
+// exactly renderer -> window -> SDL_Quit in that order. We do not duplicate
+// them here (sdl.hml is not ours to change); we call it once, between the
+// TEXTURES step and the free of `w.ev`, and log the three phases around it.
+// `window_close` also destroys the legacy `w.tex` framebuffer texture, which is
+// why that texture must NEVER be put in this registry: it would be destroyed
+// twice.
+//
+// `engine_shutdown` records the phase codes it executed, in order, so a test
+// can assert the order rather than trust this comment. See
+// `engine_teardown_steps` / `engine_teardown_phase`.
+//
+// ---------------------------------------------------------------------------
+// MEMORY OWNERSHIP — the two rules that matter
+// ---------------------------------------------------------------------------
+// * `alloc()` is NEVER reclaimed for you. `w.ev` is an `alloc()` and this
+//   module is the only thing that frees it.
+// * `buffer` / `array` / `object` / `string` are refcounted and are reclaimed
+//   when the last reference goes. Do NOT `free()` one that is still reachable
+//   from a top-level `let` — that is a double free. The texture registry
+//   therefore holds raw SDL handles (`ptr`) and never `free()`s them; SDL owns
+//   that memory and `SDL_DestroyTexture` is the only correct release.
+//
+// ---------------------------------------------------------------------------
+// NULL HANDLING
+// ---------------------------------------------------------------------------
+// A NULL `ptr` returned from FFI compares FALSE against `null` in compiled code
+// (HEMLOCK_ISSUES.md H-7, live on main). Every handle test below uses
+// `ptr_null()`. Texture parameters are deliberately UNANNOTATED: a
+// `ptr`-annotated Hemlock parameter rejects a null argument outright.
+// `engine_init` returns the Hemlock `null` literal on failure — that one is a
+// Hemlock value, not an FFI pointer, so `e == null` is the correct test for it.
+//
+// ---------------------------------------------------------------------------
+// COST
+// ---------------------------------------------------------------------------
+// Nothing in this file runs per frame. There is no per-frame entry point on
+// purpose: the frame graph belongs to the caller. Registry operations are
+// linear scans over a handful of handles at boot and at shutdown, and they
+// allocate nothing after `engine_init` — the registry array is created once and
+// reused through push/pop, so a create/destroy churn does not grow the heap.
+
+import {
+    window_open_ex, window_close,
+    create_static_tex, create_streaming_tex, create_target, destroy_tex,
+    set_target, get_target,
+    mix_open, mix_close, mix_halt
+} from "./sdl.hml";
+
+// ===========================================================================
+// CONSTANTS
+// ===========================================================================
+
+// Teardown phase codes, in the order `engine_shutdown` executes them.
+export let ENGINE_PHASE_AUDIO = 1;
+export let ENGINE_PHASE_TARGET = 2;
+export let ENGINE_PHASE_TEXTURES = 3;
+export let ENGINE_PHASE_RENDERER = 4;
+export let ENGINE_PHASE_WINDOW = 5;
+export let ENGINE_PHASE_QUIT = 6;
+export let ENGINE_PHASE_MAX = 6;
+
+// Default registry capacity. A registry is a boot-time structure; the cap
+// exists so that a leak in the CALLER (registering in a loop) is a reported
+// -1 rather than unbounded growth. Override with `engine_init_ex`.
+export let ENGINE_TEX_CAP = 256;
+
+// `logical` selector passed through to `window_open_ex`.
+//   ENGINE_CHUNKY  — no logical size. Draw into an offscreen target and upscale
+//                    it. This is the shipping path.
+//   ENGINE_LOGICAL — SDL_RenderSetLogicalSize. Legacy; SDL smooths rasterization
+//                    at window resolution, so the chunky look is absent.
+export let ENGINE_CHUNKY = 0;
+export let ENGINE_LOGICAL = 1;
+
+// `mix_halt` channel argument meaning "every channel".
+let g_all_channels = -1;
+
+// ===========================================================================
+// INIT
+// ===========================================================================
+
+// Open a window/renderer and create the engine handle.
+//
+//   p_title   window title
+//   p_w, p_h  the engine's own resolution in pixels (the target size, not the
+//             window size)
+//   p_scale   integer window upscale; the window is p_w*p_scale by p_h*p_scale
+//
+// Returns the engine handle, or the Hemlock `null` literal if the window could
+// not be opened. Test the result with `e == null` (it is a Hemlock value, not
+// an FFI pointer).
+//
+// The handle is:
+//   { win, tex, target, audio, alive, log, w, h, scale, logical, cap }
+// `win` is sdl.hml's window object — pass it to every sdl.hml call. Get it back
+// with `engine_handle`.
+export fn engine_init(p_title: string, p_w: i32, p_h: i32, p_scale: i32) {
+    return engine_init_ex(p_title, p_w, p_h, p_scale, ENGINE_CHUNKY, ENGINE_TEX_CAP);
+}
+
+export fn engine_init_ex(p_title: string, p_w: i32, p_h: i32, p_scale: i32,
+                         p_logical: i32, p_cap: i32) {
+    let win = window_open_ex(p_title, p_w, p_h, p_scale, p_logical);
+    if (win == null) { return null; }
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = ENGINE_TEX_CAP; }
+    return { win: win,
+             tex: [],                 // registered SDL_Texture handles
+             target: ptr_null(),      // the render target, torn down first
+             audio: 0,                // 1 when the mixer device is ours to close
+             alive: 1,
+             log: [],                 // teardown phase codes, in execution order
+             w: p_w, h: p_h, scale: p_scale, logical: p_logical, cap: cap };
+}
+
+// The sdl.hml window object. Every sdl.hml entry point takes this, not the
+// engine handle. Returns `null` after shutdown.
+export fn engine_handle(p_e: object) {
+    if (p_e.alive == 0) { return null; }
+    return p_e.win;
+}
+
+export fn engine_alive(p_e: object): i32 { let out: i32 = p_e.alive; return out; }
+export fn engine_width(p_e: object): i32 { let out: i32 = p_e.w; return out; }
+export fn engine_height(p_e: object): i32 { let out: i32 = p_e.h; return out; }
+export fn engine_scale(p_e: object): i32 { let out: i32 = p_e.scale; return out; }
+
+// ===========================================================================
+// TEXTURE REGISTRY
+// ===========================================================================
+//
+// Every texture the engine is expected to destroy must be in here. Registering
+// is idempotent: a handle already present returns its existing index rather
+// than a second entry, so a double-register cannot produce a double-destroy.
+//
+// NEVER register the legacy framebuffer texture `engine_handle(e).tex` —
+// `window_close` destroys that one, and a second SDL_DestroyTexture on it is a
+// use-after-free.
+
+// Index of `p_tex` in the registry, or -1.
+export fn engine_tex_index(p_e: object, p_tex): i32 {
+    let a = p_e.tex;
+    let n: i32 = a.length;
+    let i: i32 = 0;
+    while (i < n) {
+        if (a[i] == p_tex) { let hit: i32 = i; return hit; }
+        i++;
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// Register an existing texture. Returns its registry index, or -1 if the handle
+// is null, the engine is down, or the registry is full.
+export fn engine_register_tex(p_e: object, p_tex): i32 {
+    if (p_e.alive == 0) { let dead: i32 = -1; return dead; }
+    if (p_tex == ptr_null()) { let bad: i32 = -1; return bad; }
+    let dup: i32 = engine_tex_index(p_e, p_tex);
+    if (dup >= 0) { return dup; }
+    let a = p_e.tex;
+    let n: i32 = a.length;
+    let cap: i32 = p_e.cap;
+    if (n >= cap) { let full: i32 = -1; return full; }
+    a.push(p_tex);
+    let idx: i32 = n;
+    return idx;
+}
+
+// Forget a texture WITHOUT destroying it — for a handle whose lifetime the
+// caller has taken back. Swap-with-last then pop, so the array keeps its
+// capacity and repeated register/unregister does not grow the heap.
+// Returns 1 if it was present, 0 if not.
+export fn engine_unregister_tex(p_e: object, p_tex): i32 {
+    let idx: i32 = engine_tex_index(p_e, p_tex);
+    if (idx < 0) { let miss: i32 = 0; return miss; }
+    let a = p_e.tex;
+    let n: i32 = a.length;
+    a[idx] = a[n - 1];
+    a.pop();
+    let hit: i32 = 1;
+    return hit;
+}
+
+// Destroy a texture now and forget it. Returns 1 if it was registered and has
+// been destroyed, 0 otherwise (an unregistered handle is NOT destroyed — the
+// registry is the record of what the engine owns).
+export fn engine_destroy_tex(p_e: object, p_tex): i32 {
+    if (engine_unregister_tex(p_e, p_tex) == 0) { let miss: i32 = 0; return miss; }
+    if (p_e.target == p_tex) { p_e.target = ptr_null(); }
+    destroy_tex(p_tex);
+    let hit: i32 = 1;
+    return hit;
+}
+
+export fn engine_tex_count(p_e: object): i32 {
+    let a = p_e.tex;
+    let out: i32 = a.length;
+    return out;
+}
+
+export fn engine_tex_cap(p_e: object): i32 { let out: i32 = p_e.cap; return out; }
+
+// Registry slot `p_i`, or `ptr_null()` if out of range.
+export fn engine_tex_at(p_e: object, p_i: i32) {
+    let a = p_e.tex;
+    let n: i32 = a.length;
+    let i: i32 = p_i;
+    if (i < 0 || i >= n) { return ptr_null(); }
+    return a[i];
+}
+
+// --- creation helpers: create AND register in one step ----------------------
+//
+// These are the calls a caller should reach for. A texture created through them
+// cannot be forgotten, because it is registered before it is returned. Each
+// returns `ptr_null()` on failure (SDL failed, or the registry is full — in the
+// latter case the texture is destroyed again rather than leaked).
+
+fn adopt(p_e: object, p_tex) {
+    if (p_tex == ptr_null()) { return ptr_null(); }
+    if (engine_register_tex(p_e, p_tex) < 0) { destroy_tex(p_tex); return ptr_null(); }
+    return p_tex;
+}
+
+export fn engine_create_static_tex(p_e: object, p_fmt: u32, p_w: i32, p_h: i32) {
+    return adopt(p_e, create_static_tex(p_e.win, p_fmt, p_w, p_h));
+}
+
+export fn engine_create_streaming_tex(p_e: object, p_fmt: u32, p_w: i32, p_h: i32) {
+    return adopt(p_e, create_streaming_tex(p_e.win, p_fmt, p_w, p_h));
+}
+
+// An offscreen ARGB8888 TEXTUREACCESS_TARGET texture, registered AND recorded as
+// the render target, so teardown unbinds and destroys it before the sweep.
+// Only one target is tracked; setting a second replaces the record (the first
+// stays in the ordinary registry and is destroyed by the sweep).
+export fn engine_create_target(p_e: object, p_w: i32, p_h: i32) {
+    let t = adopt(p_e, create_target(p_e.win, p_w, p_h));
+    if (t != ptr_null()) { p_e.target = t; }
+    return t;
+}
+
+// Record an already-created texture as the render target. It must be registered
+// first (or created through `engine_create_target`). Returns 1 on success.
+export fn engine_set_target_tex(p_e: object, p_tex): i32 {
+    if (engine_tex_index(p_e, p_tex) < 0) { let miss: i32 = 0; return miss; }
+    p_e.target = p_tex;
+    let hit: i32 = 1;
+    return hit;
+}
+
+export fn engine_target_tex(p_e: object) { return p_e.target; }
+
+// ===========================================================================
+// AUDIO OWNERSHIP
+// ===========================================================================
+//
+// The engine does not assume it opened the audio device. Two ways to make the
+// mixer part of the ordered teardown:
+//
+//   a) `engine_open_audio(...)` — the engine opens it and owns it.
+//   b) whoever opened it calls `engine_set_audio_owned(e, 1)`.
+//
+// If a higher layer closes the device itself, it must call
+// `engine_set_audio_owned(e, 0)` first: Mix_CloseAudio is refcounted against
+// Mix_OpenAudio and closing twice tears down a device the process may still be
+// using.
+
+// Open the mixer and take ownership of closing it. Returns 0 on success, -1 if
+// no device (which is normal headless, and is NOT fatal — the caller keeps
+// rendering).
+export fn engine_open_audio(p_e: object, p_freq: i32, p_fmt: i32,
+                            p_channels: i32, p_chunk: i32): i32 {
+    let rc: i32 = mix_open(p_freq, p_fmt, p_channels, p_chunk);
+    if (rc == 0) { p_e.audio = 1; }
+    let out: i32 = rc;
+    return out;
+}
+
+export fn engine_set_audio_owned(p_e: object, p_on: i32) { p_e.audio = p_on; }
+export fn engine_audio_owned(p_e: object): i32 { let out: i32 = p_e.audio; return out; }
+
+// ===========================================================================
+// SHUTDOWN
+// ===========================================================================
+
+fn log_phase(p_e: object, p_code: i32) {
+    let l = p_e.log;
+    l.push(p_code);
+}
+
+// Destroy every registered texture, newest first. Returns how many were
+// destroyed. Used by `engine_shutdown`; exported because a caller that rebuilds
+// its whole atlas set wants exactly this.
+export fn engine_destroy_all_tex(p_e: object): i32 {
+    let a = p_e.tex;
+    let destroyed: i32 = 0;
+    while (a.length > 0) {
+        let i: i32 = a.length - 1;
+        let t = a[i];
+        a.pop();
+        destroy_tex(t);
+        destroyed++;
+    }
+    p_e.target = ptr_null();
+    let out: i32 = destroyed;
+    return out;
+}
+
+// Tear the engine down in the documented order. Idempotent: a second call is a
+// no-op and returns 0. Returns the number of phases executed (6 on a normal
+// shutdown).
+//
+// The executed phase codes are recorded in order; read them back with
+// `engine_teardown_steps` / `engine_teardown_phase` to assert the order rather
+// than trust the comment at the top of this file.
+export fn engine_shutdown(p_e: object): i32 {
+    if (p_e.alive == 0) { let already: i32 = 0; return already; }
+    p_e.alive = 0;
+
+    let win = p_e.win;
+
+    // 1. AUDIO — silence every channel, then close the device. Doing this first
+    //    stops the mixer thread before any buffer it points at can be released.
+    if (p_e.audio != 0) {
+        mix_halt(g_all_channels);
+        mix_close();
+        p_e.audio = 0;
+    }
+    log_phase(p_e, ENGINE_PHASE_AUDIO);
+
+    // 2. TARGET — unbind before destroying. A renderer left holding a destroyed
+    //    target is the one ordering mistake in this file that would actually
+    //    crash.
+    if (p_e.target != ptr_null()) {
+        if (get_target(win) == p_e.target) { set_target(win, null); }
+        engine_destroy_tex(p_e, p_e.target);
+        p_e.target = ptr_null();
+    }
+    log_phase(p_e, ENGINE_PHASE_TARGET);
+
+    // 3. TEXTURES — the sweep. This is the whole point of the registry.
+    engine_destroy_all_tex(p_e);
+    log_phase(p_e, ENGINE_PHASE_TEXTURES);
+
+    // 4/5/6. RENDERER, WINDOW, QUIT — `window_close` performs exactly these
+    //        three, in this order, plus the legacy framebuffer texture it owns.
+    log_phase(p_e, ENGINE_PHASE_RENDERER);
+    log_phase(p_e, ENGINE_PHASE_WINDOW);
+    window_close(win);
+    log_phase(p_e, ENGINE_PHASE_QUIT);
+
+    // The event scratch is an alloc(); nothing reclaims it for us. Freed after
+    // SDL_Quit so no SDL path can still be polling into it.
+    if (win.ev != ptr_null()) { free(win.ev); win.ev = ptr_null(); }
+
+    p_e.win = null;
+    let l = p_e.log;
+    let out: i32 = l.length;
+    return out;
+}
+
+// How many teardown phases have been executed.
+export fn engine_teardown_steps(p_e: object): i32 {
+    let l = p_e.log;
+    let out: i32 = l.length;
+    return out;
+}
+
+// The phase code executed at step `p_i` (0-based), or -1 if out of range.
+export fn engine_teardown_phase(p_e: object, p_i: i32): i32 {
+    let l = p_e.log;
+    let n: i32 = l.length;
+    let i: i32 = p_i;
+    if (i < 0 || i >= n) { let bad: i32 = -1; return bad; }
+    let out: i32 = l[i];
+    return out;
+}

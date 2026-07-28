@@ -1,0 +1,51 @@
+// Does SDL_RenderGeometry support alpha blending if we set the blend mode?
+import "libSDL2-2.0.so.0";
+extern fn SDL_SetTextureBlendMode(tex: ptr, mode: i32): i32;
+extern fn SDL_SetTextureAlphaMod(tex: ptr, a: i32): i32;
+extern fn SDL_SetRenderDrawBlendMode(ren: ptr, mode: i32): i32;
+import { window_open, upload_texture, clear, present_geom, read_pixels, draw_tris, window_close } from "../src/sdl.hml";
+import { tex_checker } from "../src/texture.hml";
+import { write_png } from "../src/png.hml";
+
+let VS = 20;
+fn put(buf: ptr, i: i32, x: f64, y: f64, r: i32, g: i32, bl: i32, a: i32, u: f64, v: f64) {
+    let o = i * VS;
+    ptr_write_f32(ptr_offset(buf, o, 1), x);
+    ptr_write_f32(ptr_offset(buf, o+4, 1), y);
+    ptr_write_u8(ptr_offset(buf, o+8, 1), r & 255);
+    ptr_write_u8(ptr_offset(buf, o+9, 1), g & 255);
+    ptr_write_u8(ptr_offset(buf, o+10, 1), bl & 255);
+    ptr_write_u8(ptr_offset(buf, o+11, 1), a & 255);
+    ptr_write_f32(ptr_offset(buf, o+12, 1), u);
+    ptr_write_f32(ptr_offset(buf, o+16, 1), v);
+}
+fn main() {
+    let W = 64; let H = 64;
+    let win = window_open("alpha", W, H, 1);
+    let t = upload_texture(win, tex_checker(8, 8, 2));
+    let rc = SDL_SetTextureBlendMode(t, 1);   // SDL_BLENDMODE_BLEND
+    print(`SDL_SetTextureBlendMode -> ${rc}`);
+    SDL_SetRenderDrawBlendMode(win.ren, 1);
+
+    let buf = alloc(6 * VS);
+    clear(win, 0, 0, 255);                       // blue background
+    // opaque red-modulated quad over left half
+    put(buf,0, 0.0,0.0, 255,0,0,255, 0.0,0.0);
+    put(buf,1, 32.0,0.0, 255,0,0,255, 1.0,0.0);
+    put(buf,2, 32.0,64.0, 255,0,0,255, 1.0,1.0);
+    draw_tris(win, null, buf, 3);
+    // 50% alpha white quad over right half (untextured)
+    put(buf,0, 32.0,0.0, 255,255,255,128, 0.0,0.0);
+    put(buf,1, 64.0,0.0, 255,255,255,128, 1.0,0.0);
+    put(buf,2, 64.0,64.0, 255,255,255,128, 1.0,1.0);
+    draw_tris(win, null, buf, 3);
+
+    let px = buffer(W*H*3);
+    read_pixels(win, px);
+    print(`bg (2,2)      = ${px[(2*W+2)*3]},${px[(2*W+2)*3+1]},${px[(2*W+2)*3+2]}`);
+    print(`opaque (5,5)  = ${px[(5*W+5)*3]},${px[(5*W+5)*3+1]},${px[(5*W+5)*3+2]}`);
+    print(`alpha  (58,5) = ${px[(5*W+58)*3]},${px[(5*W+58)*3+1]},${px[(5*W+58)*3+2]}`);
+    write_png("/tmp/alpha_test.png", px, W, H);
+    window_close(win);
+}
+main();

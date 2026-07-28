@@ -1,0 +1,51 @@
+// _bench_gpu.hml — headless phase-timed benchmark of the GPU path (scratch).
+import { sin, cos } from "@stdlib/math";
+import { time_ms } from "@stdlib/time";
+import { v3, v_add, v_scale } from "../src/vec.hml";
+import { tex_grass, tex_checker, tex_sky } from "../src/texture.hml";
+import { batch_new, batch_flush } from "../src/geom.hml";
+import { camera_mvp, render_world_gpu, load_tree } from "../src/scene_gpu.hml";
+import { window_open, upload_texture, clear, present_geom, window_close } from "../src/sdl.hml";
+
+let W = 320; let H = 240;
+let FRAMES = 120;
+
+fn main() {
+    let win = window_open("bench", W, H, 1);
+    if (win == null) { eprint("window failed"); return; }
+    let gtex = upload_texture(win, tex_grass(64, 64));
+    let ctex = upload_texture(win, tex_checker(64, 64, 4));
+    let skytex = upload_texture(win, tex_sky(320, 128));
+    let tree = load_tree("assets/tree.obj");
+    let b = batch_new(8192);
+
+    let pos = v3(4.0, 2.0, 10.0);
+    let yaw = 0.0 - 0.35; let pitch = 0.0 - 0.08;
+
+    let t_emit = 0; let t_flush = 0; let t_clear = 0; let t_present = 0;
+    let tris_total = 0;
+    let wall0 = time_ms();
+
+    for (let f = 0; f < FRAMES; f++) {
+        yaw = yaw + 0.01;
+        pos = v_add(pos, v3(0.0, 0.0, 0.0 - 0.02));
+        let look = v3(sin(yaw) * cos(pitch), sin(pitch), (0.0 - cos(yaw)) * cos(pitch));
+        let mvp = camera_mvp(pos, v_add(pos, look), W, H);
+
+        let t0 = time_ms(); clear(win, 0, 0, 0); t_clear = t_clear + (time_ms() - t0);
+        t0 = time_ms(); render_world_gpu(b, mvp, yaw, W, H, gtex, ctex, skytex, tree);
+        t_emit = t_emit + (time_ms() - t0);
+        tris_total = tris_total + b.tris.length;
+        t0 = time_ms(); batch_flush(win, b); t_flush = t_flush + (time_ms() - t0);
+        t0 = time_ms(); present_geom(win); t_present = t_present + (time_ms() - t0);
+    }
+    let wall = time_ms() - wall0;
+    print(`frames=${FRAMES} wall=${wall}ms  fps=${FRAMES * 1000.0 / wall}`);
+    print(`  tris/frame  = ${tris_total / (FRAMES * 1.0)}`);
+    print(`  clear       = ${t_clear / (FRAMES * 1.0)} ms/frame`);
+    print(`  emit(CPU)   = ${t_emit / (FRAMES * 1.0)} ms/frame`);
+    print(`  flush(sort+RenderGeometry) = ${t_flush / (FRAMES * 1.0)} ms/frame`);
+    print(`  present     = ${t_present / (FRAMES * 1.0)} ms/frame`);
+    window_close(win);
+}
+main();

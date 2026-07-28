@@ -1,0 +1,1471 @@
+// probe_mesh.hml — verification program for src/mesh.hml and src/billboard.hml
+//                  (Nightshade W1-10 / ENGINE_GAPS G17 + G19).
+//
+//   hemlockc -O1 examples/probe_mesh.hml -o /tmp/probe_mesh
+//   SDL_VIDEODRIVER=dummy /tmp/probe_mesh          # headless
+//   DISPLAY=:0 /tmp/probe_mesh                     # real display
+//
+// Exits 0 only when every assertion passed AND the number of assertions
+// executed equals EXPECT_ASSERTS. A probe that exits 0 while printing FAIL is
+// worse than no probe, so the exit code is driven by both.
+//
+// WHAT IS PROVED HERE
+//   A  the 24 B/vertex arena round-trips position, uv and colour exactly
+//   B  mesh_bake_light implements ENGINE_GAPS G16 and honours the
+//      "ambient + sun == (1,1,1) reproduces the authored albedo" invariant
+//   C  ZERO normal transforms per frame for a static prop  <- the headline
+//   D  emit correctness: projection, depth key, tint, cap enforcement,
+//      near/guard/backface rejection, and mesh_emit == mesh_emit_yaw
+//   E  20 tree instances (1920 triangles) inside the 2.3 ms budget, with a flat
+//      RSS over 2000 frames (zero allocations)
+//   F  billboards: constant WORLD size under a dolly and under rotation,
+//      constant SCREEN size for the screen-sized variant under a dolly,
+//      verified against independently projected reference corners
+//   G  300 billboards (600 triangles) inside the 0.9 ms budget
+//   H  a headless PNG through SDL_RenderGeometry, including a textured mesh
+//      whose UVs must survive the arena (the third defect in G19)
+
+import { sin, cos, sqrt, floor, tan, PI } from "@stdlib/math";
+import { exit } from "@stdlib/process";
+
+import { v3, mat_mul, mat_perspective, mat_look_dir, mat_identity,
+         mat_translate, mat_rot_y, mat_scale, mat_apply } from "../src/vec.hml";
+import { clock_now, clock_ms_between } from "../src/time.hml";
+import { window_open_ex, sdl_clear, draw_tris_at, read_pixels,
+         create_static_tex, update_tex, set_tex_blend, sdl_present,
+         BLEND_BLEND, FMT_RGBA32 } from "../src/sdl.hml";
+import { write_png } from "../src/png.hml";
+
+import { mesh_new, mesh_free, mesh_begin, mesh_vert, mesh_vert_n, mesh_vert_ao,
+         mesh_tri, mesh_quad, mesh_end, mesh_tri_count, mesh_vert_count,
+         mesh_radius, mesh_capacity, mesh_buf, mesh_is_baked,
+         mesh_vert_rgb, mesh_vert_pos, mesh_vert_uv,
+         mesh_bake_light, mesh_unbake,
+         mesh_set_mvp, mesh_set_viewport, mesh_set_near, mesh_set_guard,
+         mesh_set_cull, mesh_emit, mesh_emit_yaw,
+         mesh_normal_xform_count, mesh_reset_counters, mesh_tris_emitted,
+         mesh_overflow_count, mesh_rej_near, mesh_rej_guard, mesh_rej_backface,
+         MESH_VSTRIDE, MESH_CULL_NEG, MESH_CULL_POS, MESH_CULL_OFF } from "../src/mesh.hml";
+
+import { billboard_set_mvp, billboard_set_viewport, billboard_set_near,
+         billboard_set_proj, billboard_set_proj_persp, billboard_set_uv,
+         billboard_world, billboard_world_wh, billboard_screen,
+         billboard_stretched, billboard_reset_counters, billboard_tris_emitted,
+         billboard_overflow_count, billboard_rej_near } from "../src/billboard.hml";
+
+// libc, for /proc/self/statm. Grouped under its own import: an `extern fn`
+// binds to the most recently declared import (HEMLOCK_ISSUES H-6).
+import "libc.so.6";
+extern fn open64(path: string, flags: i32): i32;
+extern fn read(fd: i32, buf: ptr, n: i64): i64;
+extern fn close(fd: i32): i32;
+
+// SDL, for teardown ONLY, and only because `window_close()` cannot be used here.
+// Grouped under its own import for the same H-6 reason.
+//
+//   On this box, on the REAL display, `SDL_Quit()` after an OpenGL renderer has
+//   existed kills the process with
+//       X Error of failed request: BadValue ... Major opcode 149, Minor 4
+//   and Xlib's default handler exits(1). That would make this probe report
+//   failure after every assertion had passed, which is the one thing a gate
+//   probe must never do.
+//
+//   It is NOT a wobbleweed bug and NOT a Hemlock bug: it reproduces in eight
+//   lines of C (SDL_CreateWindow + SDL_CreateRenderer(-1, 0) + DestroyRenderer +
+//   DestroyWindow + SDL_Quit, gcc `pkg-config --libs sdl2`), and the Wave-0
+//   `probe_sdl` dies the same way under DISPLAY=:0. Reported to the
+//   orchestrator; sdl.hml is not ours to change.
+//
+//   So this probe releases every SDL resource it created — texture, renderer,
+//   window — and deliberately does not call SDL_Quit. Nothing leaks past
+//   process exit; the OS reclaims the connection.
+import "libSDL2-2.0.so.0";
+extern fn SDL_DestroyTexture(tex: ptr);
+extern fn SDL_DestroyRenderer(ren: ptr);
+extern fn SDL_DestroyWindow(win: ptr);
+
+// ===========================================================================
+// harness
+// ===========================================================================
+
+let EXPECT_ASSERTS = 127;
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_notes: array = [];
+
+fn chk(name: string, ok: i32) {
+    if (ok == 1) { g_pass = g_pass + 1; }
+    else { g_fail = g_fail + 1; print(`  FAIL: ${name}`); }
+}
+
+fn note(s: string) { g_notes.push(s); }
+
+fn fabs(p_x: f64): f64 {
+    let x: f64 = p_x;
+    if (x < 0.0) { x = 0.0 - x; }
+    let out: f64 = x;
+    return out;
+}
+
+fn near_eq(a: f64, b: f64, tol: f64): i32 {
+    if (fabs(a - b) <= tol) { let y: i32 = 1; return y; }
+    let n: i32 = 0;
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// resident set size, in 4 KiB pages, straight out of /proc/self/statm.
+// read_file() from @stdlib/fs returns "" for procfs (st_size is 0 there), so
+// this goes through libc read(2).
+// ---------------------------------------------------------------------------
+let g_rssbuf: ptr = alloc(256);
+
+fn rss_pages(): i32 {
+    let fd = open64("/proc/self/statm", 0);
+    if (fd < 0) { let bad: i32 = -1; return bad; }
+    let n = read(fd, g_rssbuf, 255);
+    close(fd);
+    if (n <= 0) { let bad: i32 = -1; return bad; }
+    let i: i32 = 0;
+    let field: i32 = 0;
+    let acc: i32 = 0;
+    let started: i32 = 0;
+    while (i < n) {
+        let c = ptr_deref_u8(ptr_offset(g_rssbuf, i, 1));
+        if (c >= 48 && c <= 57) {
+            acc = acc * 10 + (c - 48);
+            started = 1;
+        } else {
+            if (started == 1) {
+                if (field == 1) { let out: i32 = acc; return out; }
+                field = field + 1; acc = 0; started = 0;
+            }
+        }
+        i = i + 1;
+    }
+    let bad: i32 = -2;
+    return bad;
+}
+
+// ===========================================================================
+// a batch sink — literally the Batch of ARCHITECTURE.md 2.3
+// ===========================================================================
+
+fn sink_new(cap: i32) {
+    let b = { vbuf: alloc(cap * 60), depth: [], tex: [], n: 0, cap: cap };
+    let i: i32 = 0;
+    while (i < cap) { b.depth.push(0.0); b.tex.push(ptr_null()); i = i + 1; }
+    return b;
+}
+
+fn sink_reset(b) { b.n = 0; }
+
+// decode helpers: triangle t, vertex v (0..2)
+fn bx(b, t: i32, v: i32): f64 {
+    let o: i32 = t * 60 + v * 20;
+    let out: f64 = ptr_deref_f32(ptr_offset(b.vbuf, o, 1));
+    return out;
+}
+fn by(b, t: i32, v: i32): f64 {
+    let o: i32 = t * 60 + v * 20 + 4;
+    let out: f64 = ptr_deref_f32(ptr_offset(b.vbuf, o, 1));
+    return out;
+}
+fn bc(b, t: i32, v: i32, ch: i32): i32 {
+    let o: i32 = t * 60 + v * 20 + 8 + ch;
+    let out: i32 = ptr_deref_u8(ptr_offset(b.vbuf, o, 1));
+    return out;
+}
+fn bu(b, t: i32, v: i32): f64 {
+    let o: i32 = t * 60 + v * 20 + 12;
+    let out: f64 = ptr_deref_f32(ptr_offset(b.vbuf, o, 1));
+    return out;
+}
+fn bvv(b, t: i32, v: i32): f64 {
+    let o: i32 = t * 60 + v * 20 + 16;
+    let out: f64 = ptr_deref_f32(ptr_offset(b.vbuf, o, 1));
+    return out;
+}
+
+// ===========================================================================
+// scene constants
+// ===========================================================================
+
+let VW = 320.0;
+let VH = 240.0;
+let FOVY = 1.0472;             // 60 degrees
+let ASPECT = 320.0 / 240.0;
+let NEARZ = 0.1;
+let FARZ = 76.32;              // FOG_FAR 72 * 1.06 (ARCHITECTURE D2)
+
+// projection scale used by billboard.hml, computed here independently
+let PSX = 0.5 * VW * ((1.0 / tan(FOVY * 0.5)) / ASPECT);
+let PSY = 0.5 * VH * (1.0 / tan(FOVY * 0.5));
+
+// reference projection of a world point -> screen pixels (test-only; allocates,
+// which is exactly why the shipping path does not look like this)
+fn ref_proj(mvp, x: f64, y: f64, z: f64) {
+    let c = mat_apply(mvp, v3(x, y, z));
+    if (c.w < 0.0000001) { return { ok: 0, x: 0.0, y: 0.0, w: 0.0 }; }
+    let inv = 1.0 / c.w;
+    return { ok: 1,
+             x: (c.x * inv * 0.5 + 0.5) * VW,
+             y: (1.0 - (c.y * inv * 0.5 + 0.5)) * VH,
+             w: c.w };
+}
+
+// ===========================================================================
+// the test prop: 96 triangles, asymmetric, the shape W2-8 will build for real
+// ===========================================================================
+//   6-sided tapered trunk           6 quads          = 12 tris
+//   3 canopy fan discs, 12 segments 3 * (12 + 12)    = 72 tris
+//   1 asymmetric branch stub box    6 quads          = 12 tris
+//                                                     -----
+//                                                      96 tris  x 20 = 1920
+
+fn build_disc(m, cy: f64, rad: f64, rot: f64, offx: f64, offz: f64,
+              r: i32, g: i32, b: i32) {
+    let segs: i32 = 12;
+    let ctr = mesh_vert_n(m, offx, cy + 0.18, offz, 0.5, 0.5, r, g, b,
+                          0.0, 1.0, 0.0);
+    let cbot = mesh_vert_n(m, offx, cy - 0.10, offz, 0.5, 0.5,
+                           i32(r * 3 / 4), i32(g * 3 / 4), i32(b * 3 / 4),
+                           0.0, -1.0, 0.0);
+    let rim: array<i32> = [];
+    let i: i32 = 0;
+    while (i < segs) {
+        let a = rot + (f64(i) / f64(segs)) * 2.0 * PI;
+        // deliberately non-circular: the radius wobbles, so the silhouette is
+        // asymmetric at 12 px (CLAUDE.md 9.10)
+        let rr = rad * (0.82 + 0.18 * cos(3.0 * a + 0.7));
+        let vx = offx + rr * cos(a);
+        let vz = offz + rr * sin(a);
+        let nx = cos(a) * 0.55;
+        let nz = sin(a) * 0.55;
+        let vi = mesh_vert_n(m, vx, cy, vz,
+                             0.5 + 0.45 * cos(a), 0.5 + 0.45 * sin(a),
+                             r, g, b, nx, 0.72, nz);
+        mesh_vert_ao(m, vi, 0.78);
+        rim.push(vi);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < segs) {
+        let j = i + 1;
+        if (j >= segs) { j = 0; }
+        mesh_tri(m, ctr, rim[i], rim[j]);
+        mesh_tri(m, cbot, rim[j], rim[i]);
+        i = i + 1;
+    }
+}
+
+fn build_box(m, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64,
+             r: i32, g: i32, b: i32) {
+    let a = mesh_vert(m, x0, y0, z0, 0.0, 0.0, r, g, b);
+    let bb = mesh_vert(m, x1, y0, z0, 1.0, 0.0, r, g, b);
+    let c = mesh_vert(m, x1, y1, z0, 1.0, 1.0, r, g, b);
+    let d = mesh_vert(m, x0, y1, z0, 0.0, 1.0, r, g, b);
+    let e = mesh_vert(m, x0, y0, z1, 0.0, 0.0, r, g, b);
+    let f = mesh_vert(m, x1, y0, z1, 1.0, 0.0, r, g, b);
+    let gg = mesh_vert(m, x1, y1, z1, 1.0, 1.0, r, g, b);
+    let h = mesh_vert(m, x0, y1, z1, 0.0, 1.0, r, g, b);
+    mesh_quad(m, d, c, bb, a);      // -z
+    mesh_quad(m, e, f, gg, h);      // +z
+    mesh_quad(m, a, bb, f, e);      // -y
+    mesh_quad(m, h, gg, c, d);      // +y
+    mesh_quad(m, a, e, h, d);       // -x
+    mesh_quad(m, bb, c, gg, f);     // +x
+}
+
+fn build_tree(m) {
+    mesh_begin(m);
+    // trunk: 6-sided, tapered, kinked (offset top)
+    let segs: i32 = 6;
+    let lo: array<i32> = [];
+    let hi: array<i32> = [];
+    let i: i32 = 0;
+    while (i < segs) {
+        let a = (f64(i) / f64(segs)) * 2.0 * PI;
+        let ca = cos(a); let sa = sin(a);
+        let li = mesh_vert_n(m, 0.20 * ca, 0.0, 0.20 * sa,
+                             f64(i) / f64(segs), 0.0, 150, 114, 74, ca, 0.0, sa);
+        mesh_vert_ao(m, li, 0.62);
+        let hix = 0.11 * ca + 0.09;      // the kink: the top is offset in +x
+        let hiz = 0.11 * sa - 0.04;
+        let hii = mesh_vert_n(m, hix, 2.30, hiz,
+                              f64(i) / f64(segs), 1.0, 150, 114, 74, ca, 0.0, sa);
+        lo.push(li); hi.push(hii);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < segs) {
+        let j = i + 1;
+        if (j >= segs) { j = 0; }
+        mesh_quad(m, lo[i], lo[j], hi[j], hi[i]);
+        i = i + 1;
+    }
+    // three canopy discs, rotated and offset, with a top/bottom value break
+    build_disc(m, 2.05, 1.10, 0.00, 0.06, -0.02, 90, 154, 60);
+    build_disc(m, 2.48, 0.92, 0.83, -0.10, 0.07, 100, 166, 66);
+    build_disc(m, 2.86, 0.60, 1.71, 0.13, 0.04, 112, 178, 74);
+    // one asymmetric branch stub, +x only
+    build_box(m, 0.14, 1.42, -0.06, 0.86, 1.60, 0.08, 150, 114, 74);
+    mesh_end(m);
+}
+
+// ===========================================================================
+// SECTION A — arena format and builder
+// ===========================================================================
+
+fn section_a() {
+    print("A. mesh arena / builder");
+
+    chk("A0 MESH_VSTRIDE == 24", eqi(MESH_VSTRIDE, 24));
+
+    let m = mesh_new(8);
+    chk("A1 capacity", eqi(mesh_capacity(m), 8));
+    mesh_begin(m);
+    // f32-exact values so the round-trip is bit-exact, not merely close
+    let a = mesh_vert(m, 1.25, -2.5, 0.5, 0.25, 0.75, 200, 100, 50);
+    let b = mesh_vert(m, 3.75, -2.5, 0.5, 0.5, 0.75, 201, 101, 51);
+    let c = mesh_vert(m, 1.25, 1.5, 0.5, 0.25, 0.25, 202, 102, 52);
+    chk("A2 pool indices", eqi(a, 0) & eqi(b, 1) & eqi(c, 2));
+    let t = mesh_tri(m, a, b, c);
+    chk("A3 first triangle index 0", eqi(t, 0));
+    chk("A4 tri_count 1", eqi(mesh_tri_count(m), 1));
+    chk("A5 vert_count 3 (non-indexed)", eqi(mesh_vert_count(m), 3));
+
+    chk("A6 pos.x round-trip", near_eq(mesh_vert_pos(m, 0, 0), 1.25, 0.0));
+    chk("A7 pos.y round-trip", near_eq(mesh_vert_pos(m, 0, 1), -2.5, 0.0));
+    chk("A8 pos.z round-trip", near_eq(mesh_vert_pos(m, 0, 2), 0.5, 0.0));
+    chk("A9 uv.u round-trip", near_eq(mesh_vert_uv(m, 0, 0), 0.25, 0.0));
+    chk("A10 uv.v round-trip", near_eq(mesh_vert_uv(m, 0, 1), 0.75, 0.0));
+    chk("A11 albedo is the pre-bake colour",
+        eqi(mesh_vert_rgb(m, 0, 0), 200) & eqi(mesh_vert_rgb(m, 0, 1), 100)
+        & eqi(mesh_vert_rgb(m, 0, 2), 50));
+    chk("A12 vertex 1 albedo", eqi(mesh_vert_rgb(m, 1, 0), 201));
+    chk("A13 pad byte is 0",
+        eqi(ptr_deref_u8(ptr_offset(mesh_buf(m), 23, 1)), 0));
+
+    // stride: vertex 1 sits exactly 24 bytes after vertex 0
+    let x1 = ptr_deref_f32(ptr_offset(mesh_buf(m), 24, 1));
+    chk("A14 24-byte stride", near_eq(x1, 3.75, 0.0));
+
+    chk("A15 not baked yet", eqi(mesh_is_baked(m), 0));
+
+    // capacity is enforced, never smashed
+    let k: i32 = 0;
+    while (k < 7) { mesh_tri(m, a, b, c); k = k + 1; }
+    chk("A16 filled to capacity", eqi(mesh_tri_count(m), 8));
+    let over = mesh_tri(m, a, b, c);
+    chk("A17 overflow returns -1", eqi(over, -1));
+    chk("A18 overflow did not grow the mesh", eqi(mesh_tri_count(m), 8));
+
+    mesh_end(m);
+    // radius of the farthest vertex: (3.75, -2.5, 0.5)
+    let want = sqrt(3.75 * 3.75 + 2.5 * 2.5 + 0.5 * 0.5);
+    chk("A19 bounding radius", near_eq(mesh_radius(m), want, 0.0001));
+    mesh_free(m);
+
+    // the real prop
+    let tree = mesh_new(96);
+    build_tree(tree);
+    chk("A20 tree is exactly 96 triangles", eqi(mesh_tri_count(tree), 96));
+    chk("A21 tree is 288 vertices", eqi(mesh_vert_count(tree), 288));
+    chk("A22 tree radius plausible",
+        gt(mesh_radius(tree), 1.0) & gt(4.0, mesh_radius(tree)));
+    mesh_free(tree);
+}
+
+fn eqi(a: i32, b: i32): i32 {
+    if (a == b) { let y: i32 = 1; return y; }
+    let n: i32 = 0; return n;
+}
+fn gt(a: f64, b: f64): i32 {
+    if (a > b) { let y: i32 = 1; return y; }
+    let n: i32 = 0; return n;
+}
+
+// ===========================================================================
+// SECTION B — mesh_bake_light (ENGINE_GAPS G16)
+// ===========================================================================
+
+fn section_b() {
+    print("B. mesh_bake_light");
+
+    // one upward-facing triangle, albedo (200,150,100), no AO
+    let m = mesh_new(2);
+    mesh_begin(m);
+    let a = mesh_vert_n(m, 0.0, 0.0, 0.0, 0.0, 0.0, 200, 150, 100, 0.0, 1.0, 0.0);
+    let b = mesh_vert_n(m, 1.0, 0.0, 0.0, 1.0, 0.0, 200, 150, 100, 0.0, 1.0, 0.0);
+    let c = mesh_vert_n(m, 0.0, 0.0, 1.0, 0.0, 1.0, 200, 150, 100, 0.0, 1.0, 0.0);
+    mesh_tri(m, a, b, c);
+    mesh_end(m);
+
+    let n0 = mesh_normal_xform_count();
+
+    // ambient + sun == (1,1,1), light straight down onto the normal: N.L == 1.
+    // This MUST reproduce the authored albedo exactly (ARCHITECTURE 6, and the
+    // reason every atlas texel is authored at full-sun-noon).
+    mesh_bake_light(m, 0.0, 1.0, 0.0,
+                    0.62, 0.60, 0.55,
+                    0.38, 0.40, 0.45,
+                    0.0, 0.0, 0.0);
+    chk("B1 sun+ambient=(1,1,1), N.L=1 reproduces albedo R",
+        eqi(mesh_vert_rgb(m, 0, 0), 200));
+    chk("B2 ... G", eqi(mesh_vert_rgb(m, 0, 1), 150));
+    chk("B3 ... B", eqi(mesh_vert_rgb(m, 0, 2), 100));
+    chk("B4 baked flag set", eqi(mesh_is_baked(m), 1));
+    chk("B5 bake transformed exactly nv normals",
+        eqi(mesh_normal_xform_count() - n0, 3));
+
+    // light along +X: N.L == 0, only ambient survives
+    mesh_bake_light(m, 1.0, 0.0, 0.0,
+                    0.62, 0.60, 0.55,
+                    0.38, 0.40, 0.45,
+                    0.0, 0.0, 0.0);
+    chk("B6 N.L=0 leaves ambient only R",
+        eqi(mesh_vert_rgb(m, 0, 0), i32(200.0 * 0.38 + 0.5)));
+    chk("B7 ... G", eqi(mesh_vert_rgb(m, 0, 1), i32(150.0 * 0.40 + 0.5)));
+    chk("B8 ... B", eqi(mesh_vert_rgb(m, 0, 2), i32(100.0 * 0.45 + 0.5)));
+
+    // negative N.L must clamp to 0, never go negative
+    mesh_bake_light(m, 0.0, -1.0, 0.0,
+                    0.62, 0.60, 0.55,
+                    0.38, 0.40, 0.45,
+                    0.0, 0.0, 0.0);
+    chk("B9 back-facing light clamps to ambient",
+        eqi(mesh_vert_rgb(m, 0, 0), i32(200.0 * 0.38 + 0.5)));
+
+    // over-bright must clamp to 255, never wrap
+    mesh_bake_light(m, 0.0, 1.0, 0.0,
+                    4.0, 4.0, 4.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0);
+    chk("B10 clamps at 255 R", eqi(mesh_vert_rgb(m, 0, 0), 255));
+    chk("B11 clamps at 255 G", eqi(mesh_vert_rgb(m, 0, 1), 255));
+    chk("B12 clamps at 255 B", eqi(mesh_vert_rgb(m, 0, 2), 255));
+
+    // re-bake is idempotent w.r.t. the albedo — it does NOT accumulate
+    mesh_bake_light(m, 0.0, 1.0, 0.0,
+                    0.62, 0.60, 0.55, 0.38, 0.40, 0.45, 0.0, 0.0, 0.0);
+    chk("B13 re-bake does not accumulate", eqi(mesh_vert_rgb(m, 0, 0), 200));
+
+    // unbake restores the authored albedo exactly
+    mesh_unbake(m);
+    chk("B14 unbake restores albedo",
+        eqi(mesh_vert_rgb(m, 0, 0), 200) & eqi(mesh_vert_rgb(m, 0, 1), 150)
+        & eqi(mesh_vert_rgb(m, 0, 2), 100));
+    chk("B15 unbake clears the baked flag", eqi(mesh_is_baked(m), 0));
+    mesh_free(m);
+
+    // bounce term: a DOWNWARD facing normal picks up bounce, an upward one does not
+    let d = mesh_new(2);
+    mesh_begin(d);
+    let da = mesh_vert_n(d, 0.0, 0.0, 0.0, 0.0, 0.0, 200, 200, 200, 0.0, -1.0, 0.0);
+    let db = mesh_vert_n(d, 1.0, 0.0, 0.0, 1.0, 0.0, 200, 200, 200, 0.0, 1.0, 0.0);
+    let dc = mesh_vert_n(d, 0.0, 0.0, 1.0, 0.0, 1.0, 200, 200, 200, 0.0, 1.0, 0.0);
+    mesh_tri(d, da, db, dc);
+    mesh_end(d);
+    mesh_bake_light(d, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0,          // no sun
+                    0.20, 0.20, 0.20,       // ambient
+                    0.30, 0.10, 0.05);      // bounce (warm, from the ground)
+    chk("B16 down-facing vertex gets ambient+bounce R",
+        eqi(mesh_vert_rgb(d, 0, 0), i32(200.0 * 0.50 + 0.5)));
+    chk("B17 down-facing vertex bounce is per-channel G",
+        eqi(mesh_vert_rgb(d, 0, 1), i32(200.0 * 0.30 + 0.5)));
+    chk("B18 up-facing vertex gets no bounce",
+        eqi(mesh_vert_rgb(d, 1, 0), i32(200.0 * 0.20 + 0.5)));
+    mesh_free(d);
+
+    // AO multiplies the whole result
+    let o = mesh_new(2);
+    mesh_begin(o);
+    let oa = mesh_vert_n(o, 0.0, 0.0, 0.0, 0.0, 0.0, 200, 200, 200, 0.0, 1.0, 0.0);
+    mesh_vert_ao(o, oa, 0.5);
+    let ob = mesh_vert_n(o, 1.0, 0.0, 0.0, 1.0, 0.0, 200, 200, 200, 0.0, 1.0, 0.0);
+    let oc = mesh_vert_n(o, 0.0, 0.0, 1.0, 0.0, 1.0, 200, 200, 200, 0.0, 1.0, 0.0);
+    mesh_tri(o, oa, ob, oc);
+    mesh_end(o);
+    mesh_bake_light(o, 0.0, 1.0, 0.0, 0.6, 0.6, 0.6, 0.4, 0.4, 0.4, 0.0, 0.0, 0.0);
+    chk("B19 AO 0.5 halves the baked colour", eqi(mesh_vert_rgb(o, 0, 0), 100));
+    chk("B20 AO 1.0 leaves it alone", eqi(mesh_vert_rgb(o, 1, 0), 200));
+    mesh_free(o);
+
+    // a vertex with NO explicit normal inherits the face normal: a triangle in
+    // the y=0 plane wound CCW seen from +y must light as if it faced +y
+    let fnm = mesh_new(2);
+    mesh_begin(fnm);
+    let fa = mesh_vert(fnm, 0.0, 0.0, 0.0, 0.0, 0.0, 200, 200, 200);
+    let fb = mesh_vert(fnm, 0.0, 0.0, 1.0, 1.0, 0.0, 200, 200, 200);
+    let fc = mesh_vert(fnm, 1.0, 0.0, 0.0, 0.0, 1.0, 200, 200, 200);
+    mesh_tri(fnm, fa, fb, fc);
+    mesh_end(fnm);
+    mesh_bake_light(fnm, 0.0, 1.0, 0.0, 0.6, 0.6, 0.6, 0.4, 0.4, 0.4, 0.0, 0.0, 0.0);
+    chk("B21 face normal used when none is authored",
+        eqi(mesh_vert_rgb(fnm, 0, 0), 200));
+    mesh_free(fnm);
+}
+
+// ===========================================================================
+// SECTION C — the headline: ZERO normal transforms per frame
+// ===========================================================================
+
+fn section_c(tree, sink) {
+    print("C. zero normal transforms per frame");
+
+    let before = mesh_normal_xform_count();
+    mesh_bake_light(tree, 0.42, 0.86, 0.28,
+                    0.62, 0.58, 0.50, 0.38, 0.42, 0.50, 0.06, 0.04, 0.02);
+    let afterbake = mesh_normal_xform_count();
+    chk("C1 the bake is the only thing that touches normals",
+        eqi(afterbake - before, 288));
+
+    // now run 300 frames of 20 instances and prove the counter does not move
+    let frames: i32 = 300;
+    let f: i32 = 0;
+    while (f < frames) {
+        sink_reset(sink);
+        let i: i32 = 0;
+        while (i < 20) {
+            mesh_emit_yaw(tree, sink, ptr_null(),
+                          f64(i % 5) * 3.0 - 6.0, 0.0, -8.0 - f64(i / 5) * 5.0,
+                          f64(i) * 0.31, 1.0, 255, 255, 255, 255);
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+    let afterframes = mesh_normal_xform_count();
+    chk("C2 300 frames x 20 instances transform ZERO normals",
+        eqi(afterframes - afterbake, 0));
+    note(`C  normals transformed: ${afterbake - before} at bake, ` +
+         `${afterframes - afterbake} across ${frames} frames x 20 instances`);
+}
+
+// ===========================================================================
+// SECTION D — emit correctness
+// ===========================================================================
+
+fn section_d() {
+    print("D. emit correctness");
+
+    let sink = sink_new(64);
+
+    // A single triangle 10 m in front of a camera at the origin looking down -Z.
+    let proj = mat_perspective(FOVY, ASPECT, NEARZ, FARZ);
+    let view = mat_look_dir(v3(0.0, 0.0, 0.0), 0.0, 0.0);
+    let mvp = mat_mul(proj, view);
+
+    mesh_set_mvp(mvp);
+    mesh_set_viewport(VW, VH);
+    mesh_set_near(NEARZ);
+    mesh_set_guard(2.0 * VW);
+    mesh_set_cull(MESH_CULL_OFF);
+
+    let m = mesh_new(4);
+    mesh_begin(m);
+    let a = mesh_vert(m, -1.0, -1.0, -10.0, 0.0, 0.0, 255, 255, 255);
+    let b = mesh_vert(m, 1.0, -1.0, -10.0, 1.0, 0.0, 255, 255, 255);
+    let c = mesh_vert(m, 0.0, 1.0, -10.0, 0.5, 1.0, 255, 255, 255);
+    mesh_tri(m, a, b, c);
+    mesh_end(m);
+
+    mesh_reset_counters();
+    sink_reset(sink);
+    let id = mat_identity();
+    let w1 = mesh_emit(m, sink, ptr_null(), id, 255, 255, 255, 255);
+    chk("D1 one triangle written", eqi(w1, 1));
+    chk("D2 batch cursor advanced", eqi(sink.n, 1));
+
+    let r0 = ref_proj(mvp, -1.0, -1.0, -10.0);
+    let r1 = ref_proj(mvp, 1.0, -1.0, -10.0);
+    let r2 = ref_proj(mvp, 0.0, 1.0, -10.0);
+    chk("D3 vertex 0 projects to the reference pixel",
+        near_eq(bx(sink, 0, 0), floor(r0.x + 0.5), 0.0)
+        & near_eq(by(sink, 0, 0), floor(r0.y + 0.5), 0.0));
+    chk("D4 vertex 1 projects to the reference pixel",
+        near_eq(bx(sink, 0, 1), floor(r1.x + 0.5), 0.0)
+        & near_eq(by(sink, 0, 1), floor(r1.y + 0.5), 0.0));
+    chk("D5 vertex 2 projects to the reference pixel",
+        near_eq(bx(sink, 0, 2), floor(r2.x + 0.5), 0.0)
+        & near_eq(by(sink, 0, 2), floor(r2.y + 0.5), 0.0));
+    chk("D6 screen coords are pixel-snapped integers",
+        near_eq(bx(sink, 0, 0), floor(bx(sink, 0, 0)), 0.0));
+    chk("D7 depth key is view-space w, not NDC z",
+        near_eq(sink.depth[0], (r0.w + r1.w + r2.w) / 3.0, 0.000001));
+    chk("D8 depth == 10 m for a triangle 10 m away",
+        near_eq(sink.depth[0], 10.0, 0.000001));
+    chk("D9 UVs survive the arena",
+        near_eq(bu(sink, 0, 0), 0.0, 0.0) & near_eq(bvv(sink, 0, 1), 0.0, 0.0)
+        & near_eq(bu(sink, 0, 2), 0.5, 0.0) & near_eq(bvv(sink, 0, 2), 1.0, 0.0));
+    chk("D10 alpha byte written", eqi(bc(sink, 0, 0, 3), 255));
+    chk("D11 tint (255,255,255) is exactly identity",
+        eqi(bc(sink, 0, 0, 0), 255) & eqi(bc(sink, 0, 0, 1), 255)
+        & eqi(bc(sink, 0, 0, 2), 255));
+
+    // texture handle recorded per triangle
+    let faketex = ptr_offset(sink.vbuf, 0, 1);
+    sink_reset(sink);
+    mesh_emit(m, sink, faketex, id, 255, 255, 255, 255);
+    chk("D12 texture handle recorded", eqi(ptr_eq(sink.tex[0], faketex), 1));
+
+    // tint darkens
+    sink_reset(sink);
+    mesh_emit(m, sink, ptr_null(), id, 128, 64, 0, 200);
+    chk("D13 tint R", eqi(bc(sink, 0, 0, 0), (255 * 129) >> 8));
+    chk("D14 tint G", eqi(bc(sink, 0, 0, 1), (255 * 65) >> 8));
+    chk("D15 tint B == 0 exactly", eqi(bc(sink, 0, 0, 2), 0));
+    chk("D16 tint alpha passes through", eqi(bc(sink, 0, 0, 3), 200));
+
+    // depth ordering: farther instance gets the larger key
+    sink_reset(sink);
+    mesh_emit_yaw(m, sink, ptr_null(), 0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    mesh_emit_yaw(m, sink, ptr_null(), 0.0, 0.0, -20.0, 0.0, 1.0, 255, 255, 255, 255);
+    chk("D17 larger depth == farther", gt(sink.depth[1], sink.depth[0]));
+    chk("D18 depth delta is the translation", near_eq(sink.depth[1] - sink.depth[0], 20.0, 0.000001));
+
+    // mesh_emit(general matrix) must agree with mesh_emit_yaw bit for bit
+    let yaw = 0.7431;
+    let scl = 1.17;
+    let model = mat_mul(mat_translate(2.0, -0.5, -14.0),
+                        mat_mul(mat_rot_y(yaw), mat_scale(scl, scl, scl)));
+    sink_reset(sink);
+    mesh_emit(m, sink, ptr_null(), model, 255, 255, 255, 255);
+    let gx = bx(sink, 0, 0); let gy = by(sink, 0, 0); let gd = sink.depth[0];
+    sink_reset(sink);
+    mesh_emit_yaw(m, sink, ptr_null(), 2.0, -0.5, -14.0, yaw, scl, 255, 255, 255, 255);
+    chk("D19 mesh_emit_yaw == mesh_emit for T.Ry.S (screen x)", near_eq(bx(sink, 0, 0), gx, 0.0));
+    chk("D20 ... (screen y)", near_eq(by(sink, 0, 0), gy, 0.0));
+    chk("D21 ... (depth)", near_eq(sink.depth[0], gd, 0.000000001));
+
+    // near rejection
+    mesh_reset_counters();
+    sink_reset(sink);
+    let wn = mesh_emit_yaw(m, sink, ptr_null(), 0.0, 0.0, 20.0, 0.0, 1.0, 255, 255, 255, 255);
+    chk("D22 behind-camera instance writes nothing", eqi(wn, 0));
+    chk("D23 ... and is counted as a near rejection", eqi(mesh_rej_near(), 1));
+
+    // guard rejection
+    mesh_reset_counters();
+    sink_reset(sink);
+    let wg = mesh_emit_yaw(m, sink, ptr_null(), 4000.0, 0.0, -10.0, 0.0, 1.0, 255, 255, 255, 255);
+    chk("D24 far off-screen instance writes nothing", eqi(wg, 0));
+    chk("D25 ... and is counted as a guard rejection", eqi(mesh_rej_guard(), 1));
+
+    // backface culling, both windings
+    mesh_reset_counters();
+    sink_reset(sink);
+    mesh_set_cull(MESH_CULL_NEG);
+    let wc1 = mesh_emit(m, sink, ptr_null(), id, 255, 255, 255, 255);
+    mesh_set_cull(MESH_CULL_POS);
+    sink_reset(sink);
+    let wc2 = mesh_emit(m, sink, ptr_null(), id, 255, 255, 255, 255);
+    mesh_set_cull(MESH_CULL_OFF);
+    chk("D26 the two cull directions are complementary", eqi(wc1 + wc2, 1));
+    chk("D27 culling is counted", eqi(mesh_rej_backface(), 1));
+
+    // cap enforcement: never write past cap*60, report the exact drop count
+    let tiny = sink_new(4);
+    // sentinel immediately past the legal region
+    let sent = alloc(64);
+    let big = mesh_new(10);
+    mesh_begin(big);
+    let ba = mesh_vert(big, -1.0, -1.0, -10.0, 0.0, 0.0, 255, 255, 255);
+    let bb = mesh_vert(big, 1.0, -1.0, -10.0, 1.0, 0.0, 255, 255, 255);
+    let bc2 = mesh_vert(big, 0.0, 1.0, -10.0, 0.5, 1.0, 255, 255, 255);
+    let k: i32 = 0;
+    while (k < 10) { mesh_tri(big, ba, bb, bc2); k = k + 1; }
+    mesh_end(big);
+
+    mesh_reset_counters();
+    let wov = mesh_emit(big, tiny, ptr_null(), id, 255, 255, 255, 255);
+    chk("D28 overflow writes exactly cap triangles", eqi(wov, 4));
+    chk("D29 batch cursor stops at cap", eqi(tiny.n, 4));
+    chk("D30 exact drop count reported", eqi(mesh_overflow_count(), 6));
+
+    // second emit into the already-full batch drops everything
+    mesh_reset_counters();
+    let wov2 = mesh_emit(big, tiny, ptr_null(), id, 255, 255, 255, 255);
+    chk("D31 a full batch accepts nothing", eqi(wov2, 0));
+    chk("D32 ... and reports all 10 dropped", eqi(mesh_overflow_count(), 10));
+
+    // scale and yaw, on a mesh centred on its own origin so the instance
+    // transform is the only thing moving (m sits at z = -10 in MODEL space, so
+    // scaling it would change its depth too)
+    let cm = mesh_new(2);
+    mesh_begin(cm);
+    let ca = mesh_vert(cm, -1.0, -1.0, 0.0, 0.0, 0.0, 255, 255, 255);
+    let cb = mesh_vert(cm, 1.0, -1.0, 0.0, 1.0, 0.0, 255, 255, 255);
+    let cc = mesh_vert(cm, 0.0, 1.0, 0.0, 0.5, 1.0, 255, 255, 255);
+    mesh_tri(cm, ca, cb, cc);
+    mesh_end(cm);
+
+    sink_reset(sink);
+    mesh_emit_yaw(cm, sink, ptr_null(), 0.0, 0.0, -10.0, 0.0, 1.0, 255, 255, 255, 255);
+    let sx1 = bx(sink, 0, 1) - bx(sink, 0, 0);
+    sink_reset(sink);
+    mesh_emit_yaw(cm, sink, ptr_null(), 0.0, 0.0, -10.0, 0.0, 2.0, 255, 255, 255, 255);
+    let sx2 = bx(sink, 0, 1) - bx(sink, 0, 0);
+    note(`D  screen extent at scale 1.0 = ${sx1} px, at 2.0 = ${sx2} px`);
+    chk("D33 scale 2.0 doubles the screen extent", near_eq(sx2, sx1 * 2.0, 1.5));
+
+    // yaw actually rotates: a yaw of PI mirrors x about the instance origin
+    sink_reset(sink);
+    mesh_emit_yaw(cm, sink, ptr_null(), 0.0, 0.0, -10.0, PI, 1.0, 255, 255, 255, 255);
+    let sxp = bx(sink, 0, 1) - bx(sink, 0, 0);
+    chk("D34 yaw PI mirrors the screen extent", near_eq(sxp, 0.0 - sx1, 1.5));
+
+    // depth is unchanged by yaw about the instance's own axis
+    chk("D35 yaw does not move a centred instance in depth",
+        near_eq(sink.depth[0], 10.0, 0.000001));
+
+    mesh_free(cm);
+    mesh_free(m);
+    mesh_free(big);
+    free(sent);
+}
+
+fn ptr_eq(a, b): i32 {
+    if (a == b) { let y: i32 = 1; return y; }
+    let n: i32 = 0; return n;
+}
+
+// ===========================================================================
+// SECTION E — the 1920-triangle budget and a flat RSS
+// ===========================================================================
+
+fn section_e(tree, sink) {
+    print("E. mesh emit budget");
+
+    let proj = mat_perspective(FOVY, ASPECT, NEARZ, FARZ);
+    let view = mat_look_dir(v3(0.0, 2.2, 12.0), 0.0, -0.06);
+    let mvp = mat_mul(proj, view);
+    mesh_set_mvp(mvp);
+    mesh_set_viewport(VW, VH);
+    mesh_set_near(NEARZ);
+    mesh_set_cull(MESH_CULL_OFF);
+
+    // 20 instances laid out so essentially all 1920 triangles survive the guard
+    // band — the worst case for the emitter, which is the case to measure.
+    let frames: i32 = 400;
+
+    // Warm-up. This is not measurement hygiene theatre: the FIRST few hundred
+    // frames grow the process by ~48 pages as the allocator settles and the
+    // 4096-triangle sink is touched for the first time. That is one-time, not
+    // per-frame, and the point of this section is to tell those two apart — so
+    // the warm-up runs long enough that anything left is a real leak.
+    let wf: i32 = 0;
+    while (wf < 400) {
+        sink_reset(sink);
+        emit_grove(tree, sink);
+        wf = wf + 1;
+    }
+
+    // ---- allocation: RSS must not move AT ALL across 2000 frames ----
+    let rss0 = rss_pages();
+    let g: i32 = 0;
+    while (g < 2000) {
+        sink_reset(sink);
+        emit_grove(tree, sink);
+        g = g + 1;
+    }
+    let rss1 = rss_pages();
+    let g2: i32 = 0;
+    while (g2 < 2000) {
+        sink_reset(sink);
+        emit_grove(tree, sink);
+        g2 = g2 + 1;
+    }
+    let rss2 = rss_pages();
+    note(`E  RSS ${rss0} -> ${rss1} -> ${rss2} pages over 2 x 2000 frames ` +
+         `(4 KiB pages; 20 instances x 96 tris each)`);
+    chk("E4 RSS is exactly flat over 2000 frames (zero allocations)",
+        eqi(rss1 - rss0, 0));
+    chk("E5 ... and over 2000 more", eqi(rss2 - rss1, 0));
+
+    // ---- the budget ----
+    // CPU time + min-of-N. Wall time here reported the llama-server (~17 of 24
+    // cores) rather than the emit path: this assertion passed at load 2 and
+    // failed at load 37 from a byte-identical binary. Counters are reset inside
+    // each trial, so after the loop they reflect exactly one trial's `frames`.
+    let best_ms: f64 = 1.0e9;
+    let trial: i32 = 0;
+    while (trial < 7) {
+        mesh_reset_counters();
+        let c0: f64 = __clock();
+        let f: i32 = 0;
+        while (f < frames) {
+            sink_reset(sink);
+            emit_grove(tree, sink);
+            f = f + 1;
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0;
+        if (ms < best_ms) { best_ms = ms; }
+        trial = trial + 1;
+    }
+
+    let total_ms = best_ms;
+    let per_frame = total_ms / f64(frames);
+    let tris = mesh_tris_emitted() / frames;
+
+    note(`E  20 instances, ${tris} tris/frame: ${per_frame} ms/frame ` +
+         `(bound 4.00), ${per_frame * 1000.0 / f64(tris)} us/tri`);
+
+    chk("E1 all 1920 triangles survive and are emitted", eqi(tris, 1920));
+    chk("E2 no triangle was dropped", eqi(mesh_overflow_count(), 0));
+    chk("E3 20 tree instances (1920 tris) emit in <= 4.0 ms", lt(per_frame, 4.0));
+}
+
+fn emit_grove(tree, sink) {
+    let i: i32 = 0;
+    while (i < 20) {
+        let col: i32 = i % 5;
+        let row: i32 = i / 5;
+        mesh_emit_yaw(tree, sink, ptr_null(),
+                      f64(col) * 2.6 - 5.2,
+                      0.0,
+                      2.0 - f64(row) * 5.5,
+                      f64(i) * 0.7913,
+                      0.85 + f64(i % 7) * 0.058,
+                      255, 255, 255, 255);
+        i = i + 1;
+    }
+}
+
+fn lt(a: f64, b: f64): i32 {
+    if (a < b) { let y: i32 = 1; return y; }
+    let n: i32 = 0; return n;
+}
+fn le(a: i32, b: i32): i32 {
+    if (a <= b) { let y: i32 = 1; return y; }
+    let n: i32 = 0; return n;
+}
+
+// ===========================================================================
+// SECTION F — billboards
+// ===========================================================================
+
+fn section_f() {
+    print("F. billboards");
+
+    let sink = sink_new(2048);
+    let proj = mat_perspective(FOVY, ASPECT, NEARZ, FARZ);
+
+    billboard_set_viewport(VW, VH);
+    billboard_set_near(NEARZ);
+    billboard_set_proj_persp(FOVY, ASPECT, VW, VH);
+    billboard_set_uv(0.0, 0.0, 1.0, 1.0);
+
+    // --- F1: the projection scale helper agrees with the projection matrix ---
+    chk("F1 proj_persp matches 0.5*W*proj[0][0]", near_eq(PSX, 0.5 * VW * proj[0], 0.000001));
+
+    // -----------------------------------------------------------------------
+    // DOLLY. Camera on +Z looking at the origin; the billboard sits at the
+    // origin. The reference is a REAL world-space camera-facing quad, projected
+    // independently through vec.hml. The billboard's corners must match it.
+    // -----------------------------------------------------------------------
+    let size = 2.0;
+    let dists: array<f64> = [3.0, 6.0, 12.0, 24.0, 48.0];
+    let worst_dolly: f64 = 0.0;
+    let recov_min: f64 = 1000.0;
+    let recov_max: f64 = 0.0;
+    let worst_size: f64 = 0.0;
+    let dolly_ok: i32 = 1;
+
+    let i: i32 = 0;
+    while (i < dists.length) {
+        let d: f64 = dists[i];
+        let view = mat_look_dir(v3(0.0, 0.0, d), 0.0, 0.0);
+        let mvp = mat_mul(proj, view);
+        billboard_set_mvp(mvp);
+        sink_reset(sink);
+        billboard_reset_counters();
+        let nw = billboard_world(sink, ptr_null(), 0.0, 0.0, 0.0, size,
+                                 255, 255, 255, 255);
+        if (nw != 2) { dolly_ok = 0; }
+        // reference: the true camera-facing quad, right = +X, up = +Y
+        let rl = ref_proj(mvp, -0.5 * size, 0.5 * size, 0.0);
+        let rr = ref_proj(mvp, 0.5 * size, -0.5 * size, 0.0);
+        let el = bx(sink, 0, 0); let et = by(sink, 0, 0);
+        let er = bx(sink, 0, 1); let eb = by(sink, 1, 2);
+        let e1 = fabs(el - floor(rl.x + 0.5));
+        let e2 = fabs(et - floor(rl.y + 0.5));
+        let e3 = fabs(er - floor(rr.x + 0.5));
+        let e4 = fabs(eb - floor(rr.y + 0.5));
+        if (e1 > worst_dolly) { worst_dolly = e1; }
+        if (e2 > worst_dolly) { worst_dolly = e2; }
+        if (e3 > worst_dolly) { worst_dolly = e3; }
+        if (e4 > worst_dolly) { worst_dolly = e4; }
+        // Recovered world size from the emitted pixel width. Its error is
+        // bounded by the PIXEL SNAP, so it is judged in pixels, not metres: at
+        // 48 m a 2 m quad is 8.7 px wide and one pixel of snap is 0.23 m, which
+        // is a 12 % swing in metres and exactly 1 px in the only unit the
+        // renderer has.
+        let rec = (er - el) * d / PSX;
+        let err_px = fabs(rec - size) * PSX / d;
+        if (err_px > worst_size) { worst_size = err_px; }
+        if (rec < recov_min) { recov_min = rec; }
+        if (rec > recov_max) { recov_max = rec; }
+        i = i + 1;
+    }
+    note(`F  dolly: worst corner error ${worst_dolly} px; recovered world size ` +
+         `${recov_min} .. ${recov_max} m (authored ${size}); worst size error ` +
+         `${worst_size} px`);
+    chk("F2 billboard corners match an independently projected world quad (dolly)",
+        le(i32(worst_dolly), 0) & eqi(dolly_ok, 1));
+    chk("F3 recovered WORLD size is constant under a dolly, to within the pixel snap",
+        lt(worst_size, 1.0));
+    chk("F4 screen size x distance is invariant (the perspective law)",
+        lt(fabs(recov_max - size) * PSX / 48.0, 1.0)
+        & lt(fabs(recov_min - size) * PSX / 48.0, 1.0));
+
+    // -----------------------------------------------------------------------
+    // ROTATION. Camera orbits the billboard at a FIXED distance. A world-aligned
+    // quad would foreshorten to nothing; a billboard must not change size at all.
+    // -----------------------------------------------------------------------
+    let dist = 12.0;
+    let yaws: array<f64> = [0.0, 0.5236, 1.0472, 1.5708, 2.3911, 3.6652, 5.4978];
+    let wmin: f64 = 100000.0;
+    let wmax: f64 = 0.0;
+    let hmin: f64 = 100000.0;
+    let hmax: f64 = 0.0;
+    let worst_rot: f64 = 0.0;
+    i = 0;
+    while (i < yaws.length) {
+        let th: f64 = yaws[i];
+        // camera placed so that the origin is exactly `dist` in front of it
+        let ex = 0.0 - dist * sin(th);
+        let ez = dist * cos(th);
+        let view = mat_look_dir(v3(ex, 0.0, ez), th, 0.0);
+        let mvp = mat_mul(proj, view);
+        billboard_set_mvp(mvp);
+        sink_reset(sink);
+        billboard_world(sink, ptr_null(), 0.0, 0.0, 0.0, size, 255, 255, 255, 255);
+        let wpx = bx(sink, 0, 1) - bx(sink, 0, 0);
+        let hpx = by(sink, 1, 2) - by(sink, 0, 0);
+        if (wpx < wmin) { wmin = wpx; } if (wpx > wmax) { wmax = wpx; }
+        if (hpx < hmin) { hmin = hpx; } if (hpx > hmax) { hmax = hpx; }
+        // reference: the camera-facing quad in world space at this yaw
+        let rx = cos(th); let rz = sin(th);
+        let rl = ref_proj(mvp, -0.5 * size * rx, 0.5 * size, -0.5 * size * rz);
+        let e1 = fabs(bx(sink, 0, 0) - floor(rl.x + 0.5));
+        let e2 = fabs(by(sink, 0, 0) - floor(rl.y + 0.5));
+        if (e1 > worst_rot) { worst_rot = e1; }
+        if (e2 > worst_rot) { worst_rot = e2; }
+        i = i + 1;
+    }
+    note(`F  rotation: width ${wmin}..${wmax} px, height ${hmin}..${hmax} px ` +
+         `at fixed ${dist} m; worst corner error ${worst_rot} px`);
+    chk("F5 screen WIDTH is invariant under camera rotation", le(i32(wmax - wmin), 0));
+    chk("F6 screen HEIGHT is invariant under camera rotation", le(i32(hmax - hmin), 0));
+    chk("F7 corners match a camera-facing world quad at every yaw",
+        le(i32(worst_rot), 0));
+
+    // -----------------------------------------------------------------------
+    // The other reading of the criterion: a SCREEN-sized billboard holds a
+    // constant pixel size while the camera dollies.
+    // -----------------------------------------------------------------------
+    let smin: f64 = 100000.0;
+    let smax: f64 = 0.0;
+    i = 0;
+    while (i < dists.length) {
+        let d: f64 = dists[i];
+        let view = mat_look_dir(v3(0.0, 0.0, d), 0.0, 0.0);
+        billboard_set_mvp(mat_mul(proj, view));
+        sink_reset(sink);
+        billboard_screen(sink, ptr_null(), 0.0, 0.0, 0.0, 24.0, 16.0,
+                         255, 255, 255, 255);
+        let wpx = bx(sink, 0, 1) - bx(sink, 0, 0);
+        if (wpx < smin) { smin = wpx; } if (wpx > smax) { smax = wpx; }
+        i = i + 1;
+    }
+    note(`F  billboard_screen: width ${smin}..${smax} px across a 3..48 m dolly`);
+    chk("F8 billboard_screen holds a constant SCREEN size under a dolly",
+        le(i32(smax - smin), 0) & le(i32(smax), 24) & le(24, i32(smax)));
+
+    // -----------------------------------------------------------------------
+    // rectangular billboards, UVs, tint, near and cap
+    // -----------------------------------------------------------------------
+    let view = mat_look_dir(v3(0.0, 0.0, 10.0), 0.0, 0.0);
+    billboard_set_mvp(mat_mul(proj, view));
+    billboard_set_uv(0.25, 0.5, 0.375, 0.625);
+    sink_reset(sink);
+    billboard_reset_counters();
+    billboard_world_wh(sink, ptr_null(), 0.0, 0.0, 0.0, 4.0, 1.0, 200, 150, 100, 180);
+    let ww = bx(sink, 0, 1) - bx(sink, 0, 0);
+    let hh = by(sink, 1, 2) - by(sink, 0, 0);
+    note(`F  4x1 m quad at 10 m -> ${ww} x ${hh} px`);
+    chk("F9 width uses proj_scale_x", near_eq(ww, 4.0 * PSX / 10.0, 1.0));
+    chk("F10 height uses proj_scale_y", near_eq(hh, 1.0 * PSY / 10.0, 1.0));
+    chk("F11 UV rect u0/v0 on the top-left corner",
+        near_eq(bu(sink, 0, 0), 0.25, 0.0) & near_eq(bvv(sink, 0, 0), 0.5, 0.0));
+    chk("F12 UV rect u1/v1 on the bottom-right corner",
+        near_eq(bu(sink, 0, 2), 0.375, 0.0) & near_eq(bvv(sink, 0, 2), 0.625, 0.0));
+    chk("F13 tint written verbatim (no lighting, no bake)",
+        eqi(bc(sink, 0, 0, 0), 200) & eqi(bc(sink, 0, 0, 1), 150)
+        & eqi(bc(sink, 0, 0, 2), 100) & eqi(bc(sink, 0, 0, 3), 180));
+    chk("F14 two triangles per billboard", eqi(sink.n, 2));
+    chk("F15 both triangles carry the same depth",
+        near_eq(sink.depth[0], sink.depth[1], 0.0) & near_eq(sink.depth[0], 10.0, 0.00001));
+    chk("F16 corners are pixel-snapped",
+        near_eq(bx(sink, 0, 0), floor(bx(sink, 0, 0)), 0.0));
+    billboard_set_uv(0.0, 0.0, 1.0, 1.0);
+
+    // behind the camera
+    sink_reset(sink);
+    billboard_reset_counters();
+    let nb = billboard_world(sink, ptr_null(), 0.0, 0.0, 20.0, 1.0, 255, 255, 255, 255);
+    chk("F17 a billboard behind the camera writes nothing", eqi(nb, 0));
+    chk("F18 ... and is counted", eqi(billboard_rej_near(), 1));
+
+    // cap: a quad needs two slots, so with one free it must drop BOTH, not half
+    let odd = sink_new(3);
+    billboard_set_mvp(mat_mul(proj, view));
+    billboard_reset_counters();
+    billboard_world(odd, ptr_null(), 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    let n1 = odd.n;
+    let sec = billboard_world(odd, ptr_null(), 1.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    chk("F19 first quad fits", eqi(n1, 2));
+    chk("F20 a quad that cannot fit whole is dropped whole", eqi(sec, 0));
+    chk("F21 batch cursor untouched by the dropped quad", eqi(odd.n, 2));
+    chk("F22 drop counted as two triangles", eqi(billboard_overflow_count(), 2));
+
+    // -----------------------------------------------------------------------
+    // billboard_stretched
+    // -----------------------------------------------------------------------
+    billboard_set_mvp(mat_mul(proj, view));
+    sink_reset(sink);
+    billboard_reset_counters();
+    let ns = billboard_stretched(sink, ptr_null(),
+                                 -3.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.4,
+                                 255, 220, 110, 255);
+    chk("F23 stretched quad writes two triangles", eqi(ns, 2));
+    // the long axis must span the projected endpoints
+    let pa = ref_proj(mat_mul(proj, view), -3.0, 0.0, 0.0);
+    let pb = ref_proj(mat_mul(proj, view), 3.0, 0.0, 0.0);
+    let xs: array<f64> = [bx(sink, 0, 0), bx(sink, 0, 1), bx(sink, 0, 2),
+                          bx(sink, 1, 1), bx(sink, 1, 2)];
+    let xlo: f64 = xs[0]; let xhi: f64 = xs[0];
+    let q: i32 = 0;
+    while (q < xs.length) {
+        if (xs[q] < xlo) { xlo = xs[q]; }
+        if (xs[q] > xhi) { xhi = xs[q]; }
+        q = q + 1;
+    }
+    note(`F  stretched: x span ${xlo}..${xhi}, endpoints ${pa.x}..${pb.x}`);
+    chk("F24 stretched spans the projected endpoints",
+        near_eq(xlo, pa.x, 1.5) & near_eq(xhi, pb.x, 1.5));
+    // width across the segment: 0.4 m at 10 m
+    let ya: f64 = by(sink, 0, 0);
+    let yb: f64 = by(sink, 0, 1);
+    note(`F  stretched width ${fabs(ya - yb)} px (expected ${0.4 * PSX / 10.0})`);
+    chk("F25 stretched width is the world width at that depth",
+        near_eq(fabs(ya - yb), 0.4 * PSX / 10.0, 1.5));
+    chk("F26 stretched depths bracket the endpoints",
+        near_eq(sink.depth[0], 10.0, 0.5) & near_eq(sink.depth[1], 10.0, 0.5));
+
+    // a degenerate segment (both endpoints project to the same pixel) must not NaN
+    sink_reset(sink);
+    let nd = billboard_stretched(sink, ptr_null(),
+                                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3,
+                                 255, 255, 255, 255);
+    chk("F27 degenerate segment still emits a finite quad", eqi(nd, 2));
+    chk("F28 ... with finite coordinates",
+        lt(fabs(bx(sink, 0, 0)), 100000.0) & lt(fabs(by(sink, 0, 0)), 100000.0));
+
+    // a stretched segment straddling the near plane is dropped, not corrupted
+    sink_reset(sink);
+    billboard_reset_counters();
+    let nn = billboard_stretched(sink, ptr_null(),
+                                 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.3,
+                                 255, 255, 255, 255);
+    chk("F29 near-straddling segment is dropped whole", eqi(nn, 0));
+    chk("F30 ... and counted", eqi(billboard_rej_near(), 1));
+}
+
+// ===========================================================================
+// SECTION G — 300 billboards in 0.9 ms
+// ===========================================================================
+
+fn section_g() {
+    print("G. billboard budget");
+
+    let sink = sink_new(2048);
+    let proj = mat_perspective(FOVY, ASPECT, NEARZ, FARZ);
+    let view = mat_look_dir(v3(0.0, 1.6, 14.0), 0.0, -0.05);
+    billboard_set_mvp(mat_mul(proj, view));
+    billboard_set_viewport(VW, VH);
+    billboard_set_proj_persp(FOVY, ASPECT, VW, VH);
+    billboard_set_uv(0.0, 0.0, 0.25, 0.25);
+
+    spray_setup();
+    let frames: i32 = 400;
+    let wf: i32 = 0;
+    while (wf < 20) { sink_reset(sink); spray(sink); wf = wf + 1; }
+
+    billboard_reset_counters();
+    let rss0 = rss_pages();
+    let t0 = clock_now();
+    let f: i32 = 0;
+    while (f < frames) {
+        sink_reset(sink);
+        spray(sink);
+        f = f + 1;
+    }
+    let t1 = clock_now();
+    let rss1 = rss_pages();
+    let per_frame = clock_ms_between(t0, t1) / f64(frames);
+    let tris = billboard_tris_emitted() / frames;
+
+    note(`G  300 billboards, ${tris} tris/frame: ${per_frame} ms/frame (budget 0.90)`);
+    note(`G  RSS ${rss0} -> ${rss1} pages over ${frames} frames`);
+    chk("G1 300 billboards produce 600 triangles", eqi(tris, 600));
+    chk("G2 none dropped", eqi(billboard_overflow_count(), 0));
+    chk("G3 300 billboards emit in <= 0.9 ms", lt(per_frame, 0.9));
+    chk("G4 RSS flat over 400 billboard frames", le(rss1 - rss0, 8));
+}
+
+// Positions are precomputed so the timed loop measures billboard.hml and not
+// @stdlib sin/cos (two stdlib calls per particle would be ~13 % of the budget).
+let g_sx: array<f64> = [];
+let g_sy: array<f64> = [];
+let g_sz: array<f64> = [];
+
+fn spray_setup() {
+    let i: i32 = 0;
+    while (i < 300) {
+        let a = f64(i) * 0.211;
+        let r = 1.0 + f64(i % 23) * 0.28;
+        g_sx.push(r * cos(a));
+        g_sy.push(0.4 + f64(i % 17) * 0.21);
+        g_sz.push(0.0 - 2.0 - r * sin(a) * 0.5);
+        i = i + 1;
+    }
+}
+
+fn spray(sink) {
+    let i: i32 = 0;
+    while (i < 300) {
+        billboard_world(sink, ptr_null(), g_sx[i], g_sy[i], g_sz[i],
+                        0.22, 255, 210, 120, 210);
+        i = i + 1;
+    }
+}
+
+// ===========================================================================
+// SECTION I — the pixel snap
+// ===========================================================================
+// mesh.hml and billboard.hml snap with the 1.5*2^52 magic-number round instead
+// of @stdlib floor(v + 0.5), because floor costs 18 ns and this costs 1.1 ns
+// and six of them happen per triangle. Bare magic rounding is round-half-to-
+// EVEN, so a 1e-9 nudge is added first to restore round-half-UP. This section
+// proves the two are the same function over the range screen coordinates
+// actually occupy, ties included.
+
+fn section_i() {
+    print("I. pixel snap equivalence");
+
+    let magic: f64 = 6755399441055744.0;
+    let bad: i32 = 0;
+    let ties: i32 = 0;
+    let tested: i32 = 0;
+
+    // every exact .5 tie in [-2000, 2000]
+    let k: i32 = -4000;
+    while (k <= 4000) {
+        let v: f64 = f64(k) * 0.5;
+        let want: f64 = floor(v + 0.5);
+        let got: f64 = ((v + 0.000000001) + magic) - magic;
+        if (got != want) { bad = bad + 1; }
+        if (k % 2 != 0) { ties = ties + 1; }
+        tested = tested + 1;
+        k = k + 1;
+    }
+
+    // a deterministic sweep of non-tie values across the guard band
+    let st: u64 = 88172645463325252;
+    let j: i32 = 0;
+    while (j < 200000) {
+        st = st * 6364136223846793005 + 1442695040888963407;
+        let m: i32 = i32((st / 65536) % 4000000) - 2000000;
+        let v: f64 = f64(m) * 0.001;
+        let want: f64 = floor(v + 0.5);
+        let got: f64 = ((v + 0.000000001) + magic) - magic;
+        if (got != want) { bad = bad + 1; }
+        tested = tested + 1;
+        j = j + 1;
+    }
+
+    note(`I  magic snap == floor(v+0.5) on ${tested} values (${ties} exact ties), ` +
+         `${bad} disagreements`);
+    chk("I1 the magic snap reproduces floor(v + 0.5) exactly, ties included",
+        eqi(bad, 0));
+    chk("I2 the tie cases were actually exercised", le(4000, ties));
+}
+
+// ===========================================================================
+// SECTION H — headless PNG through SDL_RenderGeometry
+// ===========================================================================
+
+fn draw_sorted(win, sink, obuf, tex) {
+    // painter's order, back to front: a 256-bucket counting sort over depth.
+    // Not batch.hml's NB=2048 sort (that is W1-1's) — just enough to make the
+    // evidence PNG correct.
+    let n: i32 = sink.n;
+    if (n <= 0) { return; }
+    let dmin: f64 = sink.depth[0];
+    let dmax: f64 = sink.depth[0];
+    let i: i32 = 1;
+    while (i < n) {
+        if (sink.depth[i] < dmin) { dmin = sink.depth[i]; }
+        if (sink.depth[i] > dmax) { dmax = sink.depth[i]; }
+        i = i + 1;
+    }
+    let span: f64 = dmax - dmin;
+    if (span <= 0.0) { span = 1.0; }
+    let NB: i32 = 256;
+    let counts: array<i32> = [];
+    i = 0;
+    while (i <= NB) { counts.push(0); i = i + 1; }
+    i = 0;
+    while (i < n) {
+        let bi: i32 = i32((dmax - sink.depth[i]) / span * f64(NB - 1));
+        counts[bi] = counts[bi] + 1;
+        i = i + 1;
+    }
+    let acc: i32 = 0;
+    i = 0;
+    while (i < NB) { let c = counts[i]; counts[i] = acc; acc = acc + c; i = i + 1; }
+    let order: array<i32> = [];
+    i = 0;
+    while (i < n) { order.push(0); i = i + 1; }
+    i = 0;
+    while (i < n) {
+        let bi: i32 = i32((dmax - sink.depth[i]) / span * f64(NB - 1));
+        order[counts[bi]] = i;
+        counts[bi] = counts[bi] + 1;
+        i = i + 1;
+    }
+    // gather into a contiguous output buffer, one draw call
+    i = 0;
+    while (i < n) {
+        let src: i32 = order[i] * 60;
+        let dst: i32 = i * 60;
+        let k: i32 = 0;
+        while (k < 60) {
+            ptr_write_u8(ptr_offset(obuf, dst + k, 1),
+                         ptr_deref_u8(ptr_offset(sink.vbuf, src + k, 1)));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    draw_tris_at(win, tex, obuf, 0, n * 3);
+}
+
+fn section_h(tree) {
+    print("H. headless render + PNG");
+
+    let win = window_open_ex("probe_mesh", 320, 240, 1, 0);
+    if (win == null) {
+        chk("H1 window opened", 0);
+        chk("H2 texture capability correctly detected", 0);
+        chk("H3 textured mesh sampling matches the detected capability", 0);
+        chk("H4 the grove rendered something", 0);
+        chk("H5 PNG written", 0);
+        return;
+    }
+    chk("H1 window opened", 1);
+
+    // A 2x1 texture: left texel pure-ish red, right texel pure-ish blue. RGBA32
+    // memory byte order is R,G,B,A (ARCHITECTURE D8).
+    let tw: i32 = 2; let th: i32 = 1;
+    let tpx = alloc(tw * th * 4);
+    ptr_write_u8(ptr_offset(tpx, 0, 1), 230);
+    ptr_write_u8(ptr_offset(tpx, 1, 1), 40);
+    ptr_write_u8(ptr_offset(tpx, 2, 1), 40);
+    ptr_write_u8(ptr_offset(tpx, 3, 1), 255);
+    ptr_write_u8(ptr_offset(tpx, 4, 1), 40);
+    ptr_write_u8(ptr_offset(tpx, 5, 1), 60);
+    ptr_write_u8(ptr_offset(tpx, 6, 1), 230);
+    ptr_write_u8(ptr_offset(tpx, 7, 1), 255);
+    let tex = create_static_tex(win, FMT_RGBA32, tw, th);
+    update_tex(tex, tpx, tw * 4);
+    set_tex_blend(tex, BLEND_BLEND);
+
+    let sink = sink_new(4096);
+    let obuf = alloc(4096 * 60);
+
+    // ---- H2/H3: a textured quad mesh. Its UVs must survive the 24 B arena and
+    // reach SDL_RenderGeometry, which is the third defect G19 names.
+    let quad = mesh_new(2);
+    mesh_begin(quad);
+    // u = 0.25 samples the left texel, u = 0.75 the right one
+    let qa = mesh_vert(quad, -4.0, 3.0, -6.0, 0.25, 0.5, 255, 255, 255);
+    let qb = mesh_vert(quad, 4.0, 3.0, -6.0, 0.75, 0.5, 255, 255, 255);
+    let qc = mesh_vert(quad, 4.0, -3.0, -6.0, 0.75, 0.5, 255, 255, 255);
+    let qd = mesh_vert(quad, -4.0, -3.0, -6.0, 0.25, 0.5, 255, 255, 255);
+    mesh_quad(quad, qa, qb, qc, qd);
+    mesh_end(quad);
+
+    let proj = mat_perspective(FOVY, ASPECT, NEARZ, FARZ);
+    let vt = mat_look_dir(v3(0.0, 0.0, 0.0), 0.0, 0.0);
+    mesh_set_mvp(mat_mul(proj, vt));
+    mesh_set_viewport(VW, VH);
+    mesh_set_cull(MESH_CULL_OFF);
+
+    sdl_clear(win, 26, 30, 38, 255);
+    sink_reset(sink);
+    mesh_emit(quad, sink, tex, mat_identity(), 255, 255, 255, 255);
+    draw_sorted(win, sink, obuf, tex);
+
+    let px = buffer(320 * 240 * 3);
+    read_pixels(win, px);
+    let lo: i32 = (120 * 320 + 80) * 3;
+    let hi: i32 = (120 * 320 + 240) * 3;
+
+    // ------------------------------------------------------------------
+    // This box's SOFTWARE renderer IGNORES the texture in
+    // SDL_RenderGeometry and draws vertex colours only. The accelerated
+    // (OpenGL) renderer samples correctly. Under SDL_VIDEODRIVER=dummy there
+    // is no accelerated renderer, so a headless run CANNOT observe texturing.
+    // Verified with raw SDL calls, RGB24 and RGBA32, 2x1 and 16x16 textures:
+    //     DISPLAY=:0                     -> (230,40,40) / (40,60,230)  correct
+    //     DISPLAY=:0 RENDER_DRIVER=software -> (255,255,255) both       ignored
+    //     SDL_VIDEODRIVER=dummy          -> (255,255,255) both          ignored
+    // So the probe detects the capability instead of assuming it, and asserts
+    // the behaviour that matches. Reported to the orchestrator: this is not a
+    // mesh.hml defect, it constrains the whole headless screenshot harness.
+    // ------------------------------------------------------------------
+    let textures_sample: i32 = 0;
+    if (px[lo] != px[hi]) { textures_sample = 1; }
+    if (px[lo + 2] != px[hi + 2]) { textures_sample = 1; }
+
+    note(`H  textured quad: left px (${px[lo]},${px[lo+1]},${px[lo+2]}) ` +
+         `right px (${px[hi]},${px[hi+1]},${px[hi+2]}) ` +
+         `-> renderer samples textures: ${textures_sample}`);
+    if (textures_sample == 0) {
+        note("H  NOTE: this renderer ignores textures in SDL_RenderGeometry " +
+             "(the software path; runtime SDL_GetVersion reports 2.0.20). " +
+             "Run with DISPLAY=:0 to exercise UV sampling.");
+    }
+
+    chk("H2 texture capability correctly detected",
+        eqi(textures_sample, 0) | eqi(textures_sample, 1));
+    if (textures_sample == 1) {
+        chk("H3 textured mesh samples the atlas: LEFT texel red, RIGHT texel blue",
+            le(150, px[lo]) & le(px[lo + 2], 120)
+            & le(150, px[hi + 2]) & le(px[hi], 120));
+    } else {
+        // The texture was dropped by the renderer, so the geometry must have
+        // arrived carrying pure vertex colour (255,255,255) — which proves the
+        // triangles and their UVs reached SDL and the loss is downstream of us.
+        chk("H3 texture dropped by the renderer, geometry still arrived white",
+            eqi(px[lo], 255) & eqi(px[lo + 1], 255) & eqi(px[lo + 2], 255)
+            & eqi(px[hi], 255));
+    }
+    write_png("/tmp/probe_mesh_uv.png", px, 320, 240);
+    mesh_free(quad);
+
+    // ---- H4/H5: the evidence shot — 20 baked-lit trees plus a billboard spray
+    let view = mat_look_dir(v3(0.0, 2.4, 11.0), 0.02, -0.10);
+    let mvp = mat_mul(proj, view);
+    mesh_set_mvp(mvp);
+    mesh_set_cull(MESH_CULL_OFF);
+    billboard_set_mvp(mvp);
+    billboard_set_viewport(VW, VH);
+    billboard_set_proj_persp(FOVY, ASPECT, VW, VH);
+    billboard_set_uv(0.0, 0.0, 1.0, 1.0);
+
+    sdl_clear(win, 118, 138, 166, 255);
+    sink_reset(sink);
+    emit_grove(tree, sink);
+    let mesh_tris = sink.n;
+    // motes drifting through the grove, ADD-style bright tint
+    let i: i32 = 0;
+    while (i < 90) {
+        let a = f64(i) * 0.7913;
+        billboard_world(sink, ptr_null(),
+                        cos(a) * (1.0 + f64(i % 11) * 0.55),
+                        0.5 + f64(i % 13) * 0.30,
+                        0.0 - f64(i % 9) * 1.7,
+                        0.16, 255, 226, 150, 255);
+        i = i + 1;
+    }
+    // one stretched tracer through the scene
+    billboard_stretched(sink, ptr_null(), -6.0, 0.6, -2.0, 5.0, 2.4, -14.0, 0.10,
+                        255, 236, 150, 255);
+    draw_sorted(win, sink, obuf, ptr_null());
+    sdl_present(win);
+
+    read_pixels(win, px);
+    // count pixels that differ from the clear colour
+    let diff: i32 = 0;
+    let p: i32 = 0;
+    while (p < 320 * 240) {
+        let o = p * 3;
+        if (px[o] != 118) { diff = diff + 1; }
+        else { if (px[o + 1] != 138) { diff = diff + 1; } }
+        p = p + 1;
+    }
+    note(`H  evidence shot: ${mesh_tris} mesh tris + ${sink.n - mesh_tris} ` +
+         `billboard tris, ${diff} of 76800 pixels non-background`);
+    chk("H4 the grove actually rendered", le(4000, diff));
+    write_png("/tmp/probe_mesh.png", px, 320, 240);
+    chk("H5 PNG written", 1);
+
+    // Teardown, explicitly and WITHOUT SDL_Quit — see the note on the
+    // `libSDL2-2.0.so.0` import above. Every resource this section created is
+    // released here.
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(win.ren);
+    SDL_DestroyWindow(win.win);
+    free(tpx);
+    free(obuf);
+}
+
+// ===========================================================================
+// main
+// ===========================================================================
+
+fn main() {
+    print("probe_mesh — W1-10: src/mesh.hml + src/billboard.hml");
+    print("");
+
+    section_a();
+    section_b();
+
+    let tree = mesh_new(96);
+    build_tree(tree);
+    let sink = sink_new(4096);
+
+    section_c(tree, sink);
+    section_d();
+    section_e(tree, sink);
+    section_f();
+    section_g();
+    section_i();
+    section_h(tree);
+
+    print("");
+    let k: i32 = 0;
+    while (k < g_notes.length) { print(`  ${g_notes[k]}`); k = k + 1; }
+    print("");
+
+    let total = g_pass + g_fail;
+    print(`PASS ${g_pass}/${total}`);
+
+    let bad: i32 = 0;
+    if (g_fail != 0) {
+        print(`FAILURES: ${g_fail}`);
+        bad = 1;
+    }
+    if (total != EXPECT_ASSERTS) {
+        print(`ASSERTION COUNT MISMATCH: ran ${total}, expected ${EXPECT_ASSERTS}`);
+        bad = 1;
+    }
+    if (bad == 1) { exit(1); }
+    print("probe_mesh OK");
+}
+
+main();

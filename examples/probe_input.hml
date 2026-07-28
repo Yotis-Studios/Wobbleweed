@@ -1,0 +1,710 @@
+// probe_input.hml — the acceptance probe for W1-6 / ENGINE_GAPS G9
+// (src/input.hml: held / pressed / released edges, wheel, relative mouse
+// deltas, action map).
+//
+// Run it COMPILED. It must print `PASS n/n` and exit 0; it exits 1 on any
+// failed assertion AND on an assertion COUNT that does not match the expected
+// total, so a skipped branch cannot fake a green run.
+//
+//   HC=/home/nbeerbower/Projects/hemlock/hemlockc
+//   $HC -O1 examples/probe_input.hml -o /tmp/probe_input
+//   SDL_VIDEODRIVER=dummy /tmp/probe_input      # headless: relative mode FAILS,
+//                                               # and the probe renders anyway
+//   DISPLAY=:0 /tmp/probe_input                 # real display: relative mode
+//                                               # engages and the LIVE section runs
+//
+// -----------------------------------------------------------------------------
+// HOW EACH CRITERION IS PROVEN
+// -----------------------------------------------------------------------------
+// * Edge exactness is proven by SYNTHETIC EVENT INJECTION: the probe builds the
+//   flat [type, a, b] triples that sdl.hml's poll_events() writes and hands them
+//   to input_apply_events() directly. That works headless, is deterministic, and
+//   does not need a keyboard, a focus, or a human.
+// * The live relative delta is driven with XTestFakeMotionEvent, never with a
+//   pointer WARP. A warp produces xrel == 0 by design, so a warp-based test
+//   proves nothing at all. XTest injects motion at the X server as if the device
+//   had moved, which is the only way to see a real delta.
+// * The LIVE section runs only when relative mode actually engaged, so the
+//   headless run and the real-display run assert different totals — both of
+//   which are checked (EXPECTED_CORE and EXPECTED_CORE + EXPECTED_LIVE).
+//
+// The probe links libX11/libXtst for the injection. Both are present wherever a
+// real display is; the FFI is lazy (HEMLOCK_ISSUES H-8) so the headless run
+// never calls into either.
+
+import { exit } from "@stdlib/process";
+import {
+    window_open, window_close, sdl_clear, sdl_present, poll_events,
+    set_relative_mouse, rel_mouse_delta, show_cursor, sdl_error,
+    EV_QUIT, EV_KEYDOWN, EV_KEYUP,
+    EV_MOUSEBUTTONDOWN, EV_MOUSEBUTTONUP, EV_MOUSEWHEEL, EV_MOUSEMOTION,
+    SC_W, SC_A, SC_S, SC_D, SC_UP, SC_ESCAPE, SC_LSHIFT, SC_1
+} from "../src/sdl.hml";
+import { clock_now, clock_ms_between, clock_sleep_ms } from "../src/time.hml";
+import {
+    input_new, input_free, input_clear, input_begin_frame, input_apply_events,
+    input_feed_mouse, input_sample, input_sync_held,
+    input_down, input_pressed, input_released, input_repeated,
+    input_mouse_dx, input_mouse_dy, input_mouse_x, input_mouse_y,
+    input_button, input_button_pressed, input_button_released,
+    input_wheel, input_wheel_x, input_quit, input_clear_quit, input_event_count,
+    input_set_relative, input_relative, input_relative_status,
+    input_relative_error,
+    input_bind_key, input_bind_button, input_unbind, input_unbind_all,
+    input_bound_key, input_bound_button,
+    input_action_down, input_action_pressed, input_action_released, input_axis,
+    INPUT_MAX_SCANCODES, INPUT_MAX_BUTTONS, INPUT_MAX_EVENTS,
+    INPUT_MAX_ACTIONS, INPUT_BINDS_PER_ACTION,
+    INPUT_MB_LEFT, INPUT_MB_RIGHT, INPUT_MB_MIDDLE
+} from "../src/input.hml";
+
+// --- X11 + XTest, for the real-display live-delta section only --------------
+// `extern fn` binds to the MOST RECENTLY DECLARED import (HEMLOCK_ISSUES H-6),
+// so each library owns its own block.
+import "libX11.so.6";
+extern fn XOpenDisplay(name: ptr): ptr;
+extern fn XCloseDisplay(dpy: ptr): i32;
+extern fn XFlush(dpy: ptr): i32;
+
+import "libXtst.so.6";
+extern fn XTestFakeMotionEvent(dpy: ptr, screen: i32, x: i32, y: i32, delay: u64): i32;
+extern fn XTestFakeRelativeMotionEvent(dpy: ptr, dx: i32, dy: i32, delay: u64): i32;
+
+// ---------------------------------------------------------------------------
+// Assertion bookkeeping
+// ---------------------------------------------------------------------------
+
+let g_n: i32 = 0;
+let g_pass: i32 = 0;
+let g_live: i32 = 0;         // 1 if the XTest live section ran
+let g_notes: array = [];
+
+// The probe must run EXACTLY this many assertions. Both numerator and
+// denominator are checked, so a branch that quietly skipped half the file
+// cannot still print a green "PASS n/n". Update deliberately.
+let EXPECTED_CORE = 102;
+let EXPECTED_LIVE = 8;
+
+fn ok(name: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}`); }
+}
+
+fn eq(name: string, got, want) {
+    g_n = g_n + 1;
+    if (got == want) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}: got ${got}, want ${want}`); }
+}
+
+fn note(s: string) { g_notes.push(s); }
+
+// ---------------------------------------------------------------------------
+// Synthetic event queue — the exact flat layout sdl.hml poll_events() writes:
+// three i32 per event, [type, a, b].
+// ---------------------------------------------------------------------------
+
+let g_ev: array<i32> = [];
+
+fn ev_reset() { g_ev.clear(); }
+fn ev_push(t: i32, a: i32, b: i32) { g_ev.push(t); g_ev.push(a); g_ev.push(b); }
+fn ev_count(): i32 { return i32(g_ev.length) / 3; }
+
+// One synthetic frame: clear edges, deliver the queued events.
+fn frame(inp: object) {
+    input_begin_frame(inp);
+    input_apply_events(inp, g_ev, ev_count());
+    ev_reset();
+}
+
+// ---------------------------------------------------------------------------
+// 1. Construction and defaults
+// ---------------------------------------------------------------------------
+fn test_new(): object {
+    print("[1] construction");
+    let inp: object = input_new();
+    ok("input_new returns a handle", inp != null);
+    ok("event scratch allocated", inp.scratch != ptr_null());
+    eq("no key down at birth", input_down(inp, SC_W), false);
+    eq("no edge at birth", input_pressed(inp, SC_W), false);
+    eq("no button down at birth", input_button(inp, INPUT_MB_LEFT), false);
+    eq("wheel zero at birth", input_wheel(inp), 0);
+    eq("dx zero at birth", input_mouse_dx(inp), 0.0);
+    eq("dy zero at birth", input_mouse_dy(inp), 0.0);
+    eq("quit clear at birth", input_quit(inp), false);
+    eq("scancode capacity is SDL's", INPUT_MAX_SCANCODES, 512);
+    ok("event capacity is generous", INPUT_MAX_EVENTS >= 128);
+    return inp;
+}
+
+// ---------------------------------------------------------------------------
+// 2. THE acceptance criterion: a key pressed AND released inside ONE frame
+//    reports exactly one `pressed` and exactly one `released`.
+//    Counted across four frames so a duplicate on a later frame is caught too.
+// ---------------------------------------------------------------------------
+fn test_press_release_same_frame(inp: object) {
+    print("[2] press+release inside one frame");
+    input_clear(inp);
+
+    let npress: i32 = 0;
+    let nrel: i32 = 0;
+    let ndown: i32 = 0;
+
+    // Frame 1 carries both events. Frames 2-4 carry nothing.
+    ev_reset();
+    ev_push(EV_KEYDOWN, SC_W, 0);
+    ev_push(EV_KEYUP, SC_W, 0);
+    for (let f = 0; f < 4; f++) {
+        frame(inp);
+        if (input_pressed(inp, SC_W)) { npress = npress + 1; }
+        if (input_released(inp, SC_W)) { nrel = nrel + 1; }
+        if (input_down(inp, SC_W)) { ndown = ndown + 1; }
+    }
+    print(`  pressed over 4 frames  = ${npress}`);
+    print(`  released over 4 frames = ${nrel}`);
+    print(`  down over 4 frames     = ${ndown}`);
+    eq("exactly one pressed", npress, 1);
+    eq("exactly one released", nrel, 1);
+    eq("never reported held (key was up by end of frame)", ndown, 0);
+
+    // And the ordinary multi-frame case still works: hold across three frames.
+    input_clear(inp);
+    npress = 0; nrel = 0; ndown = 0;
+    ev_reset();
+    ev_push(EV_KEYDOWN, SC_A, 0);
+    for (let g = 0; g < 3; g++) {
+        frame(inp);
+        if (input_pressed(inp, SC_A)) { npress = npress + 1; }
+        if (input_down(inp, SC_A)) { ndown = ndown + 1; }
+        if (input_released(inp, SC_A)) { nrel = nrel + 1; }
+    }
+    ev_push(EV_KEYUP, SC_A, 0);
+    frame(inp);
+    if (input_released(inp, SC_A)) { nrel = nrel + 1; }
+    if (input_down(inp, SC_A)) { ndown = ndown + 1; }
+    eq("one pressed for a held key", npress, 1);
+    eq("held for all three frames", ndown, 3);
+    eq("one released on the release frame", nrel, 1);
+
+    // Two taps in one frame still report one edge each (flags, not counters) —
+    // documented behaviour, asserted so it cannot drift silently.
+    input_clear(inp);
+    ev_push(EV_KEYDOWN, SC_S, 0);
+    ev_push(EV_KEYUP, SC_S, 0);
+    ev_push(EV_KEYDOWN, SC_S, 0);
+    ev_push(EV_KEYUP, SC_S, 0);
+    frame(inp);
+    eq("double tap in one frame: pressed", input_pressed(inp, SC_S), true);
+    eq("double tap in one frame: released", input_released(inp, SC_S), true);
+    eq("double tap in one frame: not held", input_down(inp, SC_S), false);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Key repeat is held but is NOT a press edge
+// ---------------------------------------------------------------------------
+fn test_repeat(inp: object) {
+    print("[3] key repeat");
+    input_clear(inp);
+    ev_push(EV_KEYDOWN, SC_D, 0);
+    frame(inp);
+    eq("initial press is an edge", input_pressed(inp, SC_D), true);
+    eq("initial press is not a repeat", input_repeated(inp, SC_D), false);
+
+    ev_push(EV_KEYDOWN, SC_D, 1);
+    frame(inp);
+    eq("repeat is NOT a press edge", input_pressed(inp, SC_D), false);
+    eq("repeat is flagged", input_repeated(inp, SC_D), true);
+    eq("repeat keeps the key held", input_down(inp, SC_D), true);
+
+    frame(inp);
+    eq("repeat flag clears next frame", input_repeated(inp, SC_D), false);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Mouse buttons — same edge contract as keys
+// ---------------------------------------------------------------------------
+fn test_buttons(inp: object) {
+    print("[4] mouse buttons");
+    input_clear(inp);
+    ev_push(EV_MOUSEBUTTONDOWN, INPUT_MB_LEFT, 0);
+    ev_push(EV_MOUSEBUTTONUP, INPUT_MB_LEFT, 0);
+    frame(inp);
+    eq("click inside one frame: pressed", input_button_pressed(inp, INPUT_MB_LEFT), true);
+    eq("click inside one frame: released", input_button_released(inp, INPUT_MB_LEFT), true);
+    eq("click inside one frame: not held", input_button(inp, INPUT_MB_LEFT), false);
+
+    frame(inp);
+    eq("button edges clear next frame", input_button_pressed(inp, INPUT_MB_LEFT), false);
+
+    ev_push(EV_MOUSEBUTTONDOWN, INPUT_MB_RIGHT, 0);
+    frame(inp);
+    eq("right button held", input_button(inp, INPUT_MB_RIGHT), true);
+    eq("left button unaffected", input_button(inp, INPUT_MB_LEFT), false);
+    frame(inp);
+    eq("right button still held with no events", input_button(inp, INPUT_MB_RIGHT), true);
+    ev_push(EV_MOUSEBUTTONUP, INPUT_MB_RIGHT, 0);
+    frame(inp);
+    eq("right button released", input_button(inp, INPUT_MB_RIGHT), false);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Wheel accumulates across every event of the frame and resets
+// ---------------------------------------------------------------------------
+fn test_wheel(inp: object) {
+    print("[5] wheel");
+    input_clear(inp);
+    ev_push(EV_MOUSEWHEEL, 0, 1);
+    ev_push(EV_MOUSEWHEEL, 0, 1);
+    ev_push(EV_MOUSEWHEEL, 0, -3);
+    ev_push(EV_MOUSEWHEEL, 2, 0);
+    frame(inp);
+    print(`  wheel y after (+1,+1,-3) = ${input_wheel(inp)}`);
+    eq("wheel y sums across the frame", input_wheel(inp), -1);
+    eq("wheel x sums across the frame", input_wheel_x(inp), 2);
+    frame(inp);
+    eq("wheel y resets next frame", input_wheel(inp), 0);
+    eq("wheel x resets next frame", input_wheel_x(inp), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Relative motion: N deltas in one frame sum into ONE delta, then reset.
+//    (Headless there is no mouse at all, so the accumulator is driven through
+//    input_feed_mouse — the same accumulator SDL's delta is added to.)
+// ---------------------------------------------------------------------------
+fn test_motion_accumulation(inp: object) {
+    print("[6] relative motion accumulation");
+    input_clear(inp);
+    input_begin_frame(inp);
+    input_feed_mouse(inp, 3.0, -1.0);
+    input_feed_mouse(inp, 5.0, -2.0);
+    input_feed_mouse(inp, 7.0, 4.0);
+    print(`  three deltas (3,-1)+(5,-2)+(7,4) -> (${input_mouse_dx(inp)}, ${input_mouse_dy(inp)})`);
+    eq("three motions sum into one dx", input_mouse_dx(inp), 15.0);
+    eq("three motions sum into one dy", input_mouse_dy(inp), 1.0);
+
+    input_begin_frame(inp);
+    eq("dx resets at the frame boundary", input_mouse_dx(inp), 0.0);
+    eq("dy resets at the frame boundary", input_mouse_dy(inp), 0.0);
+
+    // Sub-pixel sources compose without rounding.
+    input_begin_frame(inp);
+    input_feed_mouse(inp, 0.25, 0.0);
+    input_feed_mouse(inp, 0.25, 0.0);
+    eq("sub-pixel deltas sum exactly", input_mouse_dx(inp), 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Quit is sticky
+// ---------------------------------------------------------------------------
+fn test_quit(inp: object) {
+    print("[7] quit");
+    input_clear(inp);
+    ev_push(EV_QUIT, 0, 0);
+    frame(inp);
+    eq("EV_QUIT sets quit", input_quit(inp), true);
+    frame(inp);
+    eq("quit is sticky across frames", input_quit(inp), true);
+    input_clear_quit(inp);
+    eq("quit clears on request", input_quit(inp), false);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Bad input cannot corrupt anything
+// ---------------------------------------------------------------------------
+fn test_bounds(inp: object) {
+    print("[8] out-of-range safety");
+    input_clear(inp);
+    ev_push(EV_KEYDOWN, 99999, 0);
+    ev_push(EV_KEYDOWN, -4, 0);
+    ev_push(EV_MOUSEBUTTONDOWN, 0, 0);
+    ev_push(EV_MOUSEBUTTONDOWN, 250, 0);
+    ev_push(EV_MOUSEMOTION, 12, 34);       // reported by nothing; must be inert
+    ev_push(777777, 1, 2);                 // unknown type
+    frame(inp);
+    eq("out-of-range scancode ignored", input_down(inp, 99999), false);
+    eq("negative scancode ignored", input_down(inp, -4), false);
+    eq("button 0 ignored", input_button(inp, 0), false);
+    eq("button 250 ignored", input_button(inp, 250), false);
+    eq("unknown event types do not set quit", input_quit(inp), false);
+    eq("unknown event types do not move the mouse", input_mouse_dx(inp), 0.0);
+    eq("query with a huge scancode is false", input_pressed(inp, 1000000), false);
+    eq("query with a negative scancode is false", input_released(inp, -1), false);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Action map. The engine knows integers; the GAME knows what they mean.
+// ---------------------------------------------------------------------------
+fn test_actions(inp: object) {
+    print("[9] action map");
+    input_clear(inp);
+    input_unbind_all(inp);
+
+    // Two arbitrary game-defined ids. The engine never names them (RULE R1).
+    let ACT_FWD: i32 = 0;
+    let ACT_BACK: i32 = 1;
+    let ACT_USE: i32 = 2;
+
+    eq("bind key returns slot 0", input_bind_key(inp, ACT_FWD, SC_W), 0);
+    eq("second bind returns slot 1", input_bind_key(inp, ACT_FWD, SC_UP), 1);
+    eq("re-binding the same key is idempotent", input_bind_key(inp, ACT_FWD, SC_W), 0);
+    eq("a third bind overflows", input_bind_key(inp, ACT_FWD, SC_1), -1);
+    eq("bound_key reads back", input_bound_key(inp, ACT_FWD, 0), SC_W);
+    eq("out-of-range action id refuses", input_bind_key(inp, INPUT_MAX_ACTIONS, SC_W), -1);
+    eq("out-of-range scancode refuses", input_bind_key(inp, ACT_FWD, 99999), -1);
+
+    input_bind_key(inp, ACT_BACK, SC_S);
+    eq("bind button", input_bind_button(inp, ACT_USE, INPUT_MB_LEFT), 0);
+    eq("bound_button reads back", input_bound_button(inp, ACT_USE, 0), INPUT_MB_LEFT);
+    eq("button 0 refuses to bind", input_bind_button(inp, ACT_USE, 0), -1);
+
+    ev_push(EV_KEYDOWN, SC_W, 0);
+    frame(inp);
+    eq("action down through its first bind", input_action_down(inp, ACT_FWD), true);
+    eq("action pressed edge", input_action_pressed(inp, ACT_FWD), true);
+    eq("unbound action is quiet", input_action_down(inp, ACT_BACK), false);
+    eq("axis is +1", input_axis(inp, ACT_FWD, ACT_BACK), 1.0);
+
+    ev_push(EV_KEYDOWN, SC_S, 0);
+    frame(inp);
+    eq("both held cancels the axis", input_axis(inp, ACT_FWD, ACT_BACK), 0.0);
+    eq("edge does not persist", input_action_pressed(inp, ACT_FWD), false);
+
+    ev_push(EV_KEYUP, SC_W, 0);
+    frame(inp);
+    eq("axis is -1", input_axis(inp, ACT_FWD, ACT_BACK), -1.0);
+    eq("action released edge", input_action_released(inp, ACT_FWD), true);
+
+    // The second bind of the same action fires it too.
+    input_clear(inp);
+    ev_push(EV_KEYDOWN, SC_UP, 0);
+    frame(inp);
+    eq("action fires from its second bind", input_action_down(inp, ACT_FWD), true);
+
+    // A mouse button drives an action exactly like a key.
+    input_clear(inp);
+    ev_push(EV_MOUSEBUTTONDOWN, INPUT_MB_LEFT, 0);
+    frame(inp);
+    eq("button-bound action down", input_action_down(inp, ACT_USE), true);
+    eq("button-bound action pressed", input_action_pressed(inp, ACT_USE), true);
+    ev_push(EV_MOUSEBUTTONUP, INPUT_MB_LEFT, 0);
+    frame(inp);
+    eq("button-bound action released", input_action_released(inp, ACT_USE), true);
+    eq("button-bound action no longer down", input_action_down(inp, ACT_USE), false);
+
+    input_unbind(inp, ACT_USE);
+    eq("unbind clears the key slot", input_bound_key(inp, ACT_USE, 0), -1);
+    eq("unbind clears the button slot", input_bound_button(inp, ACT_USE, 0), -1);
+    input_clear(inp);
+    ev_push(EV_MOUSEBUTTONDOWN, INPUT_MB_LEFT, 0);
+    frame(inp);
+    eq("unbound action stays quiet", input_action_down(inp, ACT_USE), false);
+    eq("out-of-range action id reads false", input_action_down(inp, -1), false);
+    eq("binds-per-action is at least two", INPUT_BINDS_PER_ACTION >= 2, true);
+}
+
+// ---------------------------------------------------------------------------
+// 10. input_clear wipes held state (focus loss)
+// ---------------------------------------------------------------------------
+fn test_clear(inp: object) {
+    print("[10] input_clear");
+    input_clear(inp);
+    ev_push(EV_KEYDOWN, SC_LSHIFT, 0);
+    ev_push(EV_MOUSEBUTTONDOWN, INPUT_MB_MIDDLE, 0);
+    frame(inp);
+    eq("key held before clear", input_down(inp, SC_LSHIFT), true);
+    eq("button held before clear", input_button(inp, INPUT_MB_MIDDLE), true);
+    input_clear(inp);
+    eq("key released by clear", input_down(inp, SC_LSHIFT), false);
+    eq("button released by clear", input_button(inp, INPUT_MB_MIDDLE), false);
+    eq("edges cleared too", input_pressed(inp, SC_LSHIFT), false);
+}
+
+// ---------------------------------------------------------------------------
+// 11. The live path through a real window: input_sample, and relative mode.
+//     Headless, set_relative MUST fail and the program MUST keep rendering.
+// ---------------------------------------------------------------------------
+fn test_live(inp: object, w: object) {
+    print("[11] live path (window + input_sample + relative mode)");
+
+    // A frame's worth of real work before touching relative mode: this is the
+    // "renders normally" half of the criterion.
+    sdl_clear(w, 12, 14, 18, 255);
+    sdl_present(w);
+    let n0: i32 = input_sample(inp, w);
+    ok("input_sample through a real window returns a count", n0 >= 0);
+    eq("event count matches the sample", input_event_count(inp), n0);
+    eq("no synthetic state leaked into the live sample", input_quit(inp), false);
+
+    let rc: i32 = input_set_relative(inp, 1);
+    print(`  input_set_relative(1) -> ${rc}   (relative now ${input_relative(inp)})`);
+    eq("input_set_relative reports its status", input_relative_status(inp), rc);
+    ok("status is 0 (engaged) or -1 (unavailable)", rc == 0 || rc == -1);
+
+    if (rc == 0) {
+        print("  relative mode ENGAGED — real display path");
+        eq("relative mode is on", input_relative(inp), 1);
+        // Same assertion COUNT in both branches, so EXPECTED_CORE is one number
+        // whether the run is headless or on a real display.
+        eq("no error recorded after success", input_relative_error(inp), "");
+        note("relative mode engaged: real display");
+    } else {
+        print(`  relative mode UNAVAILABLE: ${input_relative_error(inp)}`);
+        eq("relative mode reports off after failure", input_relative(inp), 0);
+        ok("failure carries an SDL error string", input_relative_error(inp).length > 0);
+        note("relative mode unavailable (expected under SDL_VIDEODRIVER=dummy)");
+    }
+
+    // THE non-fatal criterion: after the failure, sampling and rendering must
+    // both keep working. Ten frames, exactly as a tool like shot.hml would.
+    let rendered: i32 = 0;
+    for (let f = 0; f < 10; f++) {
+        input_sample(inp, w);
+        sdl_clear(w, 12, 14, 18, 255);
+        sdl_present(w);
+        rendered = rendered + 1;
+    }
+    eq("ten frames rendered after the relative-mode call", rendered, 10);
+    ok("mouse position sampled without crashing", input_mouse_x(inp) > -100000);
+
+    // Held-state resync against SDL's own keyboard array must not throw.
+    input_sync_held(inp);
+    ok("input_sync_held survives with no keys held", input_down(inp, SC_ESCAPE) == false);
+
+    // Turning relative mode off must also be honest about its status.
+    let rc_off: i32 = input_set_relative(inp, 0);
+    ok("turning relative mode off returns a status", rc_off == 0 || rc_off == -1);
+    if (rc_off == 0) { eq("relative mode is off", input_relative(inp), 0); }
+    else { eq("relative mode was never on", input_relative(inp), 0); }
+    show_cursor(1);
+}
+
+// ---------------------------------------------------------------------------
+// 12. THE LIVE DELTA, driven through the XTest extension.
+//     Only runs when relative mode actually engaged (i.e. on a real display).
+//
+//     A pointer WARP is never used: a warp gives xrel == 0 by design and proves
+//     nothing.
+//
+//     MEASURED FINDING, and the reason this section uses the RELATIVE XTest
+//     entry point for its assertions: XTestFakeMotionEvent takes ABSOLUTE screen
+//     coordinates, and the XTEST pointer's XInput2 raw valuators then carry
+//     those absolute coordinates rather than a delta. SDL forwards raw valuators
+//     straight through as xrel/yrel, so three absolute moves to x = 410, 420,
+//     430 arrive as dx = 1260 (= 410+420+430), not dx = 30, and a move BACK to
+//     x = 400 arrives as dx = +400, not -30. The motion is genuinely live — the
+//     numbers are simply not deltas. XTestFakeRelativeMotionEvent, the relative
+//     sibling in the same extension, produces true deltas, so it drives every
+//     numeric assertion here. XTestFakeMotionEvent is still exercised at the end
+//     of the section, where its documented behaviour is asserted rather than
+//     assumed.
+//
+//     Values are compared with tolerance, not equality, and the injected moves
+//     are 100 px rather than 10 px. Two things make exact equality wrong here:
+//     X pointer acceleration SCALES the raw delta (10 px measured back as 18),
+//     and on a real desktop a HUMAN HAND on the real mouse is a second, live
+//     input source feeding the same accumulator (measured: +11 px on a frame
+//     that injected nothing). 100 px injections dominate that noise; the shape
+//     of each assertion — sign, and summed-vs-single — is what is being proven,
+//     not a particular pixel count.
+//     For a hand-free run, drive it against a private X server:
+//         Xvfb :99 -screen 0 1280x960x24 & DISPLAY=:99 /tmp/probe_input
+// ---------------------------------------------------------------------------
+fn test_xtest_delta(inp: object, w: object) {
+    let rc: i32 = input_set_relative(inp, 1);
+    if (rc != 0) {
+        print("[12] live delta: SKIPPED (relative mode unavailable — headless)");
+        note("XTest live-delta section skipped: no relative mouse mode");
+        return;
+    }
+    let dpy: ptr = XOpenDisplay(ptr_null());
+    if (dpy == ptr_null()) {
+        print("[12] live delta: SKIPPED (no X display)");
+        note("XTest live-delta section skipped: XOpenDisplay failed");
+        input_set_relative(inp, 0);
+        return;
+    }
+    print("[12] live delta via XTest");
+    g_live = 1;
+
+    // Let the window map, take focus and take the pointer grab.
+    for (let f = 0; f < 30; f++) {
+        input_sample(inp, w);
+        sdl_clear(w, 12, 14, 18, 255);
+        sdl_present(w);
+        clock_sleep_ms(4);
+    }
+    input_sample(inp, w);
+    input_sample(inp, w);
+
+    // Burn a motion pair before measuring. SDL swallows the first relative
+    // motion after the mode engages (measured: an injected +100 px read back as
+    // dx = 0 when it was the very first one), which is SDL protecting the caller
+    // from the enable-time warp — correct behaviour, but it would poison a
+    // baseline. The second injection puts the pointer back where it started.
+    XTestFakeRelativeMotionEvent(dpy, 100, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+    input_sample(inp, w);
+    XTestFakeRelativeMotionEvent(dpy, -100, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+    input_sample(inp, w);
+
+    // ONE motion event of +100 px: the baseline.
+    XTestFakeRelativeMotionEvent(dpy, 100, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+    input_sample(inp, w);
+    let dx1: f64 = input_mouse_dx(inp);
+    print(`  one +100 px motion                 -> dx = ${dx1}`);
+    ok("delta is LIVE on the real display", dx1 > 0.0);
+
+    input_sample(inp, w);
+
+    // THREE separate motion events, +100 px each, inside ONE frame. They must
+    // arrive as a single summed delta, and it must be clearly bigger than the
+    // one-event baseline.
+    XTestFakeRelativeMotionEvent(dpy, 100, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(8);
+    XTestFakeRelativeMotionEvent(dpy, 100, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(8);
+    XTestFakeRelativeMotionEvent(dpy, 100, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+
+    input_sample(inp, w);
+    let dx3: f64 = input_mouse_dx(inp);
+    let dy3: f64 = input_mouse_dy(inp);
+    print(`  three +100 px motions in one frame  -> dx = ${dx3}, dy = ${dy3}  (baseline x3 = ${dx1 * 3.0})`);
+    ok("three motions in one frame summed into one delta", dx3 > dx1 * 2.0);
+    ok("the summed delta is positive", dx3 > 0.0);
+    ok("no vertical drift from a horizontal move", dy3 > -40.0 && dy3 < 40.0);
+
+    // The sign must follow the direction.
+    input_sample(inp, w);
+    XTestFakeRelativeMotionEvent(dpy, -300, 0, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+    input_sample(inp, w);
+    let dxn: f64 = input_mouse_dx(inp);
+    print(`  one -300 px motion                 -> dx = ${dxn}`);
+    ok("delta sign follows the motion direction", dxn < 0.0);
+
+    // The vertical axis is live too.
+    input_sample(inp, w);
+    XTestFakeRelativeMotionEvent(dpy, 0, 100, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+    input_sample(inp, w);
+    let dyv: f64 = input_mouse_dy(inp);
+    print(`  one +100 px vertical motion        -> dy = ${dyv}`);
+    ok("vertical delta is live and signed", dyv > 0.0);
+
+    // And the delta must be CONSUMED: a quiet frame reports (near) nothing.
+    // Near, not exactly: a physical mouse on the same desk is also a source.
+    clock_sleep_ms(20);
+    input_sample(inp, w);
+    let dz: f64 = input_mouse_dx(inp);
+    print(`  quiet frame                        -> dx = ${dz}`);
+    ok("a quiet frame reports no accumulated delta", dz > -40.0 && dz < 40.0);
+
+    // XTestFakeMotionEvent (ABSOLUTE), asserted for what it actually does. It
+    // is live — it is simply not a delta. See this section's header.
+    input_sample(inp, w);
+    XTestFakeMotionEvent(dpy, -1, 400, 300, 0);
+    XFlush(dpy);
+    clock_sleep_ms(30);
+    input_sample(inp, w);
+    let dabs: f64 = input_mouse_dx(inp);
+    print(`  XTestFakeMotionEvent(abs 400,300)  -> dx = ${dabs}  (absolute valuator, not a delta)`);
+    ok("XTestFakeMotionEvent also produces live motion", dabs != 0.0);
+    if (dabs == 400.0) {
+        note("XTestFakeMotionEvent: dx == the absolute X coordinate, confirming the raw-valuator artifact");
+    } else {
+        note(`XTestFakeMotionEvent: dx = ${dabs} for an absolute move to x=400`);
+    }
+    note(`XTest relative: 1 x 100 px -> ${dx1}, 3 x 100 px -> ${dx3} (X pointer acceleration scales the raw delta)`);
+
+    input_set_relative(inp, 0);
+    show_cursor(1);
+    XCloseDisplay(dpy);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Cost. input_sample runs once per frame; it must be free at this scale.
+// ---------------------------------------------------------------------------
+fn test_cost(inp: object, w: object) {
+    print("[13] cost");
+    let iters: i32 = 2000;
+    let t0: u64 = clock_now();
+    for (let i = 0; i < iters; i++) { input_sample(inp, w); }
+    let t1: u64 = clock_now();
+    let us: f64 = clock_ms_between(t0, t1) * 1000.0 / f64(iters);
+    print(`  input_sample (empty queue)   = ${us} us/frame`);
+    ok("input_sample costs well under 100 us", us < 100.0);
+
+    // The edge-clear worklist means a frame that touched 2 keys does not pay
+    // for 512. Verify that a heavy synthetic frame is still cheap.
+    let t2: u64 = clock_now();
+    for (let j = 0; j < 2000; j++) {
+        ev_push(EV_KEYDOWN, SC_W, 0);
+        ev_push(EV_KEYUP, SC_W, 0);
+        ev_push(EV_MOUSEWHEEL, 0, 1);
+        frame(inp);
+    }
+    let t3: u64 = clock_now();
+    let us2: f64 = clock_ms_between(t2, t3) * 1000.0 / 2000.0;
+    print(`  begin_frame + 3 events       = ${us2} us/frame`);
+    ok("synthetic frame costs well under 100 us", us2 < 100.0);
+    print(`  budget impact: input is ${us / 1000.0} ms of the 16.67 ms frame`);
+}
+
+// ---------------------------------------------------------------------------
+
+fn main() {
+    print("probe_input — W1-6 / G9 input layer");
+    print("");
+
+    let inp: object = test_new();
+    test_press_release_same_frame(inp);
+    test_repeat(inp);
+    test_buttons(inp);
+    test_wheel(inp);
+    test_motion_accumulation(inp);
+    test_quit(inp);
+    test_bounds(inp);
+    test_actions(inp);
+    test_clear(inp);
+
+    let w = window_open("probe_input", 320, 240, 2);
+    ok("window_open returns a handle", w != null);
+    if (w == null) {
+        print("FATAL: no window; the live sections cannot run");
+        print(`PASS ${g_pass}/${g_n}`);
+        exit(1);
+    }
+    test_live(inp, w);
+    test_xtest_delta(inp, w);
+    test_cost(inp, w);
+
+    input_free(inp);
+    window_close(w);
+
+    print("");
+    let notes_n: i32 = i32(g_notes.length);
+    for (let i = 0; i < notes_n; i++) { print(`  NOTE: ${g_notes[i]}`); }
+
+    let expected: i32 = EXPECTED_CORE;
+    if (g_live == 1) { expected = EXPECTED_CORE + EXPECTED_LIVE; }
+    print("");
+    print(`PASS ${g_pass}/${g_n}   (expected ${expected} assertions, live section ${g_live})`);
+    if (g_n != expected) {
+        print(`FAIL: assertion COUNT is ${g_n}, expected ${expected} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass != g_n) { exit(1); }
+}
+
+main();

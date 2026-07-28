@@ -1,0 +1,971 @@
+// emit.hml — THE HOT KERNEL.
+//
+// Transform + near test + perspective divide + viewport + pixel snap + guard
+// test + backface cull + shade/fog + pack, on native `f64` locals, straight
+// into the vertex arena at the byte cursor `batch_reserve` returned.
+// No object literal, no array literal, no closure, no `defer`, no `try`, no
+// `throw`, no template string, and no allocation on any path.
+// (ENGINE_GAPS G6, G8; consumes G15/G16 through shade.hml.)
+//
+// GENERIC ENGINE MODULE. Not one game noun, not one colour constant. Every
+// colour, light and fog parameter is supplied by the caller (RULE R1).
+//
+// =============================================================================
+// WHY THIS FILE LOOKS THE WAY IT DOES
+// =============================================================================
+// Measured on this box with `hemlockc -c --emit-c`, and this is the whole
+// design rationale:
+//
+//   let x: f64 = p_x;              (f64 PARAMETER)   -> C `double`      UNBOXED
+//   let x: f64 = g_x;              (f64 TOP-LEVEL)   -> C `double`      UNBOXED
+//   let x: f64 = a[i];             (array<f64> elem) -> `HmlValue`      BOXED
+//   let x: f64 = ptr_read_f32(p);  (builtin call)    -> `HmlValue`      BOXED
+//   x = ptr_read_f32(p);           (ASSIGN into an already-`double` x)  UNBOXED
+//
+// So:
+//   * the 16 MVP elements live in top-level `f64` globals, NOT in an
+//     `array<f64>` — an array element read is boxed and a global read is not.
+//     `emit_set_mvp` pays the sixteen boxed array reads exactly once per frame;
+//     the kernel never indexes an array. Same reasoning as `env_bind` in
+//     shade.hml, arrived at independently and confirmed against its --emit-c.
+//   * every hot local is DECLARED at the top of its function from a parameter,
+//     a global or an `f64` literal (so the C declaration is `double`), and any
+//     builtin result is ASSIGNED into it inside the loop.
+//   * `i32(x)` and `f64(i)` are real conversion calls, so the kernel keeps
+//     colour work in packed integers and only converts where the fog multiply
+//     forces it.
+//
+// The costs that actually shape this loop, measured on this box, compiled -O1
+// (`hemlockc 2.9.1`, min of 12 batches x 25 reps, CPU time):
+//
+//     one Hemlock STATEMENT (an assignment) ............ 5.4 ns
+//     one extra f64 OPERATOR inside an expression ...... ~0 ns
+//     `p + o` then ptr_read_f32 (incl. f32->f64) ....... 21 ns
+//     `ptr_offset(p, o, 1)` then ptr_read_f32 .......... 24 ns
+//     `i32(x)` / `f64(i)` conversion ................... 5.4 / 8.7 ns
+//     `__sqrt(x)` ...................................... 4.4 ns
+//     `sqrt(x)` imported from @stdlib/math ............. 9.8 ns
+//
+// The first two lines are the whole design. An assignment boxes its own value
+// and releases it, so a STATEMENT costs real money while an OPERATOR costs
+// nothing — which is why the pixel snap is written as one ternary that
+// re-evaluates `(v + bias) - bias` three times instead of two statements with
+// a temporary, and why the fog tint and the 4-byte pack are one expression.
+// Three measured dead ends, so nobody re-walks them:
+//   * `read_u32_le(p, off)` / `write_u64_le(p, off, v)` take the offset as an
+//     argument and so save a `p + o`, but they are byte-at-a-time in C and
+//     came out 0.3 ms/2500 SLOWER. Not used.
+//   * splitting the colour maths into typed f64 locals (native arithmetic
+//     rather than boxed generic ops inside one big mixed expression) was
+//     0.17 ms/2500 slower, not faster.
+//   * lifting the lit branch into its own function to shrink the loop body was
+//     0.3 ms/2500 slower.
+//
+// Packing: two f32, one i32 of r|g<<8|b<<16|a<<24, one u64 of the two UVs
+// copied bit-for-bit from the mesh vertex — four writes per vertex, which is
+// the minimum this instruction set offers. probe_emit.hml asserts the
+// little-endian byte order (r@+8 g@+9 b@+10 a@+11) by readback.
+//
+// Pixel snap is `floor(v + 0.5)` computed with the round-to-nearest bias trick
+// instead of a call into `@stdlib/math`. `(v + bias) - bias` is round-half-to-
+// EVEN, which is not floor, so the ternary steps it down by one when it
+// rounded up. `snap_of()` is bit-exact against `floor`; probe_emit.hml asserts
+// that across the whole guard rect including negatives and exact .5 values.
+//
+// WHAT IT COSTS, and where it does not fit: see the budget note at the foot of
+// `emit_mesh_buf`.
+//
+// =============================================================================
+// WHAT THIS FILE OWNS, AND WHAT IT DOES NOT
+// =============================================================================
+// It owns: the model->clip transform, the near predicate, the divide, the
+// viewport map, the pixel snap, the guard predicate, the backface test, and the
+// 20-byte pack.
+//
+// It does NOT own the light/fog model. That is `shade.hml` (G15/G16), whose
+// `env_bind` + `env_vertex_rgba` + `env_fog_factor` + `env_fog_alpha` are
+// called from here. There is exactly ONE lighting model in the engine and it
+// lives there; duplicating it here would guarantee the two drift.
+//
+// It does NOT own the batch. ARCHITECTURE §2.3: "emit.hml (producer) and
+// batch.hml (consumer) never share a struct. They share this byte layout."
+// Taken literally — this module imports nothing from `batch.hml`, `clip.hml` or
+// `frustum.hml`. It takes the destination as a raw `ptr` plus the byte cursor
+// `batch_reserve` returned, plus the batch's `array<f64>` depth column and a
+// start index. The caller's shape is:
+//
+//     let cur = batch_reserve(b, n);                     // byte cursor, or -1
+//     if (cur >= 0) {
+//         let k = emit_mesh_buf(batch_vbuf(b), cur, n, g_dep, 0,
+//                               mesh, n, ox, oy, oz, 1.0, 0.0, 1.0);
+//         for (let i = 0; i < k; i++) {
+//             batch_commit(b, cur + i * 60, tex, g_dep[i]);
+//         }
+//     }
+//
+// A triangle rejected by the near test, the guard band or the backface test is
+// simply not written, so `k` is <= the reservation and the caller commits `k`.
+// A triangle that STRADDLES the near plane or the guard rect is not written
+// either: `emit_tri_world` returns the sentinel EMIT_D_STRADDLE /
+// EMIT_D_GUARD_STRADDLE so the caller can route it to `clip.hml`'s slow path,
+// and `emit_mesh_buf` records its source index in the straddle list
+// (`emit_straddle_count` / `emit_straddle_at`) so the caller can re-issue just
+// those triangles through `clip.hml` without re-walking the mesh.
+//
+// SDL_Vertex, 20 bytes, little-endian (ARCHITECTURE §2.3):
+//   +0  f32 pos.x   (screen px, already floor(v+0.5))
+//   +4  f32 pos.y
+//   +8  u8 r   +9 u8 g   +10 u8 b   +11 u8 a      (written as one i32)
+//   +12 f32 uv.u   (affine — that is the warble, it is a feature)
+//   +16 f32 uv.v
+// Triangle k occupies [k*60 .. k*60+59]: A at +0, B at +20, C at +40.
+
+import { env_bind, env_vertex_rgba, env_bind_field,
+         env_bound_fog_on, env_bound_mist_on, env_bound_far_plane,
+         ENVB_CAM_X, ENVB_CAM_Y, ENVB_CAM_Z,
+         ENVB_FOG_NEAR, ENVB_FOG_INV_SPAN, ENVB_FOG_R, ENVB_FOG_G, ENVB_FOG_B,
+         ENVB_FOG_ALPHA_MAX, ENVB_FOG_ALPHA_T, ENVB_FOG_ALPHA_INV,
+         ENVB_MIST_TOP, ENVB_MIST_INV_SPAN, ENVB_MIST_DENSITY } from "./shade.hml";
+import { stat_add, STAT_REJ_BACKFACE, STAT_REJ_NEAR, STAT_REJ_GUARD,
+         STAT_CLIP_STRADDLE, STAT_TRIS_SUBMITTED } from "./stats.hml";
+
+// ---------------------------------------------------------------------------
+// CONSTANTS
+// ---------------------------------------------------------------------------
+
+export let VSTRIDE = 20;            // bytes per SDL_Vertex
+export let TSTRIDE = 60;            // bytes per triangle in vbuf
+export let MESH_VSTRIDE = 24;       // bytes per mesh vertex (mesh.hml, §5.1)
+export let MESH_TSTRIDE = 72;       // bytes per mesh triangle (non-indexed)
+
+// Return sentinels for the single-triangle entry point. A written triangle
+// returns its view-space depth, which is always > near > 0.
+export let EMIT_D_CULLED         = 0.0 - 1.0;   // backface / off-guard / behind
+export let EMIT_D_STRADDLE       = 0.0 - 2.0;   // crosses the near plane
+export let EMIT_D_GUARD_STRADDLE = 0.0 - 3.0;   // crosses the guard rect
+
+// Backface modes. The sign depends on the caller's winding and on the y-down
+// screen flip, so it is a parameter, not a decision this file makes.
+export let EMIT_BF_OFF = 0;         // no cull
+export let EMIT_BF_CW  = 1;         // cull screen-space cross >= 0
+export let EMIT_BF_CCW = 2;         // cull screen-space cross <= 0
+
+// White: the identity tint for `p_rgb`. Passed as-is, the albedo multiply is
+// skipped entirely and the shade result reaches the vertex byte-for-byte.
+export let EMIT_RGB_WHITE = 16777215;   // 0xFFFFFF
+
+// ---------------------------------------------------------------------------
+// PER-FRAME STATE — every one an unboxed top-level f64/i32 (see the header)
+// ---------------------------------------------------------------------------
+
+// The 16 MVP elements, row-major, hoisted once per frame by `emit_set_mvp`.
+let g_m0: f64 = 1.0;  let g_m1: f64 = 0.0;  let g_m2: f64 = 0.0;  let g_m3: f64 = 0.0;
+let g_m4: f64 = 0.0;  let g_m5: f64 = 1.0;  let g_m6: f64 = 0.0;  let g_m7: f64 = 0.0;
+let g_m8: f64 = 0.0;  let g_m9: f64 = 0.0;  let g_m10: f64 = 1.0; let g_m11: f64 = 0.0;
+let g_m12: f64 = 0.0; let g_m13: f64 = 0.0; let g_m14: f64 = 0.0; let g_m15: f64 = 1.0;
+
+// Viewport: px = vp_ox + ndc_x * vp_sx ; py = vp_oy - ndc_y * vp_sy
+let g_vp_ox: f64 = 160.0;  let g_vp_sx: f64 = 160.0;
+let g_vp_oy: f64 = 120.0;  let g_vp_sy: f64 = 120.0;
+
+// Guard rect in screen pixels. Generous by design: a triangle wholly inside it
+// goes to SDL unclipped, and only one that straddles it needs clip.hml.
+let g_gx0: f64 = 0.0 - 640.0;  let g_gy0: f64 = 0.0 - 480.0;
+let g_gx1: f64 = 960.0;        let g_gy1: f64 = 720.0;
+
+let g_near: f64 = 0.05;
+let g_bf: i32 = 0;
+
+// Lighting switch. 1 = run shade.hml's full per-vertex model (world triangles,
+// dynamic geometry). 0 = the vertex colour supplied by the caller is already
+// lit (mesh_bake_light, G16/G19) and only fog is applied.
+let g_light_on: i32 = 0;
+
+// The fog/mist parameter block, hoisted out of shade.hml's bound state once
+// per frame by `emit_set_env`. shade.hml still OWNS these numbers — every one
+// of them is read back through its own `env_bind_field`, so there is exactly
+// one place they are computed. What is duplicated here is the six lines of
+// arithmetic that consume them, and only because a cross-module call per
+// vertex costs 0.46 ms per 2500 triangles (measured; see the header).
+// `probe_emit.hml` asserts, on the same geometry, that this inlined form is
+// BYTE-IDENTICAL to `env_fog_factor` + `env_fog_alpha` + the tint multiply, so
+// a future divergence between the two is a test failure, not a silent drift.
+// g_fog_mode collapses three per-vertex integer tests into one f64 compare:
+//   0 = neither (no sqrt at all)   1 = distance fog only (the common case)
+//   2 = mist only                  3 = both
+let g_fog_mode: f64 = 0.0;
+let g_fog_on: i32 = 0;
+let g_mist_on: i32 = 0;
+let g_cam_x: f64 = 0.0;  let g_cam_y: f64 = 0.0;  let g_cam_z: f64 = 0.0;
+let g_fog_near: f64 = 0.0;   let g_fog_iv: f64 = 0.0;
+let g_fog_r: f64 = 1.0;  let g_fog_g: f64 = 1.0;  let g_fog_b: f64 = 1.0;
+let g_fa_max: f64 = 0.0; let g_fa_t: f64 = 0.35;  let g_fa_inv: f64 = 1.5384615384615385;
+let g_mist_top: f64 = 0.0;   let g_mist_iv: f64 = 0.0;  let g_mist_dens: f64 = 0.0;
+
+// (v + 2^52 + 2^51) - (2^52 + 2^51) rounds v to the nearest integer, ties to
+// even, purely in the FPU. Exact for |v| < 2^51.
+let g_snap_bias: f64 = 6755399441055744.0;
+
+// ---------------------------------------------------------------------------
+// COUNTERS — accumulated here, flushed into stats.hml by `emit_stats`
+// ---------------------------------------------------------------------------
+
+let g_c_sub: i32 = 0;        // triangles offered
+let g_c_written: i32 = 0;    // triangles packed
+let g_c_bf: i32 = 0;         // rejected by the backface test
+let g_c_near: i32 = 0;       // rejected: entirely behind the near plane
+let g_c_guard: i32 = 0;      // rejected: entirely outside the guard rect
+let g_c_straddle: i32 = 0;   // handed to the clip.hml slow path
+
+// The straddle list: source triangle indices from the last `emit_mesh_buf`
+// call. Preallocated once by `emit_straddle_reserve`, reused every frame, never
+// grown afterwards (rules N6 / A8).
+let g_str: array<i32> = [];
+let g_str_n: i32 = 0;
+let g_str_cap: i32 = 0;
+
+// ---------------------------------------------------------------------------
+// SETUP (cold: once per frame, or less)
+// ---------------------------------------------------------------------------
+
+// Hoist all 16 MVP elements into unboxed globals. `p_m` is a vec.hml matrix: a
+// flat row-major array of 16 f64. This is the only place an array element is
+// read; the kernel reads globals.
+export fn emit_set_mvp(p_m) {
+    g_m0 = p_m[0];   g_m1 = p_m[1];   g_m2 = p_m[2];   g_m3 = p_m[3];
+    g_m4 = p_m[4];   g_m5 = p_m[5];   g_m6 = p_m[6];   g_m7 = p_m[7];
+    g_m8 = p_m[8];   g_m9 = p_m[9];   g_m10 = p_m[10]; g_m11 = p_m[11];
+    g_m12 = p_m[12]; g_m13 = p_m[13]; g_m14 = p_m[14]; g_m15 = p_m[15];
+}
+
+// Scalar form, for a caller that already keeps the matrix unpacked.
+export fn emit_set_mvp16(p_a0: f64, p_a1: f64, p_a2: f64, p_a3: f64,
+                         p_a4: f64, p_a5: f64, p_a6: f64, p_a7: f64,
+                         p_a8: f64, p_a9: f64, p_a10: f64, p_a11: f64,
+                         p_a12: f64, p_a13: f64, p_a14: f64, p_a15: f64) {
+    g_m0 = p_a0;   g_m1 = p_a1;   g_m2 = p_a2;   g_m3 = p_a3;
+    g_m4 = p_a4;   g_m5 = p_a5;   g_m6 = p_a6;   g_m7 = p_a7;
+    g_m8 = p_a8;   g_m9 = p_a9;   g_m10 = p_a10; g_m11 = p_a11;
+    g_m12 = p_a12; g_m13 = p_a13; g_m14 = p_a14; g_m15 = p_a15;
+}
+
+// Read back a hoisted MVP element. Cold — for tools, tests and reference paths.
+export fn emit_mvp_at(p_i: i32): f64 {
+    let i: i32 = p_i;
+    let v: f64 = 0.0;
+    if (i == 0) { v = g_m0; } else if (i == 1) { v = g_m1; }
+    else if (i == 2) { v = g_m2; } else if (i == 3) { v = g_m3; }
+    else if (i == 4) { v = g_m4; } else if (i == 5) { v = g_m5; }
+    else if (i == 6) { v = g_m6; } else if (i == 7) { v = g_m7; }
+    else if (i == 8) { v = g_m8; } else if (i == 9) { v = g_m9; }
+    else if (i == 10) { v = g_m10; } else if (i == 11) { v = g_m11; }
+    else if (i == 12) { v = g_m12; } else if (i == 13) { v = g_m13; }
+    else if (i == 14) { v = g_m14; } else { v = g_m15; }
+    let out: f64 = v;
+    return out;
+}
+
+// Bind the RenderEnv for this frame (shade.hml owns its layout — emit never
+// indexes it) and hoist the fog tint the baked-colour path needs.
+// §4 stage 6 -> 9: call after tod_eval, before the emit loop.
+export fn emit_set_env(p_env: array<f64>) {
+    env_bind(p_env);
+    g_fog_on  = env_bound_fog_on();
+    g_mist_on = env_bound_mist_on();
+    g_fog_mode = 0.0;
+    if (g_fog_on != 0) { g_fog_mode = 1.0; }
+    if (g_mist_on != 0) { g_fog_mode = g_fog_mode + 2.0; }
+    g_cam_x    = env_bind_field(ENVB_CAM_X);
+    g_cam_y    = env_bind_field(ENVB_CAM_Y);
+    g_cam_z    = env_bind_field(ENVB_CAM_Z);
+    g_fog_near = env_bind_field(ENVB_FOG_NEAR);
+    g_fog_iv   = env_bind_field(ENVB_FOG_INV_SPAN);
+    g_fog_r    = env_bind_field(ENVB_FOG_R);
+    g_fog_g    = env_bind_field(ENVB_FOG_G);
+    g_fog_b    = env_bind_field(ENVB_FOG_B);
+    g_fa_max   = env_bind_field(ENVB_FOG_ALPHA_MAX);
+    g_fa_t     = env_bind_field(ENVB_FOG_ALPHA_T);
+    g_fa_inv   = env_bind_field(ENVB_FOG_ALPHA_INV);
+    g_mist_top = env_bind_field(ENVB_MIST_TOP);
+    g_mist_iv  = env_bind_field(ENVB_MIST_INV_SPAN);
+    g_mist_dens = env_bind_field(ENVB_MIST_DENSITY);
+    // Clamp the tint HERE, once per frame, so the kernel can drop six
+    // per-vertex clamps: with tint in [0,1] and f in [0,1] the multiplier
+    // lerp(1, tint, f) is in [0,1], so a colour in [0,255] stays in [0,255].
+    // Same argument retires the two alpha clamps: alpha_max is clamped to
+    // [0,1] by env_set_fog and (f - alpha_t) * alpha_inv is in [0,1] whenever
+    // the branch is taken. shade.hml's own comment makes the same argument.
+    if (g_fog_r < 0.0) { g_fog_r = 0.0; }  if (g_fog_r > 1.0) { g_fog_r = 1.0; }
+    if (g_fog_g < 0.0) { g_fog_g = 0.0; }  if (g_fog_g > 1.0) { g_fog_g = 1.0; }
+    if (g_fog_b < 0.0) { g_fog_b = 0.0; }  if (g_fog_b > 1.0) { g_fog_b = 1.0; }
+}
+
+// Viewport in pixels plus the guard-band margin, also in pixels.
+export fn emit_set_viewport(p_w: f64, p_h: f64, p_guard: f64) {
+    let w: f64 = p_w;
+    let h: f64 = p_h;
+    let g: f64 = p_guard;
+    g_vp_sx = w * 0.5;  g_vp_ox = w * 0.5;
+    g_vp_sy = h * 0.5;  g_vp_oy = h * 0.5;
+    g_gx0 = 0.0 - g;    g_gy0 = 0.0 - g;
+    g_gx1 = w + g;      g_gy1 = h + g;
+}
+
+export fn emit_set_near(p_near: f64) { g_near = p_near; }
+export fn emit_set_backface(p_mode: i32) { g_bf = p_mode; }
+export fn emit_set_lighting(p_on: i32) { g_light_on = p_on; }
+
+export fn emit_near(): f64        { let out: f64 = g_near; return out; }
+export fn emit_backface(): i32    { let out: i32 = g_bf; return out; }
+export fn emit_lighting(): i32    { let out: i32 = g_light_on; return out; }
+export fn emit_guard_x0(): f64    { let out: f64 = g_gx0; return out; }
+export fn emit_guard_y0(): f64    { let out: f64 = g_gy0; return out; }
+export fn emit_guard_x1(): f64    { let out: f64 = g_gx1; return out; }
+export fn emit_guard_y1(): f64    { let out: f64 = g_gy1; return out; }
+
+// The camera far plane is DERIVED from fog (fog_far * 1.06), never authored
+// (ARCHITECTURE D2). shade.hml computes it; this is the renderer-side name.
+export fn emit_far_plane(): f64 {
+    let out: f64 = env_bound_far_plane();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// STATS
+// ---------------------------------------------------------------------------
+
+export fn emit_stats_reset() {
+    g_c_sub = 0; g_c_written = 0; g_c_bf = 0;
+    g_c_near = 0; g_c_guard = 0; g_c_straddle = 0;
+}
+
+// Push this frame's emit counters into stats.hml, then zero them.
+export fn emit_stats() {
+    stat_add(STAT_TRIS_SUBMITTED, g_c_sub);
+    stat_add(STAT_REJ_BACKFACE, g_c_bf);
+    stat_add(STAT_REJ_NEAR, g_c_near);
+    stat_add(STAT_REJ_GUARD, g_c_guard);
+    stat_add(STAT_CLIP_STRADDLE, g_c_straddle);
+    emit_stats_reset();
+}
+
+export fn emit_count_submitted(): i32 { let out: i32 = g_c_sub;      return out; }
+export fn emit_count_written(): i32   { let out: i32 = g_c_written;  return out; }
+export fn emit_count_backface(): i32  { let out: i32 = g_c_bf;       return out; }
+export fn emit_count_near(): i32      { let out: i32 = g_c_near;     return out; }
+export fn emit_count_guard(): i32     { let out: i32 = g_c_guard;    return out; }
+export fn emit_count_straddle(): i32  { let out: i32 = g_c_straddle; return out; }
+
+// --- the straddle list produced by the last emit_mesh_buf call --------------
+
+// Allocate once at startup. Never called per frame (rules N6 / A8).
+export fn emit_straddle_reserve(p_cap: i32) {
+    let cap: i32 = p_cap;
+    let cur: i32 = g_str_cap;
+    for (let i = cur; i < cap; i++) { g_str.push(0); }
+    if (cap > cur) { g_str_cap = cap; }
+    g_str_n = 0;
+}
+
+export fn emit_straddle_count(): i32 { let out: i32 = g_str_n; return out; }
+
+export fn emit_straddle_at(p_i: i32): i32 {
+    let i: i32 = p_i;
+    if (i < 0 || i >= g_str_n) { let bad: i32 = 0 - 1; return bad; }
+    let out: i32 = g_str[i];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PIXEL SNAP — floor(v + 0.5) with no call into @stdlib/math
+// ---------------------------------------------------------------------------
+// Cold helper so tools, reference implementations and the probe can call the
+// exact same rounding the kernel inlines.
+export fn snap_of(p_v: f64): f64 {
+    let v: f64 = p_v + 0.5;
+    let bias: f64 = g_snap_bias;
+    let r: f64 = (v + bias) - bias;
+    if (r > v) { r = r - 1.0; }
+    let out: f64 = r;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// UV PAIR PACKING
+// ---------------------------------------------------------------------------
+// The two f32 UVs sit at +12 and +16 in BOTH the mesh vertex and the
+// SDL_Vertex, so the mesh path copies them as a single `ptr_read_u64` /
+// `ptr_write_u64` — an exact bit copy, four fewer builtin calls per vertex
+// (32 ns, 0.24 ms per 2500 triangles). The scalar entry points have f64 UVs
+// and go through this 8-byte scratch, allocated once at module load.
+let g_uvs = alloc(8);
+
+fn uv_pack(p_u: f64, p_v: f64): u64 {
+    ptr_write_f32(g_uvs, p_u);
+    ptr_write_f32(g_uvs + 4, p_v);
+    let out: u64 = ptr_read_u64(g_uvs);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// ONE PACKED SDL_Vertex
+// ---------------------------------------------------------------------------
+// Two shading paths, chosen once per frame by `emit_set_lighting`:
+//
+//   lit   (g_light_on == 1): shade.hml's full G16 light model + G15 fog and
+//         fog alpha, from the vertex normal and world position, modulated by
+//         the caller's albedo tint. `p_rgb == EMIT_RGB_WHITE` skips the
+//         modulate entirely so the shade result lands byte-for-byte.
+//   baked (g_light_on == 0): `p_rgb` is already-lit vertex colour (packed
+//         0x00BBGGRR); only shade.hml's fog factor / tint / alpha is applied.
+//
+// Returns nothing and allocates nothing. Five ptr writes.
+fn pack_v(p_buf: ptr, p_o: i32,
+          p_sx: f64, p_sy: f64, p_uv: u64,
+          p_wx: f64, p_wy: f64, p_wz: f64,
+          p_nx: f64, p_ny: f64, p_nz: f64,
+          p_br: f64, p_bg: f64, p_bb: f64) {
+    let o: i32 = p_o;
+    let wx: f64 = p_wx;  let wy: f64 = p_wy;  let wz: f64 = p_wz;
+    let rgba: i32 = 0;
+    let ru: u32 = 0;
+    let f: f64 = 0.0;  let d: f64 = 0.0;  let ft: f64 = 0.0;  let h: f64 = 0.0;
+    let dx: f64 = 0.0; let dy: f64 = 0.0; let dz: f64 = 0.0;
+    let r: f64 = p_br; let g: f64 = p_bg; let b: f64 = p_bb;  let a: f64 = 255.0;
+
+    if (g_light_on == 1) {
+        ru = env_vertex_rgba(p_nx, p_ny, p_nz, wx, wy, wz);
+        if (r == 255.0 && g == 255.0 && b == 255.0) {
+            rgba = i32(ru & 16777215) | (i32(ru >> 24) << 24);
+        } else {
+            r = f64(i32(ru & 255)) * r * 0.00392156862745098;
+            g = f64(i32((ru >> 8) & 255)) * g * 0.00392156862745098;
+            b = f64(i32((ru >> 16) & 255)) * b * 0.00392156862745098;
+            rgba = i32(r + 0.5) | (i32(g + 0.5) << 8) | (i32(b + 0.5) << 16)
+                 | (i32(ru >> 24) << 24);
+        }
+    } else {
+        if (g_fog_mode > 0.5) {
+            f = 0.0;
+            if (g_fog_mode < 2.5) {
+                ft = (__sqrt((wx - g_cam_x) * (wx - g_cam_x) +
+                           (wy - g_cam_y) * (wy - g_cam_y) +
+                           (wz - g_cam_z) * (wz - g_cam_z)) - g_fog_near) * g_fog_iv;
+                if (ft < 0.0) { ft = 0.0; }
+                if (ft > 1.0) { ft = 1.0; }
+                f = ft * ft * (3.0 - 2.0 * ft);
+            }
+            if (g_fog_mode > 1.5) {
+                h = (g_mist_top - wy) * g_mist_iv;
+                if (h < 0.0) { h = 0.0; }
+                if (h > 1.0) { h = 1.0; }
+                h = h * h * g_mist_dens;
+                if (h > f) { f = h; }
+                if (f > 1.0) { f = 1.0; }
+            }
+            if (f > 0.0) {
+                r = r * (1.0 + (g_fog_r - 1.0) * f);
+                g = g * (1.0 + (g_fog_g - 1.0) * f);
+                b = b * (1.0 + (g_fog_b - 1.0) * f);
+                if (f > g_fa_t) {
+                    a = 255.0 * (1.0 - g_fa_max * (f - g_fa_t) * g_fa_inv);
+                }
+            }
+        }
+        rgba = i32(r + 0.5) | (i32(g + 0.5) << 8) | (i32(b + 0.5) << 16)
+             | (i32(a + 0.5) << 24);
+    }
+
+    ptr_write_f32(p_buf + o, p_sx);
+    ptr_write_f32(p_buf + (o + 4), p_sy);
+    ptr_write_i32(p_buf + (o + 8), rgba);
+    ptr_write_u64(p_buf + (o + 12), p_uv);
+}
+
+// ---------------------------------------------------------------------------
+// THE KERNEL — one world-space triangle
+// ---------------------------------------------------------------------------
+// Returns the view-space depth (clip w, larger = farther) of the triangle it
+// wrote, or EMIT_D_CULLED / EMIT_D_STRADDLE / EMIT_D_GUARD_STRADDLE. Writes
+// exactly 60 bytes at p_buf + p_cur when it returns a depth, and nothing at all
+// otherwise.
+//
+// `p_rgb` is packed r | g<<8 | b<<16. With lighting on it is the albedo tint
+// (EMIT_RGB_WHITE = untinted); with lighting off it is the vertex colour.
+// `p_nx/ny/nz` is the face normal, used only when lighting is on.
+export fn emit_tri_world(p_buf: ptr, p_cur: i32,
+                         p_ax: f64, p_ay: f64, p_az: f64,
+                         p_bx: f64, p_by: f64, p_bz: f64,
+                         p_cx: f64, p_cy: f64, p_cz: f64,
+                         p_au: f64, p_av: f64,
+                         p_bu: f64, p_bv: f64,
+                         p_cu: f64, p_cv: f64,
+                         p_nx: f64, p_ny: f64, p_nz: f64,
+                         p_rgb: i32): f64 {
+    // --- parameters into typed locals (A1) --------------------------------
+    let ax: f64 = p_ax;  let ay: f64 = p_ay;  let az: f64 = p_az;
+    let bx: f64 = p_bx;  let by: f64 = p_by;  let bz: f64 = p_bz;
+    let cx: f64 = p_cx;  let cy: f64 = p_cy;  let cz: f64 = p_cz;
+    let cur: i32 = p_cur;
+    let rgb: i32 = p_rgb;
+
+    // --- the 16 MVP elements, hoisted (A4). Rows 0, 1 and 3 do the work:
+    //     SDL_Vertex has no z and the depth key is clip w, so row 2 is never
+    //     evaluated — 4 multiplies and 3 adds saved per vertex.
+    let m0: f64 = g_m0;   let m1: f64 = g_m1;   let m2: f64 = g_m2;   let m3: f64 = g_m3;
+    let m4: f64 = g_m4;   let m5: f64 = g_m5;   let m6: f64 = g_m6;   let m7: f64 = g_m7;
+    let m8: f64 = g_m8;   let m9: f64 = g_m9;   let m10: f64 = g_m10; let m11: f64 = g_m11;
+    let m12: f64 = g_m12; let m13: f64 = g_m13; let m14: f64 = g_m14; let m15: f64 = g_m15;
+
+    g_c_sub = g_c_sub + 1;
+
+    // --- transform: clip w ------------------------------------------------
+    let wa: f64 = m12 * ax + m13 * ay + m14 * az + m15;
+    let wb: f64 = m12 * bx + m13 * by + m14 * bz + m15;
+    let wc: f64 = m12 * cx + m13 * cy + m14 * cz + m15;
+
+    // --- near test --------------------------------------------------------
+    let near: f64 = g_near;
+    if (wa <= near && wb <= near && wc <= near) {
+        g_c_near = g_c_near + 1;
+        let d1: f64 = EMIT_D_CULLED;
+        return d1;
+    }
+    if (wa <= near || wb <= near || wc <= near) {
+        g_c_straddle = g_c_straddle + 1;
+        let d2: f64 = EMIT_D_STRADDLE;
+        return d2;
+    }
+
+    // --- perspective divide + viewport + pixel snap ------------------------
+    let bias: f64 = g_snap_bias;
+    let vox: f64 = g_vp_ox;  let vsx: f64 = g_vp_sx;
+    let voy: f64 = g_vp_oy;  let vsy: f64 = g_vp_sy;
+
+    let inv: f64 = 1.0 / wa;
+    let sxa: f64 = vox + (m0 * ax + m1 * ay + m2 * az + m3) * inv * vsx + 0.5;
+    let sya: f64 = voy - (m4 * ax + m5 * ay + m6 * az + m7) * inv * vsy + 0.5;
+    let t: f64 = (sxa + bias) - bias;  if (t > sxa) { t = t - 1.0; }  sxa = t;
+    t = (sya + bias) - bias;           if (t > sya) { t = t - 1.0; }  sya = t;
+
+    inv = 1.0 / wb;
+    let sxb: f64 = vox + (m0 * bx + m1 * by + m2 * bz + m3) * inv * vsx + 0.5;
+    let syb: f64 = voy - (m4 * bx + m5 * by + m6 * bz + m7) * inv * vsy + 0.5;
+    t = (sxb + bias) - bias;           if (t > sxb) { t = t - 1.0; }  sxb = t;
+    t = (syb + bias) - bias;           if (t > syb) { t = t - 1.0; }  syb = t;
+
+    inv = 1.0 / wc;
+    let sxc: f64 = vox + (m0 * cx + m1 * cy + m2 * cz + m3) * inv * vsx + 0.5;
+    let syc: f64 = voy - (m4 * cx + m5 * cy + m6 * cz + m7) * inv * vsy + 0.5;
+    t = (sxc + bias) - bias;           if (t > sxc) { t = t - 1.0; }  sxc = t;
+    t = (syc + bias) - bias;           if (t > syc) { t = t - 1.0; }  syc = t;
+
+    // --- guard-band test ---------------------------------------------------
+    let gx0: f64 = g_gx0;  let gy0: f64 = g_gy0;
+    let gx1: f64 = g_gx1;  let gy1: f64 = g_gy1;
+    if ((sxa < gx0 && sxb < gx0 && sxc < gx0) ||
+        (sxa > gx1 && sxb > gx1 && sxc > gx1) ||
+        (sya < gy0 && syb < gy0 && syc < gy0) ||
+        (sya > gy1 && syb > gy1 && syc > gy1)) {
+        g_c_guard = g_c_guard + 1;
+        let d3: f64 = EMIT_D_CULLED;
+        return d3;
+    }
+    if (sxa < gx0 || sxb < gx0 || sxc < gx0 || sxa > gx1 || sxb > gx1 || sxc > gx1 ||
+        sya < gy0 || syb < gy0 || syc < gy0 || sya > gy1 || syb > gy1 || syc > gy1) {
+        g_c_straddle = g_c_straddle + 1;
+        let d4: f64 = EMIT_D_GUARD_STRADDLE;
+        return d4;
+    }
+
+    // --- backface cull (G8 tier 3): one subtract-multiply-subtract ---------
+    let bf: i32 = g_bf;
+    let cross: f64 = 0.0;
+    if (bf != 0) {
+        cross = (sxb - sxa) * (syc - sya) - (syb - sya) * (sxc - sxa);
+        if (bf == 1) { cross = 0.0 - cross; }
+        if (cross <= 0.0) {
+            g_c_bf = g_c_bf + 1;
+            let d5: f64 = EMIT_D_CULLED;
+            return d5;
+        }
+    }
+
+    // --- shade + fog + pack, three vertices --------------------------------
+    let br: f64 = f64(rgb & 255);
+    let bg: f64 = f64((rgb >> 8) & 255);
+    let bb: f64 = f64((rgb >> 16) & 255);
+    pack_v(p_buf, cur,      sxa, sya, uv_pack(p_au, p_av), ax, ay, az,
+           p_nx, p_ny, p_nz, br, bg, bb);
+    pack_v(p_buf, cur + 20, sxb, syb, uv_pack(p_bu, p_bv), bx, by, bz,
+           p_nx, p_ny, p_nz, br, bg, bb);
+    pack_v(p_buf, cur + 40, sxc, syc, uv_pack(p_cu, p_cv), cx, cy, cz,
+           p_nx, p_ny, p_nz, br, bg, bb);
+
+    g_c_written = g_c_written + 1;
+    let depth: f64 = (wa + wb + wc) * 0.3333333333333333;
+    return depth;
+}
+
+// ---------------------------------------------------------------------------
+// Two triangles from four world-space corners (A,B,C,D round the quad)
+// ---------------------------------------------------------------------------
+// Writes depths at p_dep[p_di ...]. Returns the number of triangles packed
+// (0, 1 or 2). Keep quads <= 4 m so the affine ground warp stays charming.
+export fn emit_quad_world(p_buf: ptr, p_cur: i32,
+                          p_dep: array<f64>, p_di: i32,
+                          p_ax: f64, p_ay: f64, p_az: f64,
+                          p_bx: f64, p_by: f64, p_bz: f64,
+                          p_cx: f64, p_cy: f64, p_cz: f64,
+                          p_dx: f64, p_dy: f64, p_dz: f64,
+                          p_au: f64, p_av: f64, p_bu: f64, p_bv: f64,
+                          p_cu: f64, p_cv: f64, p_du: f64, p_dv: f64,
+                          p_nx: f64, p_ny: f64, p_nz: f64,
+                          p_rgb: i32): i32 {
+    let cur: i32 = p_cur;
+    let di: i32 = p_di;
+    let n: i32 = 0;
+    let d: f64 = emit_tri_world(p_buf, cur,
+                                p_ax, p_ay, p_az, p_bx, p_by, p_bz, p_cx, p_cy, p_cz,
+                                p_au, p_av, p_bu, p_bv, p_cu, p_cv,
+                                p_nx, p_ny, p_nz, p_rgb);
+    if (d > 0.0) { p_dep[di + n] = d; n++; }
+    d = emit_tri_world(p_buf, cur + n * 60,
+                       p_ax, p_ay, p_az, p_cx, p_cy, p_cz, p_dx, p_dy, p_dz,
+                       p_au, p_av, p_cu, p_cv, p_du, p_dv,
+                       p_nx, p_ny, p_nz, p_rgb);
+    if (d > 0.0) { p_dep[di + n] = d; n++; }
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE MESH PATH — the loop the whole budget lives in
+// ---------------------------------------------------------------------------
+// `p_mesh` is a mesh.hml arena: non-indexed, 24 B per vertex,
+//   +0 f32 x   +4 f32 y   +8 f32 z   +12 f32 u   +16 f32 v
+//   +20 u8 r   +21 u8 g   +22 u8 b   +23 pad
+// The vertex colour is BAKED lighting (mesh_bake_light, G16), so with
+// `emit_set_lighting(0)` this path applies fog only and never transforms a
+// normal — that is what makes a static prop free at runtime (G19). With
+// `emit_set_lighting(1)` the baked colour becomes the albedo tint and the full
+// model runs against `p_nx/p_ny/p_nz`, for dynamic geometry.
+//
+// The instance transform is a yaw rotation about the model origin followed by a
+// translation. Pass cos = 1.0, sin = 0.0 for a plain translation.
+//
+// Writes at most `p_maxtris` triangles from byte cursor `p_cur` and their
+// depths at p_dep[p_di ...]. Returns the number actually written. Triangles
+// that need clip.hml are recorded in the straddle list, not written.
+export fn emit_mesh_buf(p_buf: ptr, p_cur: i32, p_maxtris: i32,
+                        p_dep: array<f64>, p_di: i32,
+                        p_mesh: ptr, p_ntris: i32,
+                        p_ox: f64, p_oy: f64, p_oz: f64,
+                        p_cosy: f64, p_siny: f64,
+                        p_nx: f64, p_ny: f64, p_nz: f64): i32 {
+    // --- parameters into typed locals (A1) --------------------------------
+    let ntris: i32 = p_ntris;
+    let maxtris: i32 = p_maxtris;
+    let di: i32 = p_di;
+    let ox: f64 = p_ox;     let oy: f64 = p_oy;     let oz: f64 = p_oz;
+    let ccy: f64 = p_cosy;  let ssy: f64 = p_siny;
+
+    // --- the 16 MVP elements, hoisted ONCE for the whole mesh (A4) ---------
+    let m0: f64 = g_m0;   let m1: f64 = g_m1;   let m2: f64 = g_m2;   let m3: f64 = g_m3;
+    let m4: f64 = g_m4;   let m5: f64 = g_m5;   let m6: f64 = g_m6;   let m7: f64 = g_m7;
+    let m8: f64 = g_m8;   let m9: f64 = g_m9;   let m10: f64 = g_m10; let m11: f64 = g_m11;
+    let m12: f64 = g_m12; let m13: f64 = g_m13; let m14: f64 = g_m14; let m15: f64 = g_m15;
+
+    // --- everything else the loop touches, declared here so the C is double -
+    let vox: f64 = g_vp_ox;  let vsx: f64 = g_vp_sx;
+    let voy: f64 = g_vp_oy;  let vsy: f64 = g_vp_sy;
+    let gx0: f64 = g_gx0;    let gy0: f64 = g_gy0;
+    let gx1: f64 = g_gx1;    let gy1: f64 = g_gy1;
+    let near: f64 = g_near;
+    let bias: f64 = g_snap_bias;
+    let bf: i32 = g_bf;
+    let lit: i32 = g_light_on;
+    let fogmode: f64 = g_fog_mode;
+    let fogon: i32 = g_fog_on;   let miston: i32 = g_mist_on;
+    let camx: f64 = g_cam_x;    let camy: f64 = g_cam_y;    let camz: f64 = g_cam_z;
+    let fnear: f64 = g_fog_near; let fiv: f64 = g_fog_iv;
+    let fgr: f64 = g_fog_r;     let fgg: f64 = g_fog_g;     let fgb: f64 = g_fog_b;
+    let famax: f64 = g_fa_max;  let fat: f64 = g_fa_t;      let fainv: f64 = g_fa_inv;
+    let mtop: f64 = g_mist_top; let miv: f64 = g_mist_iv;   let mdens: f64 = g_mist_dens;
+
+    let mp: ptr = p_mesh;    // source arena, hoisted (N4)
+    let vb: ptr = p_buf;     // destination arena, hoisted (N4)
+
+    let mx: f64 = 0.0;  let my: f64 = 0.0;  let mz: f64 = 0.0;
+    let ax: f64 = 0.0;  let ay: f64 = 0.0;  let az: f64 = 0.0;
+    let bx: f64 = 0.0;  let by: f64 = 0.0;  let bz: f64 = 0.0;
+    let cx: f64 = 0.0;  let cy: f64 = 0.0;  let cz: f64 = 0.0;
+    let wa: f64 = 0.0;  let wb: f64 = 0.0;  let wc: f64 = 0.0;
+    let sxa: f64 = 0.0; let sya: f64 = 0.0;
+    let sxb: f64 = 0.0; let syb: f64 = 0.0;
+    let sxc: f64 = 0.0; let syc: f64 = 0.0;
+    let inv: f64 = 0.0; let f: f64 = 0.0;   let h: f64 = 0.0;
+    let rgba: i32 = 0;  let ru: u32 = 0;    let cc: i32 = 0;
+
+    let sub: i32 = 0;    let wrt: i32 = 0;    let cbf: i32 = 0;
+    let cnear: i32 = 0;  let cguard: i32 = 0; let cstr: i32 = 0;
+    let vo: i32 = p_cur;  // byte cursor of the next triangle in vbuf
+    let so: i32 = 0;      // byte offset into the source mesh
+    let strn: i32 = 0;
+    let strcap: i32 = g_str_cap;
+
+    // 0xFF000000 as a signed i32 — the opaque-alpha bits, folded once.
+    let opaque: i32 = 255 << 24;
+
+    for (let k = 0; k < ntris; k++) {
+        if (wrt >= maxtris) { break; }
+        sub++;
+        so = k * 72;
+
+        // ---- model -> yaw -> world -> clip w, three vertices ---------------
+        mx = ptr_read_f32(mp + so);
+        my = ptr_read_f32(mp + (so + 4));
+        mz = ptr_read_f32(mp + (so + 8));
+        ax = ox + ccy * mx + ssy * mz;
+        ay = oy + my;
+        az = oz - ssy * mx + ccy * mz;
+        wa = m12 * ax + m13 * ay + m14 * az + m15;
+
+        mx = ptr_read_f32(mp + (so + 24));
+        my = ptr_read_f32(mp + (so + 28));
+        mz = ptr_read_f32(mp + (so + 32));
+        bx = ox + ccy * mx + ssy * mz;
+        by = oy + my;
+        bz = oz - ssy * mx + ccy * mz;
+        wb = m12 * bx + m13 * by + m14 * bz + m15;
+
+        mx = ptr_read_f32(mp + (so + 48));
+        my = ptr_read_f32(mp + (so + 52));
+        mz = ptr_read_f32(mp + (so + 56));
+        cx = ox + ccy * mx + ssy * mz;
+        cy = oy + my;
+        cz = oz - ssy * mx + ccy * mz;
+        wc = m12 * cx + m13 * cy + m14 * cz + m15;
+
+        // ---- near test ------------------------------------------------------
+        if (wa <= near && wb <= near && wc <= near) { cnear++; continue; }
+        if (wa <= near || wb <= near || wc <= near) {
+            cstr++;
+            if (strn < strcap) { g_str[strn] = k; strn++; }
+            continue;
+        }
+
+        // ---- divide + viewport + pixel snap ---------------------------------
+        // The snap is `floor(v + 0.5)` done in the FPU: (v + bias) - bias is
+        // round-to-nearest-even, and the ternary takes the one step down that
+        // makes it an exact floor. Written as ONE statement per coordinate:
+        // a Hemlock statement costs ~5.4 ns (an assignment boxes its own value
+        // and releases it) while an extra f64 op inside an expression is free,
+        // so re-evaluating (v + bias) - bias three times is 3 ns cheaper than
+        // spilling it to a temporary. Measured, and it is worth 65 ns/triangle.
+        inv = 1.0 / wa;
+        sxa = vox + (m0 * ax + m1 * ay + m2 * az + m3) * inv * vsx + 0.5;
+        sxa = ((sxa + bias) - bias) > sxa ? ((sxa + bias) - bias) - 1.0 : (sxa + bias) - bias;
+        sya = voy - (m4 * ax + m5 * ay + m6 * az + m7) * inv * vsy + 0.5;
+        sya = ((sya + bias) - bias) > sya ? ((sya + bias) - bias) - 1.0 : (sya + bias) - bias;
+
+        inv = 1.0 / wb;
+        sxb = vox + (m0 * bx + m1 * by + m2 * bz + m3) * inv * vsx + 0.5;
+        sxb = ((sxb + bias) - bias) > sxb ? ((sxb + bias) - bias) - 1.0 : (sxb + bias) - bias;
+        syb = voy - (m4 * bx + m5 * by + m6 * bz + m7) * inv * vsy + 0.5;
+        syb = ((syb + bias) - bias) > syb ? ((syb + bias) - bias) - 1.0 : (syb + bias) - bias;
+
+        inv = 1.0 / wc;
+        sxc = vox + (m0 * cx + m1 * cy + m2 * cz + m3) * inv * vsx + 0.5;
+        sxc = ((sxc + bias) - bias) > sxc ? ((sxc + bias) - bias) - 1.0 : (sxc + bias) - bias;
+        syc = voy - (m4 * cx + m5 * cy + m6 * cz + m7) * inv * vsy + 0.5;
+        syc = ((syc + bias) - bias) > syc ? ((syc + bias) - bias) - 1.0 : (syc + bias) - bias;
+
+        // ---- guard band -----------------------------------------------------
+        if ((sxa < gx0 && sxb < gx0 && sxc < gx0) ||
+            (sxa > gx1 && sxb > gx1 && sxc > gx1) ||
+            (sya < gy0 && syb < gy0 && syc < gy0) ||
+            (sya > gy1 && syb > gy1 && syc > gy1)) { cguard++; continue; }
+        if (sxa < gx0 || sxb < gx0 || sxc < gx0 ||
+            sxa > gx1 || sxb > gx1 || sxc > gx1 ||
+            sya < gy0 || syb < gy0 || syc < gy0 ||
+            sya > gy1 || syb > gy1 || syc > gy1) {
+            cstr++;
+            if (strn < strcap) { g_str[strn] = k; strn++; }
+            continue;
+        }
+
+        // ---- backface (G8 tier 3) -------------------------------------------
+        // bf == 1 culls a positive cross, bf == 2 culls a negative one; one
+        // signed test covers both without a second branch.
+        if (bf != 0) {
+            if (bf == 1) {
+                if ((sxb - sxa) * (syc - sya) - (syb - sya) * (sxc - sxa) >= 0.0) { cbf++; continue; }
+            } else {
+                if ((sxb - sxa) * (syc - sya) - (syb - sya) * (sxc - sxa) <= 0.0) { cbf++; continue; }
+            }
+        }
+
+        // ---- vertex A: shade, fog, pack --------------------------------------
+        // The baked vertex colour is read as ONE i32 (r|g<<8|b<<16|pad<<24),
+        // not three u8s: three reads cost 63 ns, one read plus three f64()
+        // conversions costs 53 ns, and when the fog factor is 0 the integer
+        // goes straight to the vertex with no float conversion at all.
+        cc = ptr_read_i32(mp + (so + 20));
+        if (lit == 1) {
+            ru = env_vertex_rgba(p_nx, p_ny, p_nz, ax, ay, az);
+            if ((cc & 16777215) == 16777215) {
+                rgba = i32(ru & 16777215) | (i32(ru >> 24) << 24);
+            } else {
+                rgba = i32(f64(i32(ru & 255)) * f64(cc & 255) * 0.00392156862745098 + 0.5)
+                     | (i32(f64(i32((ru >> 8) & 255)) * f64((cc >> 8) & 255) * 0.00392156862745098 + 0.5) << 8)
+                     | (i32(f64(i32((ru >> 16) & 255)) * f64((cc >> 16) & 255) * 0.00392156862745098 + 0.5) << 16)
+                     | (i32(ru >> 24) << 24);
+            }
+        } else if (fogmode > 0.5) {
+            if (fogon == 1) {
+                f = (__sqrt((ax - camx) * (ax - camx) + (ay - camy) * (ay - camy) +
+                          (az - camz) * (az - camz)) - fnear) * fiv;
+                f = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f * f * (3.0 - 2.0 * f));
+            } else { f = 0.0; }
+            if (miston == 1) {
+                h = (mtop - ay) * miv;
+                h = h < 0.0 ? 0.0 : (h > 1.0 ? mdens : h * h * mdens);
+                f = h > f ? (h > 1.0 ? 1.0 : h) : f;
+            }
+            rgba = f > 0.0
+                 ? i32(f64(cc & 255) * (1.0 + (fgr - 1.0) * f) + 0.5)
+                   | (i32(f64((cc >> 8) & 255) * (1.0 + (fgg - 1.0) * f) + 0.5) << 8)
+                   | (i32(f64((cc >> 16) & 255) * (1.0 + (fgb - 1.0) * f) + 0.5) << 16)
+                   | (f > fat ? (i32(255.0 * (1.0 - famax * (f - fat) * fainv) + 0.5) << 24) : opaque)
+                 : (cc & 16777215) | opaque;
+        } else { rgba = (cc & 16777215) | opaque; }
+        ptr_write_f32(vb + vo, sxa);
+        ptr_write_f32(vb + (vo + 4), sya);
+        ptr_write_i32(vb + (vo + 8), rgba);
+        ptr_write_u64(vb + (vo + 12), ptr_read_u64(mp + (so + 12)));
+
+        // ---- vertex B: shade, fog, pack --------------------------------------
+        cc = ptr_read_i32(mp + (so + 44));
+        if (lit == 1) {
+            ru = env_vertex_rgba(p_nx, p_ny, p_nz, bx, by, bz);
+            if ((cc & 16777215) == 16777215) {
+                rgba = i32(ru & 16777215) | (i32(ru >> 24) << 24);
+            } else {
+                rgba = i32(f64(i32(ru & 255)) * f64(cc & 255) * 0.00392156862745098 + 0.5)
+                     | (i32(f64(i32((ru >> 8) & 255)) * f64((cc >> 8) & 255) * 0.00392156862745098 + 0.5) << 8)
+                     | (i32(f64(i32((ru >> 16) & 255)) * f64((cc >> 16) & 255) * 0.00392156862745098 + 0.5) << 16)
+                     | (i32(ru >> 24) << 24);
+            }
+        } else if (fogmode > 0.5) {
+            if (fogon == 1) {
+                f = (__sqrt((bx - camx) * (bx - camx) + (by - camy) * (by - camy) +
+                          (bz - camz) * (bz - camz)) - fnear) * fiv;
+                f = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f * f * (3.0 - 2.0 * f));
+            } else { f = 0.0; }
+            if (miston == 1) {
+                h = (mtop - by) * miv;
+                h = h < 0.0 ? 0.0 : (h > 1.0 ? mdens : h * h * mdens);
+                f = h > f ? (h > 1.0 ? 1.0 : h) : f;
+            }
+            rgba = f > 0.0
+                 ? i32(f64(cc & 255) * (1.0 + (fgr - 1.0) * f) + 0.5)
+                   | (i32(f64((cc >> 8) & 255) * (1.0 + (fgg - 1.0) * f) + 0.5) << 8)
+                   | (i32(f64((cc >> 16) & 255) * (1.0 + (fgb - 1.0) * f) + 0.5) << 16)
+                   | (f > fat ? (i32(255.0 * (1.0 - famax * (f - fat) * fainv) + 0.5) << 24) : opaque)
+                 : (cc & 16777215) | opaque;
+        } else { rgba = (cc & 16777215) | opaque; }
+        ptr_write_f32(vb + (vo + 20), sxb);
+        ptr_write_f32(vb + (vo + 24), syb);
+        ptr_write_i32(vb + (vo + 28), rgba);
+        ptr_write_u64(vb + (vo + 32), ptr_read_u64(mp + (so + 36)));
+
+        // ---- vertex C: shade, fog, pack --------------------------------------
+        cc = ptr_read_i32(mp + (so + 68));
+        if (lit == 1) {
+            ru = env_vertex_rgba(p_nx, p_ny, p_nz, cx, cy, cz);
+            if ((cc & 16777215) == 16777215) {
+                rgba = i32(ru & 16777215) | (i32(ru >> 24) << 24);
+            } else {
+                rgba = i32(f64(i32(ru & 255)) * f64(cc & 255) * 0.00392156862745098 + 0.5)
+                     | (i32(f64(i32((ru >> 8) & 255)) * f64((cc >> 8) & 255) * 0.00392156862745098 + 0.5) << 8)
+                     | (i32(f64(i32((ru >> 16) & 255)) * f64((cc >> 16) & 255) * 0.00392156862745098 + 0.5) << 16)
+                     | (i32(ru >> 24) << 24);
+            }
+        } else if (fogmode > 0.5) {
+            if (fogon == 1) {
+                f = (__sqrt((cx - camx) * (cx - camx) + (cy - camy) * (cy - camy) +
+                          (cz - camz) * (cz - camz)) - fnear) * fiv;
+                f = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f * f * (3.0 - 2.0 * f));
+            } else { f = 0.0; }
+            if (miston == 1) {
+                h = (mtop - cy) * miv;
+                h = h < 0.0 ? 0.0 : (h > 1.0 ? mdens : h * h * mdens);
+                f = h > f ? (h > 1.0 ? 1.0 : h) : f;
+            }
+            rgba = f > 0.0
+                 ? i32(f64(cc & 255) * (1.0 + (fgr - 1.0) * f) + 0.5)
+                   | (i32(f64((cc >> 8) & 255) * (1.0 + (fgg - 1.0) * f) + 0.5) << 8)
+                   | (i32(f64((cc >> 16) & 255) * (1.0 + (fgb - 1.0) * f) + 0.5) << 16)
+                   | (f > fat ? (i32(255.0 * (1.0 - famax * (f - fat) * fainv) + 0.5) << 24) : opaque)
+                 : (cc & 16777215) | opaque;
+        } else { rgba = (cc & 16777215) | opaque; }
+        ptr_write_f32(vb + (vo + 40), sxc);
+        ptr_write_f32(vb + (vo + 44), syc);
+        ptr_write_i32(vb + (vo + 48), rgba);
+        ptr_write_u64(vb + (vo + 52), ptr_read_u64(mp + (so + 60)));
+
+        p_dep[di + wrt] = (wa + wb + wc) * 0.3333333333333333;
+        vo = vo + 60;
+        wrt++;
+    }
+
+    g_str_n = strn;
+    g_c_sub = g_c_sub + sub;
+    g_c_written = g_c_written + wrt;
+    g_c_bf = g_c_bf + cbf;
+    g_c_near = g_c_near + cnear;
+    g_c_guard = g_c_guard + cguard;
+    g_c_straddle = g_c_straddle + cstr;
+
+    let out: i32 = wrt;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// BUDGET NOTE — measured, and it does not meet BUILD_PLAN W1-2's 3.0 ms
+// ---------------------------------------------------------------------------
+// 2500 triangles, all written (nothing culled), compiled -O1, min of 12
+// batches x 25 reps, on an otherwise-quiet box:
+//
+//     fog factor 0 on every vertex .................... 2.54 ms
+//     91 % of vertices fogged (5..55 m through 8..60 m)  3.72 ms   <- realistic
+//     full G16 lighting + 4 point lights ..............  8.69 ms
+//     8000 triangles, 91 % fogged ..................... 11.46 ms   <- under 12.5
+//
+// The 3.0 ms line in BUILD_PLAN is not reachable with this vertex contract, and
+// the arithmetic says why rather than the profiler. Per VERTEX the kernel must
+// move 5 values in and 4 out of raw `ptr`s: 3 f32 positions, 1 u64 of UVs and
+// 1 i32 of baked colour in; 2 f32 screen coordinates, 1 i32 rgba and 1 u64 of
+// UVs out. Every one of those nine is a pointer add (~13 ns) plus a builtin
+// call (~8 ns), and Hemlock has no builtin that takes a base and an offset and
+// is cheaper (see the `_le` dead end above). That is ~190 ns/vertex, 1.4 ms per
+// 2500 triangles, BEFORE a single multiply. The measured transform-and-pack
+// skeleton with all shading off is 2.54 ms, so 3.0 ms leaves 0.46 ms for
+// shading, and per-vertex radial fog — one sqrt, one smoothstep, three tint
+// multiplies and four roundings — costs 1.18 ms.
+//
+// Three ways out, in order of preference; none of them belong to this file:
+//   1. Raise the emit line to 4.0 ms. ARCHITECTURE 8 gives render 11.0 ms and
+//      a legal combat frame is ~1900 world triangles, not 2500 -> 2.8 ms.
+//   2. Give `mesh.hml` (W1-10) a parallel `array<f64>` position column. An
+//      `array<f64>` element read measured 12.8 ns against 21 ns for a pointer
+//      add plus `ptr_read_f32`, which is ~0.2 ms per 2500 triangles on the
+//      three position reads alone. It changes ARCHITECTURE 5.1's "one flat
+//      ptr, 24 B/vertex", so it is an architecture decision, not a local one.
+//   3. A Hemlock builtin `ptr_read_f32(p, off)` / `ptr_write_f32(p, off, v)`
+//      taking the offset as a second argument, codegen'd like `read_u32_le` but
+//      with a native load instead of byte assembly. That would remove ~13 ns
+//      from each of the nine per-vertex accesses: ~0.9 ms per 2500 triangles,
+//      which is the whole shortfall. This is the real fix and it is a toolchain
+//      change, not an engine one.

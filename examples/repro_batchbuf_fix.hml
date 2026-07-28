@@ -1,0 +1,36 @@
+// same as sky3 but each texture run gets its OWN region of one big vertex buffer
+import { window_open, upload_texture, clear, read_pixels, window_close, draw_tris } from "../src/sdl.hml";
+import { tex_sky, tex_grass, tex_checker } from "../src/texture.hml";
+let VS = 20;
+fn put(buf: ptr, vi: i32, x: f64, y: f64, u: f64, v: f64) {
+    let o = vi * VS;
+    ptr_write_f32(ptr_offset(buf, o, 1), x);
+    ptr_write_f32(ptr_offset(buf, o+4, 1), y);
+    ptr_write_u8(ptr_offset(buf, o+8, 1), 255);
+    ptr_write_u8(ptr_offset(buf, o+9, 1), 255);
+    ptr_write_u8(ptr_offset(buf, o+10, 1), 255);
+    ptr_write_u8(ptr_offset(buf, o+11, 1), 255);
+    ptr_write_f32(ptr_offset(buf, o+12, 1), u);
+    ptr_write_f32(ptr_offset(buf, o+16, 1), v);
+}
+fn main() {
+    let win = window_open("s7", 320, 240, 1);
+    let gtex = upload_texture(win, tex_grass(64,64));
+    let ctex = upload_texture(win, tex_checker(64,64,4));
+    let st = upload_texture(win, tex_sky(320, 128));
+    let buf = alloc(64 * VS);
+    clear(win, 0, 0, 0);
+    // run 1: sky, verts 0..5
+    put(buf,0, 0.0,0.0, 0.0,0.0); put(buf,1, 320.0,0.0, 1.0,0.0); put(buf,2, 320.0,240.0, 1.0,1.0);
+    put(buf,3, 0.0,0.0, 0.0,0.0); put(buf,4, 320.0,240.0, 1.0,1.0); put(buf,5, 0.0,240.0, 0.0,1.0);
+    // run 2: grass, verts 6..11 (disjoint region)
+    put(buf,6, 0.0,150.0, 0.0,0.0); put(buf,7, 320.0,150.0, 1.0,0.0); put(buf,8, 320.0,240.0, 1.0,1.0);
+    put(buf,9, 0.0,150.0, 0.0,0.0); put(buf,10, 320.0,240.0, 1.0,1.0); put(buf,11, 0.0,240.0, 0.0,1.0);
+    draw_tris(win, st, buf, 6);
+    draw_tris(win, gtex, ptr_offset(buf, 6 * VS, 1), 6);
+    let px = buffer(320*240*3);
+    read_pixels(win, px);
+    print(`top=${px[0]},${px[1]},${px[2]}  mid(160,60)=${px[(60*320+160)*3]},${px[(60*320+160)*3+1]},${px[(60*320+160)*3+2]}`);
+    window_close(win);
+}
+main();

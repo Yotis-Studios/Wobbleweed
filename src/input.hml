@@ -1,0 +1,645 @@
+// input.hml — held / pressed / released edges for keys and mouse buttons,
+// wheel accumulation, relative mouse deltas, and an action map.
+// ENGINE_GAPS G9. Task W1-6.
+//
+// GENERIC ENGINE MODULE (RULE R1). It knows about scancodes, buttons, wheels,
+// deltas and integer action ids. It does not know what an action MEANS. There
+// is no FIRE, no JUMP, no SPRINT in this file and there never will be: the game
+// binds its own integer ids with input_bind_key / input_bind_button. Any
+// PS1-style game could link this file unchanged.
+//
+// -----------------------------------------------------------------------------
+// WHY EDGES COME FROM EVENTS AND NOT FROM DIFFING keystate()
+// -----------------------------------------------------------------------------
+// The acceptance criterion is: a key pressed and released INSIDE ONE FRAME must
+// report exactly one `pressed` and one `released`. A diff of SDL's keyboard
+// state array between frame N-1 and frame N cannot do that — the key is up at
+// both samples, so the whole press vanishes. At 60 fps with a 16.7 ms frame
+// that is a real, frequent event (a tap is 30-60 ms, but a dropped frame or a
+// 240 Hz-capable player makes it routine), and a lost shot is unforgivable.
+//
+// So `down` is maintained from EV_KEYDOWN / EV_KEYUP, and the edge flags are
+// set by the same events. keystate() is used only by input_sync_held(), which
+// the caller may run after regaining window focus to repair keys whose KEYUP
+// was delivered to somebody else.
+//
+// -----------------------------------------------------------------------------
+// WHY MOUSE MOTION DOES NOT COME THROUGH poll_events()
+// -----------------------------------------------------------------------------
+// sdl.hml's poll_events() deliberately does not report EV_MOUSEMOTION (its
+// xrel/yrel live at byte offsets that could silently change; the API call
+// cannot). SDL_GetRelativeMouseState — sdl.hml's rel_mouse_delta() — already
+// SUMS every motion event since the previous call and then zeroes its own
+// accumulator, so "three motion events in one frame sum into one delta" is
+// satisfied by construction: input_sample() calls it exactly once per frame.
+//
+// input_feed_mouse() adds to the same per-frame accumulator, so a second delta
+// source (a gamepad stick, a touch drag, a test injector) sums with the mouse
+// instead of fighting it. It is also how the accumulation is verified headless,
+// where there is no mouse at all.
+//
+// -----------------------------------------------------------------------------
+// RELATIVE MODE FAILS HEADLESS AND THAT IS NOT FATAL
+// -----------------------------------------------------------------------------
+// SDL_SetRelativeMouseMode returns -1 under SDL_VIDEODRIVER=dummy ("No relative
+// mode implementation available"); the WARP hint does not rescue it.
+// input_set_relative() RETURNS THE STATUS, records it, and returns. It never
+// throws, never exits, and leaves the cursor alone on failure, so a headless
+// tool keeps rendering exactly as it would have. Callers must check the status
+// and carry on — never treat it as fatal.
+//
+// -----------------------------------------------------------------------------
+// ALLOCATION
+// -----------------------------------------------------------------------------
+// Everything is allocated once, in input_new(): the event scratch array, the
+// state arrays, the 16-byte pointer scratch. The per-frame path allocates
+// nothing — no objects, no strings, no closures. Edge flags are cleared through
+// a touched-list, so the cost of a frame is proportional to the number of keys
+// that actually changed, not to 512.
+
+import {
+    poll_events, keystate, held,
+    set_relative_mouse, get_relative_mouse, rel_mouse_delta, mouse_pos,
+    show_cursor, sdl_error,
+    EV_QUIT, EV_KEYDOWN, EV_KEYUP,
+    EV_MOUSEBUTTONDOWN, EV_MOUSEBUTTONUP, EV_MOUSEWHEEL,
+    NUM_SCANCODES, MBI_LEFT, MBI_MIDDLE, MBI_RIGHT
+} from "./sdl.hml";
+
+// ---------------------------------------------------------------------------
+// Capacities
+// ---------------------------------------------------------------------------
+
+// Scancode space. SDL_NUM_SCANCODES is 512; every SC_* in sdl.hml is below it.
+export let INPUT_MAX_SCANCODES = 512;
+
+// Mouse button indices are 1-based in SDL (MBI_LEFT=1 .. X2=5). Slot 0 unused.
+export let INPUT_MAX_BUTTONS = 8;
+
+// Events drained into the scratch array per sample. sdl.hml's poll_events
+// always empties the SDL queue, but it only WRITES the first `max`, and its
+// return value is clamped, so truncation cannot be detected by the caller.
+// 256 is chosen far above any plausible one-frame burst (a human generates
+// single digits; a key-repeat storm generates tens) so that a KEYUP can never
+// be silently lost and leave a key stuck down.
+export let INPUT_MAX_EVENTS = 256;
+
+// Action map. Ids are 0..INPUT_MAX_ACTIONS-1 and are assigned BY THE GAME.
+export let INPUT_MAX_ACTIONS = 64;
+export let INPUT_BINDS_PER_ACTION = 2;
+
+// input_set_relative status codes (the SDL return value is passed through).
+export let INPUT_REL_OK = 0;
+export let INPUT_REL_FAIL = -1;
+
+// Mouse button ids, re-exported so a caller that binds buttons does not have to
+// import sdl.hml as well.
+export let INPUT_MB_LEFT = 1;
+export let INPUT_MB_MIDDLE = 2;
+export let INPUT_MB_RIGHT = 3;
+export let INPUT_MB_X1 = 4;
+export let INPUT_MB_X2 = 5;
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+fn zeros(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    for (let i = 0; i < n; i++) { a.push(0); }
+    let out: array<i32> = a;
+    return out;
+}
+
+// UNTYPED array, deliberately. sdl.hml's poll_events() writes the event type
+// and the key scancode with ptr_deref_u32(), so the values it stores are u32,
+// and storing a u32 into an `array<i32>` throws
+// "Type mismatch in typed array - expected element of specific type" at
+// runtime. The scratch the engine hands to poll_events must therefore be an
+// untyped array. (Reported against sdl.hml; not fixed here — not this task's
+// file.)
+fn zeros_any(p_n: i32): array {
+    let n: i32 = p_n;
+    let a: array = [];
+    for (let i = 0; i < n; i++) { a.push(0); }
+    let out: array = a;
+    return out;
+}
+
+fn fill_neg(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    for (let i = 0; i < n; i++) { a.push(-1); }
+    let out: array<i32> = a;
+    return out;
+}
+
+// A new input state block. Field layout, for readers of this file:
+//
+//   down  press  rel  rep    array<i32>[512]  keyboard, indexed by scancode
+//   bdown bpress brel        array<i32>[8]    mouse buttons, indexed 1..5
+//   kdirty bdirty            array<i32>       scancodes/buttons touched this
+//                                             frame; the edge-clear worklist
+//   mdx mdy                  f64              summed relative motion this frame
+//   mx my                    i32              last absolute pointer position
+//   wx wy                    i32              summed wheel this frame
+//   quit                     i32              1 once EV_QUIT has been seen
+//   relative                 i32              1 while relative mode is on
+//   rel_status               i32              last SDL status from set_relative
+//   rel_err                  string           SDL_GetError() at the last failure
+//   evs                      array            poll_events scratch, 3 ints/event
+//                                             (untyped — see zeros_any)
+//   evn                      i32              events read by the last sample
+//   frames                   i32              samples taken
+//   abind bbind              array<i32>       action map, -1 = empty slot
+//   scratch                  ptr              16 B for rel_mouse_delta/mouse_pos
+export fn input_new(): object {
+    return {
+        down: zeros(INPUT_MAX_SCANCODES),
+        press: zeros(INPUT_MAX_SCANCODES),
+        rel: zeros(INPUT_MAX_SCANCODES),
+        rep: zeros(INPUT_MAX_SCANCODES),
+        bdown: zeros(INPUT_MAX_BUTTONS),
+        bpress: zeros(INPUT_MAX_BUTTONS),
+        brel: zeros(INPUT_MAX_BUTTONS),
+        kdirty: [],
+        bdirty: [],
+        mdx: 0.0, mdy: 0.0,
+        mx: 0, my: 0,
+        wx: 0, wy: 0,
+        quit: 0,
+        relative: 0,
+        rel_status: 0,
+        rel_err: "",
+        evs: zeros_any(INPUT_MAX_EVENTS * 3),
+        evn: 0,
+        frames: 0,
+        abind: fill_neg(INPUT_MAX_ACTIONS * INPUT_BINDS_PER_ACTION),
+        bbind: fill_neg(INPUT_MAX_ACTIONS * INPUT_BINDS_PER_ACTION),
+        scratch: alloc(16)
+    };
+}
+
+// Release the one raw allocation. Everything else is refcounted. Call at
+// shutdown, after the last input_sample.
+export fn input_free(p_in: object) {
+    let s: object = p_in;
+    if (s.scratch != ptr_null()) { free(s.scratch); s.scratch = ptr_null(); }
+}
+
+// Forget everything: all keys up, all edges cleared, deltas zeroed, quit
+// cleared. Bindings and relative-mouse state are preserved. Call this when the
+// window loses focus, or when opening a menu that must not inherit a held key.
+export fn input_clear(p_in: object) {
+    let s: object = p_in;
+    let down: array<i32> = s.down;
+    let press: array<i32> = s.press;
+    let rel: array<i32> = s.rel;
+    let rep: array<i32> = s.rep;
+    for (let i = 0; i < INPUT_MAX_SCANCODES; i++) {
+        down[i] = 0; press[i] = 0; rel[i] = 0; rep[i] = 0;
+    }
+    let bd: array<i32> = s.bdown;
+    let bp: array<i32> = s.bpress;
+    let br: array<i32> = s.brel;
+    for (let b = 0; b < INPUT_MAX_BUTTONS; b++) { bd[b] = 0; bp[b] = 0; br[b] = 0; }
+    let kd: array<i32> = s.kdirty;
+    let bdl: array<i32> = s.bdirty;
+    kd.clear();
+    bdl.clear();
+    s.mdx = 0.0; s.mdy = 0.0;
+    s.wx = 0; s.wy = 0;
+    s.quit = 0;
+}
+
+// ---------------------------------------------------------------------------
+// The per-frame path
+// ---------------------------------------------------------------------------
+
+// Clear last frame's edges and accumulators. Held state survives; that is the
+// whole point of it. Called by input_sample; exposed so a caller driving the
+// state machine by hand (tests, replay, a network-fed client) can use the same
+// begin -> feed -> read shape.
+export fn input_begin_frame(p_in: object) {
+    let s: object = p_in;
+    let press: array<i32> = s.press;
+    let rel: array<i32> = s.rel;
+    let rep: array<i32> = s.rep;
+    let kd: array<i32> = s.kdirty;
+    let kn: i32 = kd.length;
+    for (let i = 0; i < kn; i++) {
+        let sc: i32 = kd[i];
+        press[sc] = 0; rel[sc] = 0; rep[sc] = 0;
+    }
+    kd.clear();
+
+    let bp: array<i32> = s.bpress;
+    let br: array<i32> = s.brel;
+    let bd: array<i32> = s.bdirty;
+    let bn: i32 = bd.length;
+    for (let j = 0; j < bn; j++) {
+        let b: i32 = bd[j];
+        bp[b] = 0; br[b] = 0;
+    }
+    bd.clear();
+
+    s.mdx = 0.0;
+    s.mdy = 0.0;
+    s.wx = 0;
+    s.wy = 0;
+    s.frames = s.frames + 1;
+}
+
+// Apply `n` events from `evs`, the flat [type, a, b] triples that
+// sdl.hml poll_events() writes. Exported so events can be injected
+// synthetically — that is how edge behaviour is verified headless, where SDL
+// will never deliver a key.
+//
+// Unknown event types are ignored, out-of-range scancodes and buttons are
+// dropped rather than corrupting memory.
+export fn input_apply_events(p_in: object, p_evs, p_n: i32) {
+    let s: object = p_in;
+    let evs = p_evs;
+    let n: i32 = p_n;
+    let down: array<i32> = s.down;
+    let press: array<i32> = s.press;
+    let rel: array<i32> = s.rel;
+    let rep: array<i32> = s.rep;
+    let kd: array<i32> = s.kdirty;
+    let bd: array<i32> = s.bdown;
+    let bp: array<i32> = s.bpress;
+    let br: array<i32> = s.brel;
+    let bl: array<i32> = s.bdirty;
+
+    for (let e = 0; e < n; e++) {
+        let i: i32 = e * 3;
+        let t: i32 = evs[i];
+        let a: i32 = evs[i + 1];
+        let b: i32 = evs[i + 2];
+
+        if (t == EV_KEYDOWN) {
+            if (a >= 0 && a < INPUT_MAX_SCANCODES) {
+                down[a] = 1;
+                if (b != 0) {
+                    // Auto-repeat: held, but NOT a new press edge. Menus and
+                    // text fields want it; gameplay must never see it.
+                    rep[a] = 1;
+                } else {
+                    press[a] = 1;
+                }
+                kd.push(a);
+            }
+        } else if (t == EV_KEYUP) {
+            if (a >= 0 && a < INPUT_MAX_SCANCODES) {
+                down[a] = 0;
+                rel[a] = 1;
+                kd.push(a);
+            }
+        } else if (t == EV_MOUSEBUTTONDOWN) {
+            if (a > 0 && a < INPUT_MAX_BUTTONS) {
+                bd[a] = 1;
+                bp[a] = 1;
+                bl.push(a);
+            }
+        } else if (t == EV_MOUSEBUTTONUP) {
+            if (a > 0 && a < INPUT_MAX_BUTTONS) {
+                bd[a] = 0;
+                br[a] = 1;
+                bl.push(a);
+            }
+        } else if (t == EV_MOUSEWHEEL) {
+            s.wx = s.wx + a;
+            s.wy = s.wy + b;
+        } else if (t == EV_QUIT) {
+            s.quit = 1;
+        }
+    }
+}
+
+// Add a relative delta to this frame's accumulator. Every source sums into the
+// same pair, so mouse + stick + injected motion compose instead of clobbering.
+export fn input_feed_mouse(p_in: object, p_dx: f64, p_dy: f64) {
+    let s: object = p_in;
+    s.mdx = s.mdx + p_dx;
+    s.mdy = s.mdy + p_dy;
+}
+
+// The whole frame's input, in one call: clear edges, drain the event queue,
+// sum the relative motion, refresh the absolute pointer position.
+// Returns the number of events applied.
+//
+// Order matters. poll_events() pumps SDL, which is what fills SDL's internal
+// relative-motion accumulator, so rel_mouse_delta() must be read AFTER the
+// drain or the frame's motion arrives one frame late.
+export fn input_sample(p_in: object, p_w: object): i32 {
+    let s: object = p_in;
+    let w: object = p_w;
+    input_begin_frame(s);
+
+    let evs: array = s.evs;
+    let n: i32 = poll_events(w, evs, INPUT_MAX_EVENTS);
+    s.evn = n;
+    input_apply_events(s, evs, n);
+
+    // Read the deltas unconditionally, in relative mode or not: the call also
+    // CONSUMES SDL's accumulator, so skipping it would let motion pile up and
+    // arrive as one enormous jump the moment relative mode is enabled.
+    let sp: ptr = s.scratch;
+    rel_mouse_delta(sp);
+    let dx: i32 = ptr_deref_i32(sp);
+    let dy: i32 = ptr_deref_i32(ptr_offset(sp, 4, 1));
+    s.mdx = s.mdx + f64(dx);
+    s.mdy = s.mdy + f64(dy);
+
+    mouse_pos(ptr_offset(sp, 8, 1));
+    s.mx = ptr_deref_i32(ptr_offset(sp, 8, 1));
+    s.my = ptr_deref_i32(ptr_offset(sp, 12, 1));
+
+    let out: i32 = n;
+    return out;
+}
+
+// Repair held state from SDL's authoritative keyboard array. A KEYUP delivered
+// while the window was not focused never reaches us, which leaves a key stuck
+// down; call this on focus-gained. It does NOT synthesize edges — a key that
+// went up off-window was not released "this frame".
+export fn input_sync_held(p_in: object) {
+    let s: object = p_in;
+    let down: array<i32> = s.down;
+    let ks: ptr = keystate();
+    if (ks == ptr_null()) { return; }
+    let n: i32 = NUM_SCANCODES;
+    if (n > INPUT_MAX_SCANCODES) { n = INPUT_MAX_SCANCODES; }
+    for (let i = 0; i < n; i++) {
+        if (held(ks, i)) { down[i] = 1; } else { down[i] = 0; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard queries
+// ---------------------------------------------------------------------------
+
+export fn input_down(p_in: object, p_sc: i32): bool {
+    let sc: i32 = p_sc;
+    if (sc < 0 || sc >= INPUT_MAX_SCANCODES) { return false; }
+    let a: array<i32> = p_in.down;
+    let out: bool = a[sc] != 0;
+    return out;
+}
+
+export fn input_pressed(p_in: object, p_sc: i32): bool {
+    let sc: i32 = p_sc;
+    if (sc < 0 || sc >= INPUT_MAX_SCANCODES) { return false; }
+    let a: array<i32> = p_in.press;
+    let out: bool = a[sc] != 0;
+    return out;
+}
+
+export fn input_released(p_in: object, p_sc: i32): bool {
+    let sc: i32 = p_sc;
+    if (sc < 0 || sc >= INPUT_MAX_SCANCODES) { return false; }
+    let a: array<i32> = p_in.rel;
+    let out: bool = a[sc] != 0;
+    return out;
+}
+
+// True while the OS key-repeat is firing for this key, and only on the frames
+// it fires. Menus and text entry; never gameplay.
+export fn input_repeated(p_in: object, p_sc: i32): bool {
+    let sc: i32 = p_sc;
+    if (sc < 0 || sc >= INPUT_MAX_SCANCODES) { return false; }
+    let a: array<i32> = p_in.rep;
+    let out: bool = a[sc] != 0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Mouse queries
+// ---------------------------------------------------------------------------
+
+// Relative motion summed over every source and every event of this frame.
+// Pixels, +x right, +y down. f64 because a sub-pixel source (a stick, a
+// smoothed delta) must be able to feed the same accumulator without rounding.
+export fn input_mouse_dx(p_in: object): f64 { let out: f64 = p_in.mdx; return out; }
+export fn input_mouse_dy(p_in: object): f64 { let out: f64 = p_in.mdy; return out; }
+
+// Absolute pointer position in window coordinates, as of the last sample.
+// Meaningless while relative mode is on; use it for menus and cursors.
+export fn input_mouse_x(p_in: object): i32 { let out: i32 = p_in.mx; return out; }
+export fn input_mouse_y(p_in: object): i32 { let out: i32 = p_in.my; return out; }
+
+export fn input_button(p_in: object, p_b: i32): bool {
+    let b: i32 = p_b;
+    if (b <= 0 || b >= INPUT_MAX_BUTTONS) { return false; }
+    let a: array<i32> = p_in.bdown;
+    let out: bool = a[b] != 0;
+    return out;
+}
+
+export fn input_button_pressed(p_in: object, p_b: i32): bool {
+    let b: i32 = p_b;
+    if (b <= 0 || b >= INPUT_MAX_BUTTONS) { return false; }
+    let a: array<i32> = p_in.bpress;
+    let out: bool = a[b] != 0;
+    return out;
+}
+
+export fn input_button_released(p_in: object, p_b: i32): bool {
+    let b: i32 = p_b;
+    if (b <= 0 || b >= INPUT_MAX_BUTTONS) { return false; }
+    let a: array<i32> = p_in.brel;
+    let out: bool = a[b] != 0;
+    return out;
+}
+
+// Wheel clicks accumulated this frame. +y is away from the user.
+export fn input_wheel(p_in: object): i32 { let out: i32 = p_in.wy; return out; }
+export fn input_wheel_x(p_in: object): i32 { let out: i32 = p_in.wx; return out; }
+
+// ---------------------------------------------------------------------------
+// Window-level state
+// ---------------------------------------------------------------------------
+
+// Sticky: set by EV_QUIT and cleared only by input_clear / input_clear_quit.
+// A quit request must never be lost because it landed on a frame nobody read.
+export fn input_quit(p_in: object): bool { let out: bool = p_in.quit != 0; return out; }
+export fn input_clear_quit(p_in: object) { let s: object = p_in; s.quit = 0; }
+
+// Events applied by the last input_sample.
+export fn input_event_count(p_in: object): i32 { let out: i32 = p_in.evn; return out; }
+
+// ---------------------------------------------------------------------------
+// Relative mouse mode — the one call that is ALLOWED to fail
+// ---------------------------------------------------------------------------
+
+// Turn relative (mouse-look) mode on or off. Returns SDL's status: 0 on
+// success, -1 on failure. FAILURE IS EXPECTED AND SURVIVABLE — under
+// SDL_VIDEODRIVER=dummy it always returns -1, and the caller must simply carry
+// on rendering. The cursor is hidden only if the mode actually engaged, so a
+// failed call leaves the desktop exactly as it found it.
+export fn input_set_relative(p_in: object, p_on: i32): i32 {
+    let s: object = p_in;
+    let on: i32 = p_on;
+    if (on != 0) { on = 1; }
+    let rc: i32 = set_relative_mouse(on);
+    s.rel_status = rc;
+    if (rc == 0) {
+        s.relative = on;
+        s.rel_err = "";
+        if (on == 1) { show_cursor(0); } else { show_cursor(1); }
+    } else {
+        // Believe SDL, not our intent: query what the mode actually is.
+        s.relative = get_relative_mouse();
+        s.rel_err = sdl_error();
+    }
+    let out: i32 = rc;
+    return out;
+}
+
+// 1 if relative mode is actually engaged right now (queried from SDL at the
+// last input_set_relative, not merely requested).
+export fn input_relative(p_in: object): i32 { let out: i32 = p_in.relative; return out; }
+
+// The status returned by the last input_set_relative call.
+export fn input_relative_status(p_in: object): i32 { let out: i32 = p_in.rel_status; return out; }
+
+// SDL_GetError() as captured at the last failure; "" if the last call worked.
+// For the log line the caller prints once, never per frame.
+export fn input_relative_error(p_in: object): string { let out: string = p_in.rel_err; return out; }
+
+// ---------------------------------------------------------------------------
+// Action map
+// ---------------------------------------------------------------------------
+//
+// An action is an integer the GAME defines. The engine stores up to
+// INPUT_BINDS_PER_ACTION keyboard binds and the same number of mouse-button
+// binds per action, and ORs their states. Two flat arrays, no objects, no
+// strings, no hashing.
+
+fn abind_slot(p_binds: array<i32>, p_action: i32, p_code: i32): i32 {
+    let binds: array<i32> = p_binds;
+    let base: i32 = p_action * INPUT_BINDS_PER_ACTION;
+    let code: i32 = p_code;
+    // Re-binding the same code is idempotent rather than consuming a slot.
+    for (let i = 0; i < INPUT_BINDS_PER_ACTION; i++) {
+        if (binds[base + i] == code) { let hit: i32 = i; return hit; }
+    }
+    for (let j = 0; j < INPUT_BINDS_PER_ACTION; j++) {
+        if (binds[base + j] < 0) { binds[base + j] = code; let s: i32 = j; return s; }
+    }
+    return -1;
+}
+
+// Bind a scancode to an action. Returns the slot used, or -1 if the action id
+// is out of range or every slot is taken.
+export fn input_bind_key(p_in: object, p_action: i32, p_sc: i32): i32 {
+    let a: i32 = p_action;
+    let sc: i32 = p_sc;
+    if (a < 0 || a >= INPUT_MAX_ACTIONS) { return -1; }
+    if (sc < 0 || sc >= INPUT_MAX_SCANCODES) { return -1; }
+    let out: i32 = abind_slot(p_in.abind, a, sc);
+    return out;
+}
+
+// Bind a mouse button (INPUT_MB_*) to an action.
+export fn input_bind_button(p_in: object, p_action: i32, p_b: i32): i32 {
+    let a: i32 = p_action;
+    let b: i32 = p_b;
+    if (a < 0 || a >= INPUT_MAX_ACTIONS) { return -1; }
+    if (b <= 0 || b >= INPUT_MAX_BUTTONS) { return -1; }
+    let out: i32 = abind_slot(p_in.bbind, a, b);
+    return out;
+}
+
+// Drop every bind on one action.
+export fn input_unbind(p_in: object, p_action: i32) {
+    let a: i32 = p_action;
+    if (a < 0 || a >= INPUT_MAX_ACTIONS) { return; }
+    let kb: array<i32> = p_in.abind;
+    let bb: array<i32> = p_in.bbind;
+    let base: i32 = a * INPUT_BINDS_PER_ACTION;
+    for (let i = 0; i < INPUT_BINDS_PER_ACTION; i++) { kb[base + i] = -1; bb[base + i] = -1; }
+}
+
+// Drop every bind on every action.
+export fn input_unbind_all(p_in: object) {
+    let kb: array<i32> = p_in.abind;
+    let bb: array<i32> = p_in.bbind;
+    let n: i32 = INPUT_MAX_ACTIONS * INPUT_BINDS_PER_ACTION;
+    for (let i = 0; i < n; i++) { kb[i] = -1; bb[i] = -1; }
+}
+
+// The scancode in one bind slot, or -1.
+export fn input_bound_key(p_in: object, p_action: i32, p_slot: i32): i32 {
+    let a: i32 = p_action;
+    let sl: i32 = p_slot;
+    if (a < 0 || a >= INPUT_MAX_ACTIONS) { return -1; }
+    if (sl < 0 || sl >= INPUT_BINDS_PER_ACTION) { return -1; }
+    let kb: array<i32> = p_in.abind;
+    let out: i32 = kb[a * INPUT_BINDS_PER_ACTION + sl];
+    return out;
+}
+
+// The mouse button in one bind slot, or -1.
+export fn input_bound_button(p_in: object, p_action: i32, p_slot: i32): i32 {
+    let a: i32 = p_action;
+    let sl: i32 = p_slot;
+    if (a < 0 || a >= INPUT_MAX_ACTIONS) { return -1; }
+    if (sl < 0 || sl >= INPUT_BINDS_PER_ACTION) { return -1; }
+    let bb: array<i32> = p_in.bbind;
+    let out: i32 = bb[a * INPUT_BINDS_PER_ACTION + sl];
+    return out;
+}
+
+// state selector: 0 = down, 1 = pressed, 2 = released.
+fn action_state(p_in: object, p_action: i32, p_which: i32): bool {
+    let s: object = p_in;
+    let a: i32 = p_action;
+    if (a < 0 || a >= INPUT_MAX_ACTIONS) { return false; }
+    let which: i32 = p_which;
+    let base: i32 = a * INPUT_BINDS_PER_ACTION;
+
+    let kb: array<i32> = s.abind;
+    let ks: array<i32> = s.down;
+    if (which == 1) { ks = s.press; } else if (which == 2) { ks = s.rel; }
+    for (let i = 0; i < INPUT_BINDS_PER_ACTION; i++) {
+        let sc: i32 = kb[base + i];
+        if (sc >= 0) { if (ks[sc] != 0) { return true; } }
+    }
+
+    let bb: array<i32> = s.bbind;
+    let bs: array<i32> = s.bdown;
+    if (which == 1) { bs = s.bpress; } else if (which == 2) { bs = s.brel; }
+    for (let j = 0; j < INPUT_BINDS_PER_ACTION; j++) {
+        let b: i32 = bb[base + j];
+        if (b > 0) { if (bs[b] != 0) { return true; } }
+    }
+    return false;
+}
+
+export fn input_action_down(p_in: object, p_action: i32): bool {
+    let out: bool = action_state(p_in, p_action, 0);
+    return out;
+}
+
+export fn input_action_pressed(p_in: object, p_action: i32): bool {
+    let out: bool = action_state(p_in, p_action, 1);
+    return out;
+}
+
+export fn input_action_released(p_in: object, p_action: i32): bool {
+    let out: bool = action_state(p_in, p_action, 2);
+    return out;
+}
+
+// A -1 / 0 / +1 axis from two actions. Both held cancels, which is the
+// behaviour every FPS wants for opposed strafe keys.
+export fn input_axis(p_in: object, p_pos: i32, p_neg: i32): f64 {
+    let s: object = p_in;
+    let a: f64 = 0.0;
+    if (action_state(s, p_pos, 0)) { a = a + 1.0; }
+    if (action_state(s, p_neg, 0)) { a = a - 1.0; }
+    let out: f64 = a;
+    return out;
+}

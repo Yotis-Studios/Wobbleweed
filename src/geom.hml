@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // geom.hml — the GPU triangle backend.
 //
 // The CPU still owns transform + projection + lighting; this module takes the

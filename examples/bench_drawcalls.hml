@@ -1,0 +1,40 @@
+// count SDL_RenderGeometry draw calls per frame in the demo scene
+import { sin, cos } from "@stdlib/math";
+import { v3, v_add } from "../src/vec.hml";
+import { tex_grass, tex_checker, tex_sky } from "../src/texture.hml";
+import { batch_new } from "../src/geom.hml";
+import { camera_mvp, render_world_gpu, load_tree } from "../src/scene_gpu.hml";
+import { window_open, upload_texture, clear, window_close } from "../src/sdl.hml";
+let W = 320; let H = 240;
+fn count_runs(b) {
+    let tris = b.tris;
+    tris.sort(fn(p, q) { if (p.depth > q.depth) { return 0 - 1; } if (p.depth < q.depth) { return 1; } return 0; });
+    let runs = 0; let n = tris.length; let i = 0;
+    while (i < n) { let tex = tris[i].tex; let j = i;
+        while (j < n && tris[j].tex == tex) { j = j + 1; }
+        runs = runs + 1; i = j; }
+    b.tris = [];
+    return runs;
+}
+fn main() {
+    let win = window_open("bench", W, H, 1);
+    let gtex = upload_texture(win, tex_grass(64,64));
+    let ctex = upload_texture(win, tex_checker(64,64,4));
+    let stex = upload_texture(win, tex_sky(320,128));
+    let tree = load_tree("assets/tree.obj");
+    let b = batch_new(8192);
+    let pos = v3(4.0, 2.0, 10.0); let yaw = 0.0 - 0.35;
+    let tot = 0; let maxr = 0; let tris = 0;
+    for (let f = 0; f < 60; f++) {
+        yaw = yaw + 0.02;
+        let look = v3(sin(yaw), 0.0 - 0.08, 0.0 - cos(yaw));
+        let mvp = camera_mvp(pos, v_add(pos, look), W, H);
+        render_world_gpu(b, mvp, yaw, W, H, gtex, ctex, stex, tree);
+        tris = tris + b.tris.length;
+        let r = count_runs(b);
+        tot = tot + r; if (r > maxr) { maxr = r; }
+    }
+    print(`avg tris/frame=${tris/60.0}  avg draw calls/frame=${tot/60.0}  max=${maxr}`);
+    window_close(win);
+}
+main();

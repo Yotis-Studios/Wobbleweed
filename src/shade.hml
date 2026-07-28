@@ -1,0 +1,1424 @@
+// shade.hml — RenderEnv: the lighting + fog/mist parameter block, and the
+// scalar light/fog kernel that emit.hml, mesh.hml and billboard.hml fold into
+// their vertex loops. ENGINE_GAPS G15 (fog + mist) and G16 (the full light
+// model).
+//
+// GENERIC ENGINE MODULE (RULE R1). Every colour, every distance and every
+// falloff here is an INPUT. This file contains no colour literal, no named
+// hue, no game noun, and no world-specific constant. The only bare numbers in
+// it are the model's own exponents and thresholds (the smoothstep polynomial,
+// the cube on the rim term, the 0.25 point-light wrap floor, the 1.06
+// far-plane margin and the 0.35 default alpha threshold), each of which is
+// stated in ENGINE_GAPS.md / ARCHITECTURE.md and each of which the game may
+// override where the doc leaves it open.
+//
+// ---------------------------------------------------------------------------
+// THE SHAPE: A FLAT array<f64>, NEVER AN OBJECT
+// ---------------------------------------------------------------------------
+// A RenderEnv is `array<f64>` of length ENV_COUNT, indexed by the exported
+// ENV_* constants. It is NOT an object and it must never become one: the emit
+// loop reads an array (or, better, the typed locals hoisted from one), and an
+// object field read is a boxed `HmlValue` on every backend.
+//
+// Four accessors — `env_field`, `env_field_set`, `env_field_count`,
+// `env_far_plane` — plus the typed `env_set_*` setters are the whole cold API.
+// Nothing in this file allocates after `env_new`.
+//
+// ---------------------------------------------------------------------------
+// THE MODEL
+// ---------------------------------------------------------------------------
+// Lighting (G16), per vertex, N unit normal, P world position, C camera:
+//
+//     lin = ambient
+//         + sun    * max(0, N·L)
+//         + bounce * max(0, -N.y)
+//         + rim    * (1 - max(0, N·V))^3            V = normalize(C - P)
+//         + SUM over up to ENV_MAX_LIGHTS point lights of
+//               colour * att * max(0.25, N·D/|D|)   D = Li - P
+//               att = t*t, t = max(0, 1 - |D| * inv_radius)
+//     clamp each channel to [0,1]
+//
+// The `max(0.25, ...)` floor is G16's: a brief local light must read as an
+// omnidirectional pop, not a hard spot. The radius falloff is `t*t` — smooth
+// at the boundary, one multiply, and it gives every light a hard finite extent,
+// which is what lets the kernel reject an out-of-range light on a squared
+// distance and never take its square root.
+//
+// Fog + mist (G15), radial distance so fog is not thinner at the screen edges:
+//
+//     d = |P - C|                             RADIAL, never view-space z
+//     t = clamp((d - fog_near)/(fog_far - fog_near), 0, 1)
+//     f = t*t*(3 - 2*t)                       smoothstep
+//     h = clamp((mist_top - P.y)/(mist_top - mist_bottom), 0, 1)
+//     f = max(f, h*h*mist_density)
+//     rgb = lin * lerp(1, fog_tint, f)
+//     a   = 255                                                  when f <= t_a
+//     a   = 255 * (1 - fog_alpha_max * (f - t_a)/(1 - t_a))       otherwise
+//
+// `t_a` is ENV_FOG_ALPHA_T, default 0.35 (ARCHITECTURE D7). D7 is explicitly an
+// open question to be settled by measurement, so the threshold is a field of
+// the env rather than a constant of the engine — raise it if the blend path
+// costs more than 1.0 ms on the software renderer.
+//
+// The fog TINT is clamped to [0,1] by `env_set_fog`, which is what makes the
+// tint multiply unable to brighten and therefore what lets the kernel skip a
+// second per-channel clamp after it. A caller that writes ENV_FOG_R/G/B through
+// `env_field_set` instead of `env_set_fog` owes the engine that invariant.
+//
+// The camera far plane is `fog_far * ENV_FAR_SCALE` (1.06), never a hardcoded
+// number: `env_far_plane(env)`. Nothing may appear unfogged.
+//
+// ---------------------------------------------------------------------------
+// HOW THE HOT PATH USES THIS — READ BEFORE WIRING emit.hml
+// ---------------------------------------------------------------------------
+// Measured on this box, compiled -O1 (probe_shade.hml §7 and the notes below
+// reproduce all of it). These five numbers dictated every line of the kernel:
+//
+//     f64 arithmetic inside ONE statement    ~0   ns  (loop-overhead noise)
+//     each additional ASSIGNMENT statement   ~3.2 ns  (hml_val_f64 round trip)
+//     read a `g_` f64 global into a local    ~2.2 ns
+//     read an array<f64> element             ~9.2 ns   / write ~6.0 ns
+//     `__sqrt(x)`                            ~11  ns   (`sqrt` imported from
+//                                                       @stdlib/math: ~21 ns)
+//     f64 `/`                                ~8   ns more than `*` — division
+//                                                       has NO unboxed path
+//     u32 `|` and `<<`                       boxed; a 4-channel shift-and-or
+//                                                       pack is ~65 ns more
+//                                                       than the f64 arithmetic
+//                                                       equivalent
+//     a function call                        ~17  ns + ~4 ns per f64 argument
+//
+// SIX CODEGEN RULES follow from that, and this file obeys all six. They are
+// the same six emit.hml must obey:
+//
+//   1. A global read is unboxed ONLY as a statement of its own:
+//          let cx: f64 = g_env_cam_x;      ->  double cx = ...      GOOD
+//          let ex: f64 = g_env_cam_x - px; ->  hml_binary_op(...)   BOXED
+//   2. A CALL result is never unboxed. It needs a second local:
+//          let d0: f64 = __sqrt(v);  let d: f64 = d0;               GOOD
+//          let d: f64 = __sqrt(v);   ->  HmlValue d                 BOXED
+//   3. `__sqrt` hits the compiler's math fast path. `sqrt` imported from
+//      `@stdlib/math` does not: the stdlib export is `let sqrt = __sqrt`, an
+//      alias binding, so the call goes through `hml_call_function` and costs
+//      about twice as much.
+//   4. `f64(i)` on a loop counter is ~10 ns. Carry an f64 accumulator instead.
+//   5. A multi-part reject test belongs in ONE compound `if` condition, not in
+//      four assignment statements. Measured on the per-light squared-distance
+//      gate: 2.3 ns as a condition, 13.3 ns as four `let`s. Recompute the
+//      pieces inside the branch — only the vertices that pass pay for them.
+//   6. Pack bytes into a u32 by ARITHMETIC (`r + g*256 + b*65536 + a*2^24`),
+//      never by `|` and `<<`: the integer bit operators go through the boxed
+//      dispatch while f64 multiply-add is native. Bit-identical, and 140 ns
+//      -> 75 ns per vertex. `__floor` each channel first (it has the same
+//      compiler fast path `__sqrt` has) so the fractions cannot bleed across
+//      channel boundaries.
+//
+// Two supported usages, with their measured costs:
+//
+//   1. CALL THE KERNEL (mesh_bake_light, billboards, tools, cold paths):
+//          env_bind(env);                      // once per frame
+//          let c: u32 = env_vertex_rgba(nx,ny,nz, px,py,pz);
+//      Returns 0xAABBGGRR — the exact little-endian u32 that goes at offset 8
+//      of an SDL_Vertex, so the caller does one 4-byte store and no unpacking.
+//      A packed u32 return is used instead of an out-array because an
+//      out-array would cost four ~6 ns element writes per vertex.
+//
+//   2. FOLD IT INTO THE EMIT LOOP (the shipping path for terrain and meshes).
+//      `env_bind` is still called once per frame; emit.hml then hoists the same
+//      derived values into its own once-per-frame locals and inlines the
+//      arithmetic, saving the call and its six arguments (~40 ns/vertex).
+//      `env_bind_field(i)` exposes every hoistable value by ENVB_* index so the
+//      inlined loop and this kernel cannot drift apart, and the four
+//      `env_bound_*_on` predicates are the gates. Remember rule 2 above:
+//      `let sx: f64 = env_bind_field(ENVB_SUN_X);` is BOXED — hoist through a
+//      second local, or the whole inlined loop runs boxed and costs 3x.
+//
+// THE MEASURED BUDGET, honestly. At 2500 triangles == 7500 non-indexed
+// vertices this kernel costs (probe_shade §7, best of 40 runs, this box,
+// hemlockc -O1):
+//
+//   FUSED (what emit.hml does)
+//      base pass: ambient + sun + fog, no point lights   1.55 ms  (207 ns/vtx)
+//      + 4 point lights over the 120x120 m visible area
+//        (~5.6 % of vertices inside one)                 +0.04 .. +0.20 ms
+//      + 4 point lights covering EVERY vertex            +2.2 .. +2.45 ms
+//   CALL (one env_vertex_rgba per vertex)
+//      base pass                                          3.1 ms  (413 ns/vtx)
+//      + 4 realistic point lights                        +0.52 .. +0.68 ms
+//
+// So the G16 acceptance criterion — 4 point lights at 2500 triangles for
+// <= 0.4 ms — is MET for a realistic light layout on the fused path, and is
+// NOT met if all four lights cover the whole visible world. The per-statement
+// floor of the compiled backend (~3.2 ns) also means the base pass alone
+// cannot fit the 0.15 ms G15 budget on 7500 dynamic vertices. That is exactly why G16 specifies `mesh_bake_light`: terrain and
+// static props bake `env_light_rgb` into their vertex colour once at build
+// time and pay nothing per frame, and only genuinely dynamic geometry runs
+// this kernel. The squared-radius early-out is what makes a small-radius light
+// affordable — it costs a full evaluation only on the vertices actually inside
+// its radius.
+//
+// PERFORMANCE CONTRACT (CLAUDE.md §4) as applied here:
+//   * `p_` on every parameter of the hot functions, copied into typed locals
+//     (A1) — a parameter is never unboxed,
+//   * scalar returns go through a named copy-out local (A2),
+//   * min / max / clamp are hand-inlined (A9); the only call in the hot path is
+//     `__sqrt`,
+//   * no closures, no `defer`, no `try`, no `throw`, no template strings, no
+//     allocation after `env_new`.
+//
+// `env_light_rgb` deliberately repeats the lighting arithmetic of
+// `env_vertex_rgba` rather than calling a shared helper: the helper call would
+// cost ~40 ns per vertex, more than the entire lighting computation.
+// probe_shade.hml §4 pins the two against each other, and both against an
+// independently written reference, on 4096 randomized inputs, so the
+// duplication is a tested invariant rather than a latent divergence.
+
+// NOTE: `sqrt` is deliberately NOT imported. See codegen rule 3 above — this
+// file calls the `__sqrt` builtin directly, which is ~2x faster.
+
+// ===========================================================================
+// FIELD INDICES — the RenderEnv layout. This table is the interface.
+// ===========================================================================
+
+// Direction TO the key light, unit length. Not a position: the key light is
+// directional, so it has no falloff and no position.
+export let ENV_SUN_X = 0;
+export let ENV_SUN_Y = 1;
+export let ENV_SUN_Z = 2;
+
+// Key light colour, linear, per channel. Any non-negative value; whether
+// ambient + sun sums to (1,1,1) is the caller's authoring contract, not this
+// file's business.
+export let ENV_SUN_R = 3;
+export let ENV_SUN_G = 4;
+export let ENV_SUN_B = 5;
+
+// Ambient (direction-independent) colour.
+export let ENV_AMB_R = 6;
+export let ENV_AMB_G = 7;
+export let ENV_AMB_B = 8;
+
+// Bounce colour, applied by max(0, -N.y): light coming back up off the ground.
+export let ENV_BOUNCE_R = 9;
+export let ENV_BOUNCE_G = 10;
+export let ENV_BOUNCE_B = 11;
+
+// Rim colour, applied by (1 - max(0, N·V))^3.
+export let ENV_RIM_R = 12;
+export let ENV_RIM_G = 13;
+export let ENV_RIM_B = 14;
+
+// Camera world position. Fog distance is measured from here, and so is V.
+export let ENV_CAM_X = 15;
+export let ENV_CAM_Y = 16;
+export let ENV_CAM_Z = 17;
+
+// Fog band. fog_far is also what the far plane is derived from.
+export let ENV_FOG_NEAR = 18;
+export let ENV_FOG_FAR = 19;
+
+// Fog tint, multiplied into the vertex colour as lerp(1, tint, f). Held in
+// [0,1] by env_set_fog — the tint may darken, never brighten.
+export let ENV_FOG_R = 20;
+export let ENV_FOG_G = 21;
+export let ENV_FOG_B = 22;
+
+// Maximum alpha reduction at f == 1 (0 disables the alpha channel of fog
+// entirely and keeps every triangle on the opaque path).
+export let ENV_FOG_ALPHA_MAX = 23;
+
+// f below which alpha stays 255 (ARCHITECTURE D7; default 0.35).
+export let ENV_FOG_ALPHA_T = 24;
+
+// Ground mist: a height band that fogs independently of distance.
+export let ENV_MIST_TOP = 25;
+export let ENV_MIST_BOTTOM = 26;
+export let ENV_MIST_DENSITY = 27;
+
+// Number of active point lights, 0..ENV_MAX_LIGHTS. Stored as an f64 like
+// every other field so the block stays one homogeneous array.
+export let ENV_LIGHT_COUNT = 28;
+
+// Point light blocks. Each is ENV_LIGHT_STRIDE wide and laid out by the
+// ENV_L_* offsets below, so `env[ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE + ENV_L_R]`
+// addresses light i's red channel.
+export let ENV_LIGHT_STRIDE = 7;
+export let ENV_MAX_LIGHTS = 4;
+
+export let ENV_L_X = 0;
+export let ENV_L_Y = 1;
+export let ENV_L_Z = 2;
+export let ENV_L_R = 3;
+export let ENV_L_G = 4;
+export let ENV_L_B = 5;
+export let ENV_L_RADIUS = 6;
+
+export let ENV_LIGHT0_X = 29;
+export let ENV_LIGHT0_Y = 30;
+export let ENV_LIGHT0_Z = 31;
+export let ENV_LIGHT0_R = 32;
+export let ENV_LIGHT0_G = 33;
+export let ENV_LIGHT0_B = 34;
+export let ENV_LIGHT0_RADIUS = 35;
+
+export let ENV_LIGHT1_X = 36;
+export let ENV_LIGHT2_X = 43;
+export let ENV_LIGHT3_X = 50;
+
+export let ENV_COUNT = 57;
+
+// Far plane = fog_far * ENV_FAR_SCALE. ARCHITECTURE D2 / G15: never 200.
+export let ENV_FAR_SCALE = 1.06;
+
+// Default alpha threshold, ARCHITECTURE D7. Settable per env.
+export let ENV_FOG_ALPHA_T_DEFAULT = 0.35;
+
+// The point-light wrap floor of G16. Exported so callers and probes can name
+// it; the kernel bodies spell it 0.25 because a module-level `let` read inside
+// an expression is a boxed load (codegen rule 1).
+export let ENV_LIGHT_WRAP = 0.25;
+
+// ===========================================================================
+// BOUND-STATE INDICES (ENVB_*) — the hoist list emit.hml walks.
+// `env_bind_field(ENVB_*)` returns the same derived value the kernel uses, so
+// an inlined emit loop and this kernel cannot drift apart.
+// ===========================================================================
+export let ENVB_SUN_X = 0;
+export let ENVB_SUN_Y = 1;
+export let ENVB_SUN_Z = 2;
+export let ENVB_SUN_R = 3;
+export let ENVB_SUN_G = 4;
+export let ENVB_SUN_B = 5;
+export let ENVB_AMB_R = 6;
+export let ENVB_AMB_G = 7;
+export let ENVB_AMB_B = 8;
+export let ENVB_BOUNCE_R = 9;
+export let ENVB_BOUNCE_G = 10;
+export let ENVB_BOUNCE_B = 11;
+export let ENVB_RIM_R = 12;
+export let ENVB_RIM_G = 13;
+export let ENVB_RIM_B = 14;
+export let ENVB_CAM_X = 15;
+export let ENVB_CAM_Y = 16;
+export let ENVB_CAM_Z = 17;
+export let ENVB_FOG_NEAR = 18;
+export let ENVB_FOG_INV_SPAN = 19;      // 1 / (fog_far - fog_near)
+export let ENVB_FOG_R = 20;
+export let ENVB_FOG_G = 21;
+export let ENVB_FOG_B = 22;
+export let ENVB_FOG_ALPHA_MAX = 23;
+export let ENVB_FOG_ALPHA_T = 24;
+export let ENVB_FOG_ALPHA_INV = 25;     // 1 / (1 - alpha_t)
+export let ENVB_MIST_TOP = 26;
+export let ENVB_MIST_INV_SPAN = 27;     // 1 / (mist_top - mist_bottom)
+export let ENVB_MIST_DENSITY = 28;
+export let ENVB_FAR_PLANE = 29;         // fog_far * ENV_FAR_SCALE
+export let ENVB_LIGHT_COUNT = 30;
+// Per-light bound block: x, y, z, r, g, b, inv_radius, radius*radius.
+export let ENVB_LIGHT_STRIDE = 8;
+export let ENVB_L_X = 0;
+export let ENVB_L_Y = 1;
+export let ENVB_L_Z = 2;
+export let ENVB_L_R = 3;
+export let ENVB_L_G = 4;
+export let ENVB_L_B = 5;
+export let ENVB_L_INV_RADIUS = 6;
+export let ENVB_L_RADIUS2 = 7;
+export let ENVB_LIGHT0_X = 31;
+export let ENVB_LIGHT1_X = 39;
+export let ENVB_LIGHT2_X = 47;
+export let ENVB_LIGHT3_X = 55;
+export let ENVB_COUNT = 63;
+
+// ===========================================================================
+// BOUND STATE
+// Every one of these is a `g_`-prefixed top-level (CLAUDE.md rule 3) written
+// once per frame by `env_bind` and read by the kernel. They exist because a
+// global read costs ~2.2 ns where an array<f64> read costs ~9.2 ns — at 7500
+// vertices that difference is 0.5 ms.
+// ===========================================================================
+let g_env_sun_x: f64 = 0.0;
+let g_env_sun_y: f64 = 1.0;
+let g_env_sun_z: f64 = 0.0;
+let g_env_sun_r: f64 = 0.0;
+let g_env_sun_g: f64 = 0.0;
+let g_env_sun_b: f64 = 0.0;
+
+let g_env_amb_r: f64 = 0.0;
+let g_env_amb_g: f64 = 0.0;
+let g_env_amb_b: f64 = 0.0;
+
+let g_env_bounce_r: f64 = 0.0;
+let g_env_bounce_g: f64 = 0.0;
+let g_env_bounce_b: f64 = 0.0;
+let g_env_bounce_on: i32 = 0;
+
+let g_env_rim_r: f64 = 0.0;
+let g_env_rim_g: f64 = 0.0;
+let g_env_rim_b: f64 = 0.0;
+let g_env_rim_on: i32 = 0;
+
+let g_env_cam_x: f64 = 0.0;
+let g_env_cam_y: f64 = 0.0;
+let g_env_cam_z: f64 = 0.0;
+
+let g_env_fog_near: f64 = 0.0;
+let g_env_fog_inv_span: f64 = 0.0;
+let g_env_fog_on: i32 = 0;
+let g_env_fog_r: f64 = 1.0;
+let g_env_fog_g: f64 = 1.0;
+let g_env_fog_b: f64 = 1.0;
+let g_env_fog_alpha_max: f64 = 0.0;
+let g_env_fog_alpha_t: f64 = 0.35;
+let g_env_fog_alpha_inv: f64 = 0.0;
+
+let g_env_mist_top: f64 = 0.0;
+let g_env_mist_inv_span: f64 = 0.0;
+let g_env_mist_density: f64 = 0.0;
+let g_env_mist_on: i32 = 0;
+
+let g_env_far_plane: f64 = 0.0;
+
+let g_env_light_n: i32 = 0;
+
+let g_env_l0_x: f64 = 0.0; let g_env_l0_y: f64 = 0.0; let g_env_l0_z: f64 = 0.0;
+let g_env_l0_r: f64 = 0.0; let g_env_l0_g: f64 = 0.0; let g_env_l0_b: f64 = 0.0;
+let g_env_l0_ir: f64 = 0.0; let g_env_l0_r2: f64 = 0.0;
+
+let g_env_l1_x: f64 = 0.0; let g_env_l1_y: f64 = 0.0; let g_env_l1_z: f64 = 0.0;
+let g_env_l1_r: f64 = 0.0; let g_env_l1_g: f64 = 0.0; let g_env_l1_b: f64 = 0.0;
+let g_env_l1_ir: f64 = 0.0; let g_env_l1_r2: f64 = 0.0;
+
+let g_env_l2_x: f64 = 0.0; let g_env_l2_y: f64 = 0.0; let g_env_l2_z: f64 = 0.0;
+let g_env_l2_r: f64 = 0.0; let g_env_l2_g: f64 = 0.0; let g_env_l2_b: f64 = 0.0;
+let g_env_l2_ir: f64 = 0.0; let g_env_l2_r2: f64 = 0.0;
+
+let g_env_l3_x: f64 = 0.0; let g_env_l3_y: f64 = 0.0; let g_env_l3_z: f64 = 0.0;
+let g_env_l3_r: f64 = 0.0; let g_env_l3_g: f64 = 0.0; let g_env_l3_b: f64 = 0.0;
+let g_env_l3_ir: f64 = 0.0; let g_env_l3_r2: f64 = 0.0;
+
+// ===========================================================================
+// COLD API — construction and authoring. None of this runs per vertex.
+// ===========================================================================
+
+// A new, fully zeroed RenderEnv. Deliberately black: the engine ships no
+// colours (R1), so an env that has not been authored renders nothing rather
+// than renders somebody's idea of daylight. Fog is off (near == far == 0),
+// mist is off, there are no lights, and the alpha threshold is D7's 0.35.
+export fn env_new(): array<f64> {
+    let e: array<f64> = [];
+    for (let i = 0; i < ENV_COUNT; i++) { e.push(0.0); }
+    e[ENV_SUN_Y] = 1.0;
+    e[ENV_FOG_R] = 1.0;
+    e[ENV_FOG_G] = 1.0;
+    e[ENV_FOG_B] = 1.0;
+    e[ENV_FOG_ALPHA_T] = ENV_FOG_ALPHA_T_DEFAULT;
+    return e;
+}
+
+// Restore an existing env to the state env_new would have produced, without
+// allocating. Use this instead of building a second env per frame.
+export fn env_reset(p_env: array<f64>) {
+    let e: array<f64> = p_env;
+    for (let i = 0; i < ENV_COUNT; i++) { e[i] = 0.0; }
+    e[ENV_SUN_Y] = 1.0;
+    e[ENV_FOG_R] = 1.0;
+    e[ENV_FOG_G] = 1.0;
+    e[ENV_FOG_B] = 1.0;
+    e[ENV_FOG_ALPHA_T] = ENV_FOG_ALPHA_T_DEFAULT;
+}
+
+// Copy src over dst, field for field. No allocation.
+export fn env_copy(p_dst: array<f64>, p_src: array<f64>) {
+    let d: array<f64> = p_dst;
+    let s: array<f64> = p_src;
+    for (let i = 0; i < ENV_COUNT; i++) { d[i] = s[i]; }
+}
+
+// Linear blend of two envs into a third, for a time-of-day or weather table.
+// Every scalar field lerps; the sun direction is renormalized afterwards
+// because a component-wise lerp of two unit vectors is not unit. The active
+// light COUNT is taken from whichever end is nearer (light identity is not
+// something you can interpolate), while the light fields themselves lerp so a
+// light that exists at both ends moves and fades smoothly.
+export fn env_lerp(p_dst: array<f64>, p_a: array<f64>, p_b: array<f64>, p_t: f64) {
+    let d: array<f64> = p_dst;
+    let a: array<f64> = p_a;
+    let b: array<f64> = p_b;
+    let t: f64 = p_t;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    for (let i = 0; i < ENV_COUNT; i++) {
+        let av: f64 = a[i];
+        let bv: f64 = b[i];
+        d[i] = av + (bv - av) * t;
+    }
+    // Sun direction: renormalize.
+    let sx: f64 = d[ENV_SUN_X];
+    let sy: f64 = d[ENV_SUN_Y];
+    let sz: f64 = d[ENV_SUN_Z];
+    let l0: f64 = __sqrt(sx * sx + sy * sy + sz * sz);
+    let l: f64 = l0;
+    if (l > 0.0) {
+        let inv: f64 = 1.0 / l;
+        d[ENV_SUN_X] = sx * inv;
+        d[ENV_SUN_Y] = sy * inv;
+        d[ENV_SUN_Z] = sz * inv;
+    } else {
+        d[ENV_SUN_X] = 0.0;
+        d[ENV_SUN_Y] = 1.0;
+        d[ENV_SUN_Z] = 0.0;
+    }
+    // Light count is discrete.
+    if (t < 0.5) { d[ENV_LIGHT_COUNT] = a[ENV_LIGHT_COUNT]; }
+    else { d[ENV_LIGHT_COUNT] = b[ENV_LIGHT_COUNT]; }
+}
+
+// Direction TO the light, any length; stored normalized. A zero-length
+// direction leaves the stored direction at straight up rather than producing
+// NaNs downstream.
+export fn env_set_sun(p_env: array<f64>, p_dx: f64, p_dy: f64, p_dz: f64,
+                      p_r: f64, p_g: f64, p_b: f64) {
+    let e: array<f64> = p_env;
+    let dx: f64 = p_dx;
+    let dy: f64 = p_dy;
+    let dz: f64 = p_dz;
+    let l0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+    let l: f64 = l0;
+    if (l > 0.0) {
+        let inv: f64 = 1.0 / l;
+        e[ENV_SUN_X] = dx * inv;
+        e[ENV_SUN_Y] = dy * inv;
+        e[ENV_SUN_Z] = dz * inv;
+    } else {
+        e[ENV_SUN_X] = 0.0;
+        e[ENV_SUN_Y] = 1.0;
+        e[ENV_SUN_Z] = 0.0;
+    }
+    e[ENV_SUN_R] = p_r;
+    e[ENV_SUN_G] = p_g;
+    e[ENV_SUN_B] = p_b;
+}
+
+export fn env_set_ambient(p_env: array<f64>, p_r: f64, p_g: f64, p_b: f64) {
+    let e: array<f64> = p_env;
+    e[ENV_AMB_R] = p_r;
+    e[ENV_AMB_G] = p_g;
+    e[ENV_AMB_B] = p_b;
+}
+
+export fn env_set_bounce(p_env: array<f64>, p_r: f64, p_g: f64, p_b: f64) {
+    let e: array<f64> = p_env;
+    e[ENV_BOUNCE_R] = p_r;
+    e[ENV_BOUNCE_G] = p_g;
+    e[ENV_BOUNCE_B] = p_b;
+}
+
+export fn env_set_rim(p_env: array<f64>, p_r: f64, p_g: f64, p_b: f64) {
+    let e: array<f64> = p_env;
+    e[ENV_RIM_R] = p_r;
+    e[ENV_RIM_G] = p_g;
+    e[ENV_RIM_B] = p_b;
+}
+
+// The camera position fog and the rim term are measured from. Set it every
+// frame, before env_bind.
+export fn env_set_camera(p_env: array<f64>, p_x: f64, p_y: f64, p_z: f64) {
+    let e: array<f64> = p_env;
+    e[ENV_CAM_X] = p_x;
+    e[ENV_CAM_Y] = p_y;
+    e[ENV_CAM_Z] = p_z;
+}
+
+// near/far in world units, tint per channel in [0,1], alpha_max in [0,1].
+// far <= near disables fog (f stays 0) rather than dividing by zero. The tint
+// is clamped because vertex colour can only darken; see the header.
+export fn env_set_fog(p_env: array<f64>, p_near: f64, p_far: f64,
+                      p_r: f64, p_g: f64, p_b: f64, p_alpha_max: f64) {
+    let e: array<f64> = p_env;
+    e[ENV_FOG_NEAR] = p_near;
+    e[ENV_FOG_FAR] = p_far;
+    let tr: f64 = p_r;
+    if (tr < 0.0) { tr = 0.0; }
+    if (tr > 1.0) { tr = 1.0; }
+    let tg: f64 = p_g;
+    if (tg < 0.0) { tg = 0.0; }
+    if (tg > 1.0) { tg = 1.0; }
+    let tb: f64 = p_b;
+    if (tb < 0.0) { tb = 0.0; }
+    if (tb > 1.0) { tb = 1.0; }
+    e[ENV_FOG_R] = tr;
+    e[ENV_FOG_G] = tg;
+    e[ENV_FOG_B] = tb;
+    let am: f64 = p_alpha_max;
+    if (am < 0.0) { am = 0.0; }
+    if (am > 1.0) { am = 1.0; }
+    e[ENV_FOG_ALPHA_MAX] = am;
+}
+
+// ARCHITECTURE D7 is an open question to be settled by measurement on the
+// software renderer. Raise this until the blend path costs under 1.0 ms.
+// Clamped to [0, 0.999] so the alpha ramp never divides by zero.
+export fn env_set_fog_alpha_threshold(p_env: array<f64>, p_t: f64) {
+    let e: array<f64> = p_env;
+    let t: f64 = p_t;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 0.999) { t = 0.999; }
+    e[ENV_FOG_ALPHA_T] = t;
+}
+
+// A height band: full mist at or below `bottom`, none at or above `top`,
+// scaled by density (0 disables). top <= bottom disables it.
+export fn env_set_mist(p_env: array<f64>, p_top: f64, p_bottom: f64, p_density: f64) {
+    let e: array<f64> = p_env;
+    e[ENV_MIST_TOP] = p_top;
+    e[ENV_MIST_BOTTOM] = p_bottom;
+    e[ENV_MIST_DENSITY] = p_density;
+}
+
+export fn env_clear_lights(p_env: array<f64>) {
+    let e: array<f64> = p_env;
+    e[ENV_LIGHT_COUNT] = 0.0;
+}
+
+export fn env_light_count(p_env: array<f64>): i32 {
+    let e: array<f64> = p_env;
+    let out: i32 = i32(e[ENV_LIGHT_COUNT]);
+    return out;
+}
+
+// Overwrite light `i`. Returns 1 on success, 0 if the index is out of range or
+// the radius is not positive (a light with no radius lights nothing, and its
+// reciprocal would be infinite). Does not change the active count.
+export fn env_set_light(p_env: array<f64>, p_i: i32,
+                        p_x: f64, p_y: f64, p_z: f64,
+                        p_r: f64, p_g: f64, p_b: f64, p_radius: f64): i32 {
+    let e: array<f64> = p_env;
+    let i: i32 = p_i;
+    if (i < 0) { return 0; }
+    if (i >= ENV_MAX_LIGHTS) { return 0; }
+    let rad: f64 = p_radius;
+    if (rad <= 0.0) { return 0; }
+    let base: i32 = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
+    e[base + ENV_L_X] = p_x;
+    e[base + ENV_L_Y] = p_y;
+    e[base + ENV_L_Z] = p_z;
+    e[base + ENV_L_R] = p_r;
+    e[base + ENV_L_G] = p_g;
+    e[base + ENV_L_B] = p_b;
+    e[base + ENV_L_RADIUS] = rad;
+    return 1;
+}
+
+// Append a light. Returns its index, or -1 if the block is full or the radius
+// is not positive. The game owns light selection: when more than
+// ENV_MAX_LIGHTS are in range it is the game that decides which four win, and
+// -1 is how it learns that it has to.
+export fn env_add_light(p_env: array<f64>, p_x: f64, p_y: f64, p_z: f64,
+                        p_r: f64, p_g: f64, p_b: f64, p_radius: f64): i32 {
+    let e: array<f64> = p_env;
+    let n: i32 = i32(e[ENV_LIGHT_COUNT]);
+    if (n >= ENV_MAX_LIGHTS) { return -1; }
+    let ok: i32 = env_set_light(e, n, p_x, p_y, p_z, p_r, p_g, p_b, p_radius);
+    if (ok == 0) { return -1; }
+    e[ENV_LIGHT_COUNT] = f64(n + 1);
+    let out: i32 = n;
+    return out;
+}
+
+// The camera far plane implied by this env: fog_far * 1.06 (G15). Never
+// hardcode a far plane anywhere else.
+export fn env_far_plane(p_env: array<f64>): f64 {
+    let e: array<f64> = p_env;
+    let out: f64 = e[ENV_FOG_FAR] * ENV_FAR_SCALE;
+    return out;
+}
+
+// Flat accessors. These are the whole reason the env is an array.
+export fn env_field(p_env: array<f64>, p_i: i32): f64 {
+    let e: array<f64> = p_env;
+    let out: f64 = e[p_i];
+    return out;
+}
+
+export fn env_field_set(p_env: array<f64>, p_i: i32, p_v: f64) {
+    let e: array<f64> = p_env;
+    e[p_i] = p_v;
+}
+
+export fn env_field_count(): i32 {
+    let out: i32 = ENV_COUNT;
+    return out;
+}
+
+// ===========================================================================
+// BIND — once per frame, between tod_eval and the emit loop (§4 stage 6/11).
+// Copies the env into typed globals and precomputes every reciprocal and every
+// squared radius, so the per-vertex path contains no division and can reject an
+// out-of-range light without taking a square root.
+// ===========================================================================
+export fn env_bind(p_env: array<f64>) {
+    let e: array<f64> = p_env;
+
+    g_env_sun_x = e[ENV_SUN_X];
+    g_env_sun_y = e[ENV_SUN_Y];
+    g_env_sun_z = e[ENV_SUN_Z];
+    g_env_sun_r = e[ENV_SUN_R];
+    g_env_sun_g = e[ENV_SUN_G];
+    g_env_sun_b = e[ENV_SUN_B];
+
+    g_env_amb_r = e[ENV_AMB_R];
+    g_env_amb_g = e[ENV_AMB_G];
+    g_env_amb_b = e[ENV_AMB_B];
+
+    let br: f64 = e[ENV_BOUNCE_R];
+    let bg: f64 = e[ENV_BOUNCE_G];
+    let bb: f64 = e[ENV_BOUNCE_B];
+    g_env_bounce_r = br;
+    g_env_bounce_g = bg;
+    g_env_bounce_b = bb;
+    g_env_bounce_on = 0;
+    if (br != 0.0 || bg != 0.0 || bb != 0.0) { g_env_bounce_on = 1; }
+
+    let rr: f64 = e[ENV_RIM_R];
+    let rg: f64 = e[ENV_RIM_G];
+    let rb: f64 = e[ENV_RIM_B];
+    g_env_rim_r = rr;
+    g_env_rim_g = rg;
+    g_env_rim_b = rb;
+    g_env_rim_on = 0;
+    if (rr != 0.0 || rg != 0.0 || rb != 0.0) { g_env_rim_on = 1; }
+
+    g_env_cam_x = e[ENV_CAM_X];
+    g_env_cam_y = e[ENV_CAM_Y];
+    g_env_cam_z = e[ENV_CAM_Z];
+
+    let fnear: f64 = e[ENV_FOG_NEAR];
+    let ffar: f64 = e[ENV_FOG_FAR];
+    g_env_fog_near = fnear;
+    g_env_fog_on = 0;
+    g_env_fog_inv_span = 0.0;
+    if (ffar > fnear) {
+        g_env_fog_on = 1;
+        g_env_fog_inv_span = 1.0 / (ffar - fnear);
+    }
+    g_env_fog_r = e[ENV_FOG_R];
+    g_env_fog_g = e[ENV_FOG_G];
+    g_env_fog_b = e[ENV_FOG_B];
+    g_env_fog_alpha_max = e[ENV_FOG_ALPHA_MAX];
+    let at: f64 = e[ENV_FOG_ALPHA_T];
+    if (at < 0.0) { at = 0.0; }
+    if (at > 0.999) { at = 0.999; }
+    g_env_fog_alpha_t = at;
+    g_env_fog_alpha_inv = 1.0 / (1.0 - at);
+    g_env_far_plane = ffar * ENV_FAR_SCALE;
+
+    let mtop: f64 = e[ENV_MIST_TOP];
+    let mbot: f64 = e[ENV_MIST_BOTTOM];
+    let mden: f64 = e[ENV_MIST_DENSITY];
+    g_env_mist_top = mtop;
+    g_env_mist_density = mden;
+    g_env_mist_on = 0;
+    g_env_mist_inv_span = 0.0;
+    if (mtop > mbot && mden > 0.0) {
+        g_env_mist_on = 1;
+        g_env_mist_inv_span = 1.0 / (mtop - mbot);
+    }
+
+    let n: i32 = i32(e[ENV_LIGHT_COUNT]);
+    if (n < 0) { n = 0; }
+    if (n > ENV_MAX_LIGHTS) { n = ENV_MAX_LIGHTS; }
+    g_env_light_n = n;
+
+    if (n > 0) {
+        let b0: i32 = ENV_LIGHT0_X;
+        g_env_l0_x = e[b0 + ENV_L_X];
+        g_env_l0_y = e[b0 + ENV_L_Y];
+        g_env_l0_z = e[b0 + ENV_L_Z];
+        g_env_l0_r = e[b0 + ENV_L_R];
+        g_env_l0_g = e[b0 + ENV_L_G];
+        g_env_l0_b = e[b0 + ENV_L_B];
+        let rad0: f64 = e[b0 + ENV_L_RADIUS];
+        g_env_l0_r2 = rad0 * rad0;
+        if (rad0 > 0.0) { g_env_l0_ir = 1.0 / rad0; } else { g_env_l0_ir = 0.0; }
+    }
+    if (n > 1) {
+        let b1: i32 = ENV_LIGHT1_X;
+        g_env_l1_x = e[b1 + ENV_L_X];
+        g_env_l1_y = e[b1 + ENV_L_Y];
+        g_env_l1_z = e[b1 + ENV_L_Z];
+        g_env_l1_r = e[b1 + ENV_L_R];
+        g_env_l1_g = e[b1 + ENV_L_G];
+        g_env_l1_b = e[b1 + ENV_L_B];
+        let rad1: f64 = e[b1 + ENV_L_RADIUS];
+        g_env_l1_r2 = rad1 * rad1;
+        if (rad1 > 0.0) { g_env_l1_ir = 1.0 / rad1; } else { g_env_l1_ir = 0.0; }
+    }
+    if (n > 2) {
+        let b2: i32 = ENV_LIGHT2_X;
+        g_env_l2_x = e[b2 + ENV_L_X];
+        g_env_l2_y = e[b2 + ENV_L_Y];
+        g_env_l2_z = e[b2 + ENV_L_Z];
+        g_env_l2_r = e[b2 + ENV_L_R];
+        g_env_l2_g = e[b2 + ENV_L_G];
+        g_env_l2_b = e[b2 + ENV_L_B];
+        let rad2: f64 = e[b2 + ENV_L_RADIUS];
+        g_env_l2_r2 = rad2 * rad2;
+        if (rad2 > 0.0) { g_env_l2_ir = 1.0 / rad2; } else { g_env_l2_ir = 0.0; }
+    }
+    if (n > 3) {
+        let b3: i32 = ENV_LIGHT3_X;
+        g_env_l3_x = e[b3 + ENV_L_X];
+        g_env_l3_y = e[b3 + ENV_L_Y];
+        g_env_l3_z = e[b3 + ENV_L_Z];
+        g_env_l3_r = e[b3 + ENV_L_R];
+        g_env_l3_g = e[b3 + ENV_L_G];
+        g_env_l3_b = e[b3 + ENV_L_B];
+        let rad3: f64 = e[b3 + ENV_L_RADIUS];
+        g_env_l3_r2 = rad3 * rad3;
+        if (rad3 > 0.0) { g_env_l3_ir = 1.0 / rad3; } else { g_env_l3_ir = 0.0; }
+    }
+}
+
+// The far plane of the currently bound env, without touching the array.
+export fn env_bound_far_plane(): f64 {
+    let out: f64 = g_env_far_plane;
+    return out;
+}
+
+export fn env_bound_light_count(): i32 {
+    let out: i32 = g_env_light_n;
+    return out;
+}
+
+export fn env_bound_fog_on(): i32 { let out: i32 = g_env_fog_on; return out; }
+export fn env_bound_mist_on(): i32 { let out: i32 = g_env_mist_on; return out; }
+export fn env_bound_bounce_on(): i32 { let out: i32 = g_env_bounce_on; return out; }
+export fn env_bound_rim_on(): i32 { let out: i32 = g_env_rim_on; return out; }
+
+// Read one field of the bound (derived) state by ENVB_* index. This is the
+// hoist list emit.hml walks once per frame so an inlined emit loop and this
+// kernel are guaranteed to be looking at the same numbers. Cold: it is a
+// linear chain, called at most ENVB_COUNT times per frame, never per vertex.
+export fn env_bind_field(p_i: i32): f64 {
+    let i: i32 = p_i;
+    if (i == ENVB_SUN_X) { let o: f64 = g_env_sun_x; return o; }
+    if (i == ENVB_SUN_Y) { let o: f64 = g_env_sun_y; return o; }
+    if (i == ENVB_SUN_Z) { let o: f64 = g_env_sun_z; return o; }
+    if (i == ENVB_SUN_R) { let o: f64 = g_env_sun_r; return o; }
+    if (i == ENVB_SUN_G) { let o: f64 = g_env_sun_g; return o; }
+    if (i == ENVB_SUN_B) { let o: f64 = g_env_sun_b; return o; }
+    if (i == ENVB_AMB_R) { let o: f64 = g_env_amb_r; return o; }
+    if (i == ENVB_AMB_G) { let o: f64 = g_env_amb_g; return o; }
+    if (i == ENVB_AMB_B) { let o: f64 = g_env_amb_b; return o; }
+    if (i == ENVB_BOUNCE_R) { let o: f64 = g_env_bounce_r; return o; }
+    if (i == ENVB_BOUNCE_G) { let o: f64 = g_env_bounce_g; return o; }
+    if (i == ENVB_BOUNCE_B) { let o: f64 = g_env_bounce_b; return o; }
+    if (i == ENVB_RIM_R) { let o: f64 = g_env_rim_r; return o; }
+    if (i == ENVB_RIM_G) { let o: f64 = g_env_rim_g; return o; }
+    if (i == ENVB_RIM_B) { let o: f64 = g_env_rim_b; return o; }
+    if (i == ENVB_CAM_X) { let o: f64 = g_env_cam_x; return o; }
+    if (i == ENVB_CAM_Y) { let o: f64 = g_env_cam_y; return o; }
+    if (i == ENVB_CAM_Z) { let o: f64 = g_env_cam_z; return o; }
+    if (i == ENVB_FOG_NEAR) { let o: f64 = g_env_fog_near; return o; }
+    if (i == ENVB_FOG_INV_SPAN) { let o: f64 = g_env_fog_inv_span; return o; }
+    if (i == ENVB_FOG_R) { let o: f64 = g_env_fog_r; return o; }
+    if (i == ENVB_FOG_G) { let o: f64 = g_env_fog_g; return o; }
+    if (i == ENVB_FOG_B) { let o: f64 = g_env_fog_b; return o; }
+    if (i == ENVB_FOG_ALPHA_MAX) { let o: f64 = g_env_fog_alpha_max; return o; }
+    if (i == ENVB_FOG_ALPHA_T) { let o: f64 = g_env_fog_alpha_t; return o; }
+    if (i == ENVB_FOG_ALPHA_INV) { let o: f64 = g_env_fog_alpha_inv; return o; }
+    if (i == ENVB_MIST_TOP) { let o: f64 = g_env_mist_top; return o; }
+    if (i == ENVB_MIST_INV_SPAN) { let o: f64 = g_env_mist_inv_span; return o; }
+    if (i == ENVB_MIST_DENSITY) { let o: f64 = g_env_mist_density; return o; }
+    if (i == ENVB_FAR_PLANE) { let o: f64 = g_env_far_plane; return o; }
+    if (i == ENVB_LIGHT_COUNT) { let o: f64 = f64(g_env_light_n); return o; }
+    if (i == ENVB_LIGHT0_X + 0) { let o: f64 = g_env_l0_x; return o; }
+    if (i == ENVB_LIGHT0_X + 1) { let o: f64 = g_env_l0_y; return o; }
+    if (i == ENVB_LIGHT0_X + 2) { let o: f64 = g_env_l0_z; return o; }
+    if (i == ENVB_LIGHT0_X + 3) { let o: f64 = g_env_l0_r; return o; }
+    if (i == ENVB_LIGHT0_X + 4) { let o: f64 = g_env_l0_g; return o; }
+    if (i == ENVB_LIGHT0_X + 5) { let o: f64 = g_env_l0_b; return o; }
+    if (i == ENVB_LIGHT0_X + 6) { let o: f64 = g_env_l0_ir; return o; }
+    if (i == ENVB_LIGHT0_X + 7) { let o: f64 = g_env_l0_r2; return o; }
+    if (i == ENVB_LIGHT1_X + 0) { let o: f64 = g_env_l1_x; return o; }
+    if (i == ENVB_LIGHT1_X + 1) { let o: f64 = g_env_l1_y; return o; }
+    if (i == ENVB_LIGHT1_X + 2) { let o: f64 = g_env_l1_z; return o; }
+    if (i == ENVB_LIGHT1_X + 3) { let o: f64 = g_env_l1_r; return o; }
+    if (i == ENVB_LIGHT1_X + 4) { let o: f64 = g_env_l1_g; return o; }
+    if (i == ENVB_LIGHT1_X + 5) { let o: f64 = g_env_l1_b; return o; }
+    if (i == ENVB_LIGHT1_X + 6) { let o: f64 = g_env_l1_ir; return o; }
+    if (i == ENVB_LIGHT1_X + 7) { let o: f64 = g_env_l1_r2; return o; }
+    if (i == ENVB_LIGHT2_X + 0) { let o: f64 = g_env_l2_x; return o; }
+    if (i == ENVB_LIGHT2_X + 1) { let o: f64 = g_env_l2_y; return o; }
+    if (i == ENVB_LIGHT2_X + 2) { let o: f64 = g_env_l2_z; return o; }
+    if (i == ENVB_LIGHT2_X + 3) { let o: f64 = g_env_l2_r; return o; }
+    if (i == ENVB_LIGHT2_X + 4) { let o: f64 = g_env_l2_g; return o; }
+    if (i == ENVB_LIGHT2_X + 5) { let o: f64 = g_env_l2_b; return o; }
+    if (i == ENVB_LIGHT2_X + 6) { let o: f64 = g_env_l2_ir; return o; }
+    if (i == ENVB_LIGHT2_X + 7) { let o: f64 = g_env_l2_r2; return o; }
+    if (i == ENVB_LIGHT3_X + 0) { let o: f64 = g_env_l3_x; return o; }
+    if (i == ENVB_LIGHT3_X + 1) { let o: f64 = g_env_l3_y; return o; }
+    if (i == ENVB_LIGHT3_X + 2) { let o: f64 = g_env_l3_z; return o; }
+    if (i == ENVB_LIGHT3_X + 3) { let o: f64 = g_env_l3_r; return o; }
+    if (i == ENVB_LIGHT3_X + 4) { let o: f64 = g_env_l3_g; return o; }
+    if (i == ENVB_LIGHT3_X + 5) { let o: f64 = g_env_l3_b; return o; }
+    if (i == ENVB_LIGHT3_X + 6) { let o: f64 = g_env_l3_ir; return o; }
+    if (i == ENVB_LIGHT3_X + 7) { let o: f64 = g_env_l3_r2; return o; }
+    let z: f64 = 0.0;
+    return z;
+}
+
+// ===========================================================================
+// HOT KERNEL
+//
+// Every line below obeys the four codegen rules in the header. If you edit
+// this section, re-check it with:
+//     hemlockc -c src/shade.hml --emit-c /tmp/s.c
+//     grep -c 'hml_binary_op' /tmp/s.c      # must not grow
+// ===========================================================================
+
+// Radial fog factor at a world position, 0 (clear) .. 1 (fully fogged).
+// RADIAL, not view-space z: view-space z makes fog thinner toward the screen
+// edges, which is the single most common way to make fog look wrong.
+export fn env_fog_factor(p_px: f64, p_py: f64, p_pz: f64): f64 {
+    let px: f64 = p_px;
+    let py: f64 = p_py;
+    let pz: f64 = p_pz;
+    let f: f64 = 0.0;
+    if (g_env_fog_on != 0) {
+        let cx: f64 = g_env_cam_x;
+        let cy: f64 = g_env_cam_y;
+        let cz: f64 = g_env_cam_z;
+        let dx: f64 = px - cx;
+        let dy: f64 = py - cy;
+        let dz: f64 = pz - cz;
+        let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+        let d: f64 = d0;
+        let n0: f64 = g_env_fog_near;
+        let iv: f64 = g_env_fog_inv_span;
+        let t: f64 = (d - n0) * iv;
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+        f = t * t * (3.0 - 2.0 * t);
+    }
+    if (g_env_mist_on != 0) {
+        let mt: f64 = g_env_mist_top;
+        let mi: f64 = g_env_mist_inv_span;
+        let md: f64 = g_env_mist_density;
+        let h: f64 = (mt - py) * mi;
+        if (h < 0.0) { h = 0.0; }
+        if (h > 1.0) { h = 1.0; }
+        let mf: f64 = h * h * md;
+        if (mf > f) { f = mf; }
+    }
+    if (f > 1.0) { f = 1.0; }
+    let out: f64 = f;
+    return out;
+}
+
+// Vertex alpha for a fog factor, 0..255 as an f64. ARCHITECTURE D7: opaque
+// below the threshold so most of the screen stays off the blend path.
+export fn env_fog_alpha(p_f: f64): f64 {
+    let f: f64 = p_f;
+    let at: f64 = g_env_fog_alpha_t;
+    if (f <= at) { let o: f64 = 255.0; return o; }
+    let am: f64 = g_env_fog_alpha_max;
+    let ai: f64 = g_env_fog_alpha_inv;
+    let a: f64 = 255.0 * (1.0 - am * (f - at) * ai);
+    if (a < 0.0) { a = 0.0; }
+    if (a > 255.0) { a = 255.0; }
+    let out: f64 = a;
+    return out;
+}
+
+// Lighting only, no fog: the full G16 model packed as 0x00BBGGRR.
+// This is what mesh_bake_light bakes into a static mesh's vertex colour, and
+// what a caller uses when fog is applied elsewhere (or not at all — the
+// viewmodel is emitted at f = 0 by contract).
+//
+// The arithmetic below is repeated inside env_vertex_rgba on purpose; see the
+// header. probe_shade.hml §4 proves the two agree.
+export fn env_light_rgb(p_nx: f64, p_ny: f64, p_nz: f64,
+                        p_px: f64, p_py: f64, p_pz: f64): u32 {
+    let nx: f64 = p_nx;
+    let ny: f64 = p_ny;
+    let nz: f64 = p_nz;
+    let px: f64 = p_px;
+    let py: f64 = p_py;
+    let pz: f64 = p_pz;
+
+    // ambient + sun
+    let sx: f64 = g_env_sun_x;
+    let sy: f64 = g_env_sun_y;
+    let sz: f64 = g_env_sun_z;
+    let ndl: f64 = nx * sx + ny * sy + nz * sz;
+    if (ndl < 0.0) { ndl = 0.0; }
+    let sr: f64 = g_env_sun_r;
+    let sg: f64 = g_env_sun_g;
+    let sb: f64 = g_env_sun_b;
+    let ar: f64 = g_env_amb_r;
+    let ag: f64 = g_env_amb_g;
+    let ab: f64 = g_env_amb_b;
+    let cr: f64 = ar + sr * ndl;
+    let cg: f64 = ag + sg * ndl;
+    let cb: f64 = ab + sb * ndl;
+
+    // bounce
+    if (g_env_bounce_on != 0) {
+        let bd: f64 = 0.0 - ny;
+        if (bd > 0.0) {
+            let br: f64 = g_env_bounce_r;
+            let bg: f64 = g_env_bounce_g;
+            let bb: f64 = g_env_bounce_b;
+            cr = cr + br * bd;
+            cg = cg + bg * bd;
+            cb = cb + bb * bd;
+        }
+    }
+
+    // rim
+    if (g_env_rim_on != 0) {
+        let cx: f64 = g_env_cam_x;
+        let cy: f64 = g_env_cam_y;
+        let cz: f64 = g_env_cam_z;
+        let ex: f64 = cx - px;
+        let ey: f64 = cy - py;
+        let ez: f64 = cz - pz;
+        let el0: f64 = __sqrt(ex * ex + ey * ey + ez * ez);
+        let el: f64 = el0;
+        if (el > 0.0) {
+            let ndv: f64 = (nx * ex + ny * ey + nz * ez) / el;
+            if (ndv < 0.0) { ndv = 0.0; }
+            let k: f64 = 1.0 - ndv;
+            let k3: f64 = k * k * k;
+            let rr: f64 = g_env_rim_r;
+            let rg: f64 = g_env_rim_g;
+            let rb: f64 = g_env_rim_b;
+            cr = cr + rr * k3;
+            cg = cg + rg * k3;
+            cb = cb + rb * k3;
+        }
+    }
+
+    // Point lights, unrolled: a loop would have to read the light fields out
+    // of an array (~9.2 ns each) instead of out of globals (~2.2 ns each).
+    // The squared-distance gate rejects an out-of-range light without a sqrt,
+    // which is what makes a short-radius light affordable at 7500 vertices.
+    let ln: i32 = g_env_light_n;
+    if (ln > 0) {
+        let lx: f64 = g_env_l0_x;
+        let ly: f64 = g_env_l0_y;
+        let lz: f64 = g_env_l0_z;
+        let rr2: f64 = g_env_l0_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l0_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l0_r;
+            let pg: f64 = g_env_l0_g;
+            let pb: f64 = g_env_l0_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+    if (ln > 1) {
+        let lx: f64 = g_env_l1_x;
+        let ly: f64 = g_env_l1_y;
+        let lz: f64 = g_env_l1_z;
+        let rr2: f64 = g_env_l1_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l1_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l1_r;
+            let pg: f64 = g_env_l1_g;
+            let pb: f64 = g_env_l1_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+    if (ln > 2) {
+        let lx: f64 = g_env_l2_x;
+        let ly: f64 = g_env_l2_y;
+        let lz: f64 = g_env_l2_z;
+        let rr2: f64 = g_env_l2_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l2_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l2_r;
+            let pg: f64 = g_env_l2_g;
+            let pb: f64 = g_env_l2_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+    if (ln > 3) {
+        let lx: f64 = g_env_l3_x;
+        let ly: f64 = g_env_l3_y;
+        let lz: f64 = g_env_l3_z;
+        let rr2: f64 = g_env_l3_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l3_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l3_r;
+            let pg: f64 = g_env_l3_g;
+            let pb: f64 = g_env_l3_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+
+    if (cr < 0.0) { cr = 0.0; }
+    if (cr > 1.0) { cr = 1.0; }
+    if (cg < 0.0) { cg = 0.0; }
+    if (cg > 1.0) { cg = 1.0; }
+    if (cb < 0.0) { cb = 0.0; }
+    if (cb > 1.0) { cb = 1.0; }
+
+    // Pack by ARITHMETIC, not by shift-and-or: `|` and `<<` on u32 go through
+    // the boxed integer dispatch (hml_i32_lshift / hml_i32_bit_or), while
+    // f64 multiply-add is native. Measured 140 ns -> 75 ns per vertex for the
+    // 4-channel form, and the two produce bit-identical results because every
+    // channel is floored to an integer first and the whole sum stays under
+    // 2^32 (exactly representable in f64).
+    let rf0: f64 = __floor(cr * 255.0 + 0.5);
+    let gf0: f64 = __floor(cg * 255.0 + 0.5);
+    let bf0: f64 = __floor(cb * 255.0 + 0.5);
+    let rf: f64 = rf0;
+    let gf: f64 = gf0;
+    let bf: f64 = bf0;
+    let out: u32 = u32(rf + gf * 256.0 + bf * 65536.0);
+    return out;
+}
+
+// The whole per-vertex model — G16 lighting, then G15 fog tint and fog alpha —
+// packed as 0xAABBGGRR, which is byte-for-byte the SDL_Vertex colour at offset
+// 8 (r@8 g@9 b@10 a@11, little-endian). Call env_bind once per frame first.
+export fn env_vertex_rgba(p_nx: f64, p_ny: f64, p_nz: f64,
+                          p_px: f64, p_py: f64, p_pz: f64): u32 {
+    let nx: f64 = p_nx;
+    let ny: f64 = p_ny;
+    let nz: f64 = p_nz;
+    let px: f64 = p_px;
+    let py: f64 = p_py;
+    let pz: f64 = p_pz;
+
+    // Radial camera distance. Written as ONE expression: an assignment
+    // statement costs ~3.2 ns whatever is in it, so folding the three deltas
+    // into the sqrt argument saves three of them. The rim term recomputes the
+    // deltas inside its own branch, where it is the only thing that needs them.
+    let cx: f64 = g_env_cam_x;
+    let cy: f64 = g_env_cam_y;
+    let cz: f64 = g_env_cam_z;
+    let el0: f64 = __sqrt((cx - px) * (cx - px) + (cy - py) * (cy - py)
+                          + (cz - pz) * (cz - pz));
+    let el: f64 = el0;
+
+    // ambient + sun
+    let sx: f64 = g_env_sun_x;
+    let sy: f64 = g_env_sun_y;
+    let sz: f64 = g_env_sun_z;
+    let ndl: f64 = nx * sx + ny * sy + nz * sz;
+    if (ndl < 0.0) { ndl = 0.0; }
+    let sr: f64 = g_env_sun_r;
+    let sg: f64 = g_env_sun_g;
+    let sb: f64 = g_env_sun_b;
+    let ar: f64 = g_env_amb_r;
+    let ag: f64 = g_env_amb_g;
+    let ab: f64 = g_env_amb_b;
+    let cr: f64 = ar + sr * ndl;
+    let cg: f64 = ag + sg * ndl;
+    let cb: f64 = ab + sb * ndl;
+
+    // bounce
+    if (g_env_bounce_on != 0) {
+        let bd: f64 = 0.0 - ny;
+        if (bd > 0.0) {
+            let br: f64 = g_env_bounce_r;
+            let bg: f64 = g_env_bounce_g;
+            let bb: f64 = g_env_bounce_b;
+            cr = cr + br * bd;
+            cg = cg + bg * bd;
+            cb = cb + bb * bd;
+        }
+    }
+
+    // rim
+    if (g_env_rim_on != 0) {
+        if (el > 0.0) {
+            let ex: f64 = cx - px;
+            let ey: f64 = cy - py;
+            let ez: f64 = cz - pz;
+            let ndv: f64 = (nx * ex + ny * ey + nz * ez) / el;
+            if (ndv < 0.0) { ndv = 0.0; }
+            let k: f64 = 1.0 - ndv;
+            let k3: f64 = k * k * k;
+            let rr: f64 = g_env_rim_r;
+            let rg: f64 = g_env_rim_g;
+            let rb: f64 = g_env_rim_b;
+            cr = cr + rr * k3;
+            cg = cg + rg * k3;
+            cb = cb + rb * k3;
+        }
+    }
+
+    // point lights
+    let ln: i32 = g_env_light_n;
+    if (ln > 0) {
+        let lx: f64 = g_env_l0_x;
+        let ly: f64 = g_env_l0_y;
+        let lz: f64 = g_env_l0_z;
+        let rr2: f64 = g_env_l0_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l0_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l0_r;
+            let pg: f64 = g_env_l0_g;
+            let pb: f64 = g_env_l0_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+    if (ln > 1) {
+        let lx: f64 = g_env_l1_x;
+        let ly: f64 = g_env_l1_y;
+        let lz: f64 = g_env_l1_z;
+        let rr2: f64 = g_env_l1_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l1_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l1_r;
+            let pg: f64 = g_env_l1_g;
+            let pb: f64 = g_env_l1_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+    if (ln > 2) {
+        let lx: f64 = g_env_l2_x;
+        let ly: f64 = g_env_l2_y;
+        let lz: f64 = g_env_l2_z;
+        let rr2: f64 = g_env_l2_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l2_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l2_r;
+            let pg: f64 = g_env_l2_g;
+            let pb: f64 = g_env_l2_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+    if (ln > 3) {
+        let lx: f64 = g_env_l3_x;
+        let ly: f64 = g_env_l3_y;
+        let lz: f64 = g_env_l3_z;
+        let rr2: f64 = g_env_l3_r2;
+        // The reject test is ONE compound `if` condition, not four assignment
+        // statements: measured 2.3 ns instead of 13.3 ns per light. The deltas
+        // are recomputed inside, where only the vertices actually inside the
+        // radius pay for them.
+        if ((lx - px) * (lx - px) + (ly - py) * (ly - py)
+            + (lz - pz) * (lz - pz) < rr2) {
+            let dx: f64 = lx - px;
+            let dy: f64 = ly - py;
+            let dz: f64 = lz - pz;
+            let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+            let d: f64 = d0;
+            let ir: f64 = g_env_l3_ir;
+            let t: f64 = 1.0 - d * ir;
+            let nd: f64 = 0.25;
+            if (d > 0.0) {
+                let dt: f64 = (nx * dx + ny * dy + nz * dz) / d;
+                if (dt > 0.25) { nd = dt; }
+            }
+            let w: f64 = t * t * nd;
+            let pr: f64 = g_env_l3_r;
+            let pg: f64 = g_env_l3_g;
+            let pb: f64 = g_env_l3_b;
+            cr = cr + pr * w;
+            cg = cg + pg * w;
+            cb = cb + pb * w;
+        }
+    }
+
+    if (cr < 0.0) { cr = 0.0; }
+    if (cr > 1.0) { cr = 1.0; }
+    if (cg < 0.0) { cg = 0.0; }
+    if (cg > 1.0) { cg = 1.0; }
+    if (cb < 0.0) { cb = 0.0; }
+    if (cb > 1.0) { cb = 1.0; }
+
+    // fog factor, radial. `el` is already |P - C|.
+    let f: f64 = 0.0;
+    if (g_env_fog_on != 0) {
+        let n0: f64 = g_env_fog_near;
+        let iv: f64 = g_env_fog_inv_span;
+        let ft: f64 = (el - n0) * iv;
+        if (ft < 0.0) { ft = 0.0; }
+        if (ft > 1.0) { ft = 1.0; }
+        f = ft * ft * (3.0 - 2.0 * ft);
+    }
+    if (g_env_mist_on != 0) {
+        let mt: f64 = g_env_mist_top;
+        let mi: f64 = g_env_mist_inv_span;
+        let md: f64 = g_env_mist_density;
+        let h: f64 = (mt - py) * mi;
+        if (h < 0.0) { h = 0.0; }
+        if (h > 1.0) { h = 1.0; }
+        let mf: f64 = h * h * md;
+        if (mf > f) { f = mf; }
+    }
+    if (f > 1.0) { f = 1.0; }
+
+    // Tint multiply, lerp(1, tint, f). The tint is held in [0,1] by
+    // env_set_fog and the lighting is already clamped to [0,1], so the product
+    // is in [0,1] and needs no second clamp.
+    let av: f64 = 255.0;
+    if (f > 0.0) {
+        let fr: f64 = g_env_fog_r;
+        let fg: f64 = g_env_fog_g;
+        let fb: f64 = g_env_fog_b;
+        cr = cr * (1.0 + (fr - 1.0) * f);
+        cg = cg * (1.0 + (fg - 1.0) * f);
+        cb = cb * (1.0 + (fb - 1.0) * f);
+        let at: f64 = g_env_fog_alpha_t;
+        if (f > at) {
+            let am: f64 = g_env_fog_alpha_max;
+            let ai: f64 = g_env_fog_alpha_inv;
+            av = 255.0 * (1.0 - am * (f - at) * ai);
+            if (av < 0.0) { av = 0.0; }
+            if (av > 255.0) { av = 255.0; }
+        }
+    }
+
+    // Arithmetic pack — see the note in env_light_rgb.
+    let rf0: f64 = __floor(cr * 255.0 + 0.5);
+    let gf0: f64 = __floor(cg * 255.0 + 0.5);
+    let bf0: f64 = __floor(cb * 255.0 + 0.5);
+    let af0: f64 = __floor(av + 0.5);
+    let rf: f64 = rf0;
+    let gf: f64 = gf0;
+    let bf: f64 = bf0;
+    let af: f64 = af0;
+    let out: u32 = u32(rf + gf * 256.0 + bf * 65536.0 + af * 16777216.0);
+    return out;
+}

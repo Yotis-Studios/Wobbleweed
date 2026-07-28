@@ -1,95 +1,347 @@
-// sdl.hml — a minimal SDL2 binding for presenting a software framebuffer.
+// sdl.hml — the entire OS surface: SDL2 + SDL2_mixer FFI, window/renderer
+// lifecycle, textures, render targets, blending, events, input, timing, audio.
 //
-// Wobbleweed renders into a plain RGB byte buffer (the framebuffer). This module
-// is the *output sink*: it opens a window, uploads the framebuffer to a
-// streaming texture each frame, and presents it — plus event polling for quit
-// and keys. SDL is reached through Hemlock's FFI (`extern fn`), so the only
-// dependency is `libSDL2-2.0.so.0` at runtime.
+// This module is GENERIC. It knows about triangles, textures, sound, input and
+// time. It knows nothing about any particular game. Every value is a parameter.
 //
-// The framebuffer is width*height*3 bytes, 24-bit RGB, row-major — which maps
-// directly to SDL's RGB24 texture format (no conversion).
+// ---------------------------------------------------------------------------
+// THREE RULES THAT ARE LOAD-BEARING. Read before editing.
+// ---------------------------------------------------------------------------
+//
+// 1. `extern fn` binds to the MOST RECENTLY DECLARED `import`, not to every
+//    imported library. Each library's externs are grouped directly under its own
+//    `import` line below. Move one and it will fail to resolve — and the error
+//    will blame the wrong library.
+//
+// 2. NEVER declare or call `SDL_SetTextureScaleMode`. It segfaults on SDL's
+//    internal format-conversion textures (the accelerated/OpenGL renderer
+//    allocates one for any non-native pixel format). `window_open` sets
+//    `SDL_SetHint("SDL_RENDER_SCALE_QUALITY", "0")` instead, which is read by
+//    SDL_CreateTexture and therefore covers every texture on every renderer.
+//    The absence of the extern below is deliberate: it makes the mistake a
+//    compile error, not a crash. `probe_sdl.hml` asserts both halves of this.
+//
+// 3. `SDL_RenderCopyEx`'s `angle` is a C `double`. It is typed `f64` here and
+//    callers must pass `0.0`, never `0`.
+//
+// 4. TEST A POINTER RETURNED BY FFI WITH `p == ptr_null()`, NEVER `p == null`.
+//    The interpreter says a NULL `ptr` equals `null`; `hemlockc` says it does
+//    not. `p == ptr_null()` is true on both. Every `if (x == null)` guard on an
+//    SDL handle is therefore silently dead in a compiled build. Likewise a
+//    `ptr`-annotated Hemlock parameter or return REJECTS null outright
+//    ("Cannot convert type to target type"), which is why the wrappers that
+//    can see a null handle leave those parameters unannotated.
+//
+// ---------------------------------------------------------------------------
+// VERSION CEILING
+// ---------------------------------------------------------------------------
+// Every symbol bound here is documented `available since SDL 2.0.18` or older
+// (most are 2.0.0). `SDL_RenderGeometry` and `SDL_RenderSetVSync` are the two
+// newest, both exactly 2.0.18. SDL2_mixer symbols are all 2.0.0-era; the
+// installed mixer is 2.0.4 header and runtime.
+//
+// ---------------------------------------------------------------------------
+// LEGACY SURFACE
+// ---------------------------------------------------------------------------
+// `present`, `upload_texture`, `clear`, `draw_tris`, `present_geom`,
+// `read_pixels`, `poll`, `ticks`, `delay` are kept byte-compatible for the
+// frozen legacy modules (geom.hml, scene_gpu.hml and the examples). New code
+// uses the `sdl_*` / `create_*` / `set_*` surface below them.
 
 import "libSDL2-2.0.so.0";
 
-extern fn SDL_Init(flags: u32): i32;
-extern fn SDL_CreateWindow(title: string, x: i32, y: i32, w: i32, h: i32, flags: u32): ptr;
-extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;
-extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr;
-extern fn SDL_RenderSetLogicalSize(ren: ptr, w: i32, h: i32): i32;
-extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32;
-extern fn SDL_SetTextureScaleMode(tex: ptr, mode: i32): i32;
-extern fn SDL_SetHint(name: string, value: string): i32;
-extern fn SDL_SetRenderDrawColor(ren: ptr, r: i32, g: i32, b: i32, a: i32): i32;
-extern fn SDL_RenderClear(ren: ptr): i32;
-extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
-extern fn SDL_RenderGeometry(ren: ptr, tex: ptr, verts: ptr, nv: i32, idx: ptr, ni: i32): i32;
-extern fn SDL_RenderReadPixels(ren: ptr, rect: ptr, fmt: u32, px: ptr, pitch: i32): i32;
-extern fn SDL_RenderPresent(ren: ptr): void;
-extern fn SDL_PollEvent(ev: ptr): i32;
-extern fn SDL_GetKeyboardState(numkeys: ptr): ptr;
-extern fn SDL_Delay(ms: u32): void;
-extern fn SDL_GetTicks(): u32;
-extern fn SDL_GetError(): string;
-extern fn SDL_DestroyTexture(tex: ptr): void;
-extern fn SDL_DestroyRenderer(ren: ptr): void;
-extern fn SDL_DestroyWindow(win: ptr): void;
-extern fn SDL_Quit(): void;
+// --- lifecycle / diagnostics ------------------------------------------------
+extern fn SDL_Init(flags: u32): i32;                              // since 2.0.0
+extern fn SDL_Quit(): void;                                       // since 2.0.0
+extern fn SDL_GetError(): string;                                 // since 2.0.0
+extern fn SDL_ClearError(): void;                                 // since 2.0.0
+extern fn SDL_SetHint(name: string, value: string): i32;          // since 2.0.0
+extern fn SDL_GetHint(name: string): string;                      // since 2.0.0
+extern fn SDL_GetVersion(v: ptr): void;                           // since 2.0.0
 
-// --- constants ---
+// --- window -----------------------------------------------------------------
+extern fn SDL_CreateWindow(title: string, x: i32, y: i32, w: i32, h: i32, flags: u32): ptr; // 2.0.0
+extern fn SDL_DestroyWindow(win: ptr): void;                      // since 2.0.0
+extern fn SDL_SetWindowTitle(win: ptr, title: string): void;      // since 2.0.0
+extern fn SDL_GetWindowSize(win: ptr, w: ptr, h: ptr): void;      // since 2.0.0
+
+// --- renderer ---------------------------------------------------------------
+extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;   // since 2.0.0
+extern fn SDL_DestroyRenderer(ren: ptr): void;                    // since 2.0.0
+extern fn SDL_RenderSetLogicalSize(ren: ptr, w: i32, h: i32): i32;// since 2.0.0
+extern fn SDL_RenderSetVSync(ren: ptr, vsync: i32): i32;          // since 2.0.18
+extern fn SDL_SetRenderDrawColor(ren: ptr, r: u8, g: u8, b: u8, a: u8): i32; // since 2.0.0
+extern fn SDL_SetRenderDrawBlendMode(ren: ptr, mode: i32): i32;   // since 2.0.0
+extern fn SDL_RenderClear(ren: ptr): i32;                         // since 2.0.0
+extern fn SDL_RenderPresent(ren: ptr): void;                      // since 2.0.0
+extern fn SDL_RenderFillRect(ren: ptr, rect: ptr): i32;           // since 2.0.0
+extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;  // since 2.0.0
+// angle is a C double -> f64. Pass 0.0, never 0.
+extern fn SDL_RenderCopyEx(ren: ptr, tex: ptr, src: ptr, dst: ptr,
+                           angle: f64, center: ptr, flip: i32): i32;    // since 2.0.0
+extern fn SDL_RenderGeometry(ren: ptr, tex: ptr, verts: ptr, nv: i32,
+                             idx: ptr, ni: i32): i32;             // since 2.0.18
+extern fn SDL_RenderReadPixels(ren: ptr, rect: ptr, fmt: u32, px: ptr, pitch: i32): i32; // 2.0.0
+extern fn SDL_SetRenderTarget(ren: ptr, tex: ptr): i32;           // since 2.0.0
+extern fn SDL_GetRenderTarget(ren: ptr): ptr;                     // since 2.0.0
+
+// --- textures ---------------------------------------------------------------
+extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr; // 2.0.0
+extern fn SDL_DestroyTexture(tex: ptr): void;                     // since 2.0.0
+extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32; // 2.0.0
+extern fn SDL_QueryTexture(tex: ptr, fmt: ptr, access: ptr, w: ptr, h: ptr): i32; // 2.0.0
+extern fn SDL_SetTextureBlendMode(tex: ptr, mode: i32): i32;      // since 2.0.0
+extern fn SDL_SetTextureAlphaMod(tex: ptr, alpha: u8): i32;       // since 2.0.0
+extern fn SDL_SetTextureColorMod(tex: ptr, r: u8, g: u8, b: u8): i32; // since 2.0.0
+// NOTE: SDL_SetTextureScaleMode is deliberately NOT bound. See rule 2 above.
+
+// --- events / keyboard / mouse ---------------------------------------------
+extern fn SDL_PollEvent(ev: ptr): i32;                            // since 2.0.0
+extern fn SDL_PumpEvents(): void;                                 // since 2.0.0
+extern fn SDL_GetKeyboardState(numkeys: ptr): ptr;                // since 2.0.0
+extern fn SDL_SetRelativeMouseMode(enabled: i32): i32;            // since 2.0.0
+extern fn SDL_GetRelativeMouseMode(): i32;                        // since 2.0.0
+extern fn SDL_GetRelativeMouseState(x: ptr, y: ptr): u32;         // since 2.0.0
+extern fn SDL_GetMouseState(x: ptr, y: ptr): u32;                 // since 2.0.0
+extern fn SDL_ShowCursor(toggle: i32): i32;                       // since 2.0.0
+
+// --- time -------------------------------------------------------------------
+extern fn SDL_GetPerformanceCounter(): u64;                       // since 2.0.0
+extern fn SDL_GetPerformanceFrequency(): u64;                     // since 2.0.0
+extern fn SDL_GetTicks(): u32;                                    // since 2.0.0
+extern fn SDL_Delay(ms: u32): void;                               // since 2.0.0
+
+// --- raw audio (the documented fallback behind audio.hml) -------------------
+extern fn SDL_RWFromMem(mem: ptr, size: i32): ptr;                // since 2.0.0
+extern fn SDL_OpenAudioDevice(dev: ptr, iscapture: i32, want: ptr,
+                              have: ptr, allowed: i32): u32;      // since 2.0.0
+extern fn SDL_QueueAudio(dev: u32, data: ptr, len: u32): i32;     // since 2.0.4
+extern fn SDL_GetQueuedAudioSize(dev: u32): u32;                  // since 2.0.4
+extern fn SDL_ClearQueuedAudio(dev: u32): void;                   // since 2.0.4
+extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32): void;    // since 2.0.0
+extern fn SDL_CloseAudioDevice(dev: u32): void;                   // since 2.0.0
+extern fn SDL_MixAudioFormat(dst: ptr, src: ptr, format: u16,
+                             len: u32, volume: i32): void;        // since 2.0.0
+
+// ===========================================================================
+// SDL2_mixer.  Its own `import`, its own extern block. Do not merge these.
+//
+// Mix_PlayChannel and Mix_LoadWAV are C PREPROCESSOR MACROS, not exported
+// symbols — `extern fn` against either fails with "undefined symbol". Bind the
+// real functions: Mix_PlayChannelTimed and Mix_LoadWAV_RW.
+//
+// Mix_GetError is likewise a macro (#define Mix_GetError SDL_GetError); use
+// sdl_error().
+// ===========================================================================
+
+import "libSDL2_mixer-2.0.so.0";
+
+extern fn Mix_Linked_Version(): ptr;
+extern fn Mix_OpenAudio(freq: i32, format: u16, channels: i32, chunksize: i32): i32;
+extern fn Mix_QuerySpec(freq: ptr, fmt: ptr, channels: ptr): i32;
+extern fn Mix_AllocateChannels(numchans: i32): i32;
+extern fn Mix_QuickLoad_RAW(mem: ptr, len: u32): ptr;
+extern fn Mix_LoadWAV_RW(src: ptr, freesrc: i32): ptr;
+extern fn Mix_PlayChannelTimed(channel: i32, chunk: ptr, loops: i32, ticks: i32): i32;
+extern fn Mix_SetPanning(channel: i32, left: u8, right: u8): i32;
+extern fn Mix_Volume(channel: i32, volume: i32): i32;
+extern fn Mix_VolumeChunk(chunk: ptr, volume: i32): i32;
+extern fn Mix_Playing(channel: i32): i32;
+extern fn Mix_HaltChannel(channel: i32): i32;
+extern fn Mix_FreeChunk(chunk: ptr): void;
+extern fn Mix_CloseAudio(): void;
+
+// ===========================================================================
+// CONSTANTS
+//
+// Every numeric value below was dumped from the installed SDL2 headers with a
+// C program (offsetof/sizeof/enum expansion) rather than copied from memory.
+// The *8888 names are PACKED-INTEGER names, not byte order:
+//   FMT_RGBA32   (376840196) is R,G,B,A in memory on little-endian.
+//   FMT_ARGB8888 (372645892) is B,G,R,A in memory on little-endian.
+// ===========================================================================
+
 let SDL_INIT_VIDEO = 32;
+let SDL_INIT_AUDIO = 16;
+let SDL_INIT_EVENTS = 16384;
+export let INIT_VIDEO = 32;
+export let INIT_AUDIO = 16;
+export let INIT_EVENTS = 16384;
+
 let SDL_WINDOWPOS_CENTERED = 805240832;       // 0x2FFF0000
 let SDL_WINDOW_SHOWN = 4;
-let SDL_RENDERER_ACCELERATED = 2;
+let SDL_WINDOW_HIDDEN = 8;
 let SDL_RENDERER_SOFTWARE = 1;
-let SDL_PIXELFORMAT_RGB24 = 386930691;        // byte order R,G,B
+let SDL_RENDERER_ACCELERATED = 2;
+
+// Pixel formats.
+let SDL_PIXELFORMAT_RGB24 = 386930691;        // byte order R,G,B  (legacy CPU fb)
+export let FMT_RGB24 = 386930691;
+export let FMT_RGBA32 = 376840196;            // byte order R,G,B,A (== ABGR8888 packed)
+export let FMT_ARGB8888 = 372645892;          // byte order B,G,R,A — render targets
+
+// Texture access.
 let SDL_TEXTUREACCESS_STATIC = 0;
 let SDL_TEXTUREACCESS_STREAMING = 1;
-let SDL_SCALEMODE_NEAREST = 0;
+export let TEXACCESS_STATIC = 0;
+export let TEXACCESS_STREAMING = 1;
+export let TEXACCESS_TARGET = 2;
+
+// Blend modes. Blend mode is per-texture, which makes it the material model.
+export let BLEND_NONE = 0;
+export let BLEND_BLEND = 1;
+export let BLEND_ADD = 2;
+export let BLEND_MOD = 4;
+export let BLEND_MUL = 8;
+
+// Flip modes for copy_ex.
+export let FLIP_NONE = 0;
+export let FLIP_HORIZONTAL = 1;
+export let FLIP_VERTICAL = 2;
+
+// Event types (SDL_events.h).
 let SDL_QUIT = 256;                            // 0x100
 let SDL_KEYDOWN = 768;                         // 0x300
-let EVENT_SIZE = 256;                          // SDL_Event is 56 bytes; over-allocate
-let KEYSYM_SYM_OFFSET = 20;                    // SDL_KeyboardEvent.keysym.sym
+export let EV_QUIT = 256;
+export let EV_WINDOW = 512;
+export let EV_KEYDOWN = 768;
+export let EV_KEYUP = 769;
+export let EV_MOUSEMOTION = 1024;
+export let EV_MOUSEBUTTONDOWN = 1025;
+export let EV_MOUSEBUTTONUP = 1026;
+export let EV_MOUSEWHEEL = 1027;
 
-// Common key codes (SDLK_*)
+// Mouse button MASK bits, as returned by SDL_GetMouseState /
+// SDL_GetRelativeMouseState — SDL_BUTTON(n) == 1 << (n-1).
+export let MB_LEFT = 1;
+export let MB_MIDDLE = 2;
+export let MB_RIGHT = 4;
+// Mouse button INDEX values, as they appear in SDL_MouseButtonEvent.button.
+export let MBI_LEFT = 1;
+export let MBI_MIDDLE = 2;
+export let MBI_RIGHT = 3;
+
+// Audio.
+export let AUDIO_S16LSB = 32784;               // 0x8010
+export let AUDIO_F32LSB = 33056;               // 0x8120
+export let MIX_MAX_VOLUME = 128;
+export let AUDIOSPEC_BYTES = 32;               // sizeof(SDL_AudioSpec); allocate >= this
+
+// SDL_Event layout. sizeof(SDL_Event) == 56 on x86-64; we over-allocate.
+// Offsets below were produced by offsetof() on /usr/include/SDL2/SDL_events.h
+// and are used ONLY where no API call gives the same data:
+//   common.type                          @ 0   (Uint32)
+//   SDL_KeyboardEvent.state              @ 12  (Uint8)
+//   SDL_KeyboardEvent.repeat             @ 13  (Uint8)
+//   SDL_KeyboardEvent.keysym.scancode    @ 16  (SDL_Scancode, 4 bytes)
+//   SDL_KeyboardEvent.keysym.sym         @ 20  (SDL_Keycode,  4 bytes)
+//   SDL_MouseButtonEvent.button          @ 16  (Uint8)
+//   SDL_MouseButtonEvent.state           @ 17  (Uint8)
+//   SDL_MouseWheelEvent.x                @ 16  (Sint32)
+//   SDL_MouseWheelEvent.y                @ 20  (Sint32)
+//   SDL_MouseMotionEvent.xrel            @ 28  (Sint32)  -- prefer
+//   SDL_MouseMotionEvent.yrel            @ 32  (Sint32)  -- SDL_GetRelativeMouseState
+let EVENT_SIZE = 256;
+let KEYSYM_SYM_OFFSET = 20;
+let KEYSYM_SCANCODE_OFFSET = 16;
+let KEY_REPEAT_OFFSET = 13;
+let MBUTTON_OFFSET = 16;
+let WHEEL_X_OFFSET = 16;
+let WHEEL_Y_OFFSET = 20;
+
+// Key codes (SDLK_*), for text-ish/menu use. Held-key polling uses SC_* below.
 export let KEY_ESCAPE = 27;
 export let KEY_SPACE = 32;
+export let KEY_RETURN = 13;
+export let KEY_TAB = 9;
+export let KEY_BACKSPACE = 8;
 export let KEY_LEFT = 1073741904;
 export let KEY_RIGHT = 1073741903;
 export let KEY_UP = 1073741906;
 export let KEY_DOWN = 1073741905;
+export let KEY_F1 = 1073741882;
 export let KEY_W = 119;
 export let KEY_A = 97;
 export let KEY_S = 115;
 export let KEY_D = 100;
 
-// SDL_Scancode values, for held-key polling via SDL_GetKeyboardState.
-export let SC_A = 4;  export let SC_D = 7;  export let SC_E = 8;
-export let SC_Q = 20; export let SC_S = 22; export let SC_W = 26;
+// SDL_Scancode values, for held-key polling via keystate()/held().
+export let SC_A = 4;  export let SC_B = 5;  export let SC_C = 6;  export let SC_D = 7;
+export let SC_E = 8;  export let SC_F = 9;  export let SC_G = 10; export let SC_H = 11;
+export let SC_I = 12; export let SC_J = 13; export let SC_K = 14; export let SC_L = 15;
+export let SC_M = 16; export let SC_N = 17; export let SC_O = 18; export let SC_P = 19;
+export let SC_Q = 20; export let SC_R = 21; export let SC_S = 22; export let SC_T = 23;
+export let SC_U = 24; export let SC_V = 25; export let SC_W = 26; export let SC_X = 27;
+export let SC_Y = 28; export let SC_Z = 29;
+export let SC_1 = 30; export let SC_2 = 31; export let SC_3 = 32; export let SC_4 = 33;
+export let SC_5 = 34; export let SC_6 = 35; export let SC_7 = 36; export let SC_8 = 37;
+export let SC_9 = 38; export let SC_0 = 39;
+export let SC_RETURN = 40; export let SC_ESCAPE = 41; export let SC_BACKSPACE = 42;
+export let SC_TAB = 43;    export let SC_SPACE = 44;  export let SC_GRAVE = 53;
+export let SC_F1 = 58;
 export let SC_RIGHT = 79; export let SC_LEFT = 80; export let SC_DOWN = 81; export let SC_UP = 82;
-export let SC_LSHIFT = 225; export let SC_SPACE = 44;
+export let SC_LCTRL = 224; export let SC_LSHIFT = 225; export let SC_LALT = 226;
+export let SC_RCTRL = 228; export let SC_RSHIFT = 229;
+export let NUM_SCANCODES = 512;
 
-// Open a window sized width*height, scaled up by `scale` (nearest, chunky).
-// Returns { win, ren, tex, ev, width, height } or null on failure.
-export fn window_open(title: string, width: i32, height: i32, scale: i32): object {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        eprint(`SDL_Init failed: ${SDL_GetError()}`);
-        return null;
+// Module-scope scratch. Top-level names are `g_` prefixed: hemlockc refuses to
+// unbox any function-local whose name matches a top-level variable, with no
+// scope awareness, so a bare `rect` here would de-optimize every local named
+// `rect` in the whole program.
+let g_rect_a = alloc(16);      // SDL_Rect { i32 x, y, w, h }
+let g_rect_b = alloc(16);
+let g_ver = alloc(4);          // SDL_version { u8 major, minor, patch }
+
+fn rect_set(p_r: ptr, p_x: i32, p_y: i32, p_w: i32, p_h: i32) {
+    ptr_write_i32(p_r, p_x);
+    ptr_write_i32(ptr_offset(p_r, 4, 1), p_y);
+    ptr_write_i32(ptr_offset(p_r, 8, 1), p_w);
+    ptr_write_i32(ptr_offset(p_r, 12, 1), p_h);
+}
+
+// ===========================================================================
+// LIFECYCLE
+// ===========================================================================
+
+// Open a window `width`x`height` scaled up by `scale`.
+//
+// `logical` selects the coordinate space:
+//   1 = SDL_RenderSetLogicalSize(width, height) — SDL scales rasterization to
+//       the window. This is the LEGACY path; polygon edges are smoothed at
+//       window resolution, so it is NOT the chunky path.
+//   0 = no logical size. The renderer works in window pixels; draw into an
+//       offscreen target and upscale it with copy_ex(). This is the path
+//       target.hml uses.
+//
+// Returns { win, ren, tex, ev, width, height, scale } or null on failure.
+// `tex` is a streaming RGB24 texture, present only when `logical` is 1 (the
+// legacy CPU framebuffer sink); it is null otherwise.
+export fn window_open_ex(title: string, width: i32, height: i32, scale: i32,
+                         logical: i32) {
+    if (SDL_Init(SDL_INIT_VIDEO + SDL_INIT_AUDIO + SDL_INIT_EVENTS) != 0) {
+        // Video+audio together; fall back to video only so a box with no sound
+        // card still renders.
+        SDL_ClearError();
+        if (SDL_Init(SDL_INIT_VIDEO + SDL_INIT_EVENTS) != 0) {
+            eprint(`SDL_Init failed: ${SDL_GetError()}`);
+            return null;
+        }
     }
-    // Nearest-neighbour scaling for every texture we create from here on.
+    // Nearest-neighbour scaling for every texture created from here on.
     //
-    // This replaces the per-texture SDL_SetTextureScaleMode() that
-    // upload_texture() used to call. That call SEGFAULTS on the accelerated
-    // (OpenGL) renderer: our textures are RGB24, which is not in the GL
-    // renderer's native format list, so SDL allocates an internal conversion
-    // ("native") texture for them, and the scale-mode path on that conversion
-    // texture faults in SDL 2.0.20. The software/dummy renderer never hit it,
-    // which is why headless runs were fine and every real-display run died in
-    // upload_texture. The hint is read by SDL_CreateTexture, so setting it once
-    // up front is equivalent and works on every renderer.
+    // This REPLACES the per-texture SDL_SetTextureScaleMode() that
+    // upload_texture() used to call, which SEGFAULTS on the accelerated
+    // (OpenGL) renderer: a texture in a non-native pixel format makes SDL
+    // allocate an internal conversion ("native") texture, and the scale-mode
+    // path on that conversion texture faults. The software/dummy renderer never
+    // hit it, which is why headless runs were fine and every real-display run
+    // died in upload_texture. The hint is read by SDL_CreateTexture, so setting
+    // it once up front is equivalent and works on every renderer.
+    // DO NOT REPLACE THIS WITH SDL_SetTextureScaleMode. probe_sdl.hml asserts it.
     SDL_SetHint("SDL_RENDER_SCALE_QUALITY", "0");   // 0 = nearest
     let win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                width * scale, height * scale, SDL_WINDOW_SHOWN);
-    if (win == null) { eprint(`CreateWindow failed: ${SDL_GetError()}`); return null; }
+    if (win == ptr_null()) { eprint(`CreateWindow failed: ${SDL_GetError()}`); return null; }
 
     // flags=0 lets SDL pick the best driver: GPU-accelerated on a real display,
     // software when headless. (Do NOT force SDL_RENDERER_ACCELERATED — under the
@@ -97,19 +349,322 @@ export fn window_open(title: string, width: i32, height: i32, scale: i32): objec
     // SDL_RenderGeometry with "Invalid renderer"; flags=0 behaves identically in
     // the interpreter and compiler.) Fall back to explicit software if needed.
     let ren = SDL_CreateRenderer(win, -1, 0);
-    if (ren == null) { ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE); }
-    if (ren == null) { eprint(`CreateRenderer failed: ${SDL_GetError()}`); return null; }
-    // Logical size = internal resolution; SDL scales it up to the window.
-    SDL_RenderSetLogicalSize(ren, width, height);
+    if (ren == ptr_null()) { ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE); }
+    if (ren == ptr_null()) { eprint(`CreateRenderer failed: ${SDL_GetError()}`); return null; }
 
-    let tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, width, height);
-    if (tex == null) { eprint(`CreateTexture failed: ${SDL_GetError()}`); return null; }
+    // NOTE: `tex` is ptr_null(), not the `null` literal, when there is no
+    // framebuffer texture — so that `w.tex == ptr_null()` is the one test that
+    // works on both backends.
+    let tex = ptr_null();
+    if (logical != 0) {
+        SDL_RenderSetLogicalSize(ren, width, height);
+        tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24,
+                                SDL_TEXTUREACCESS_STREAMING, width, height);
+        if (tex == ptr_null()) { eprint(`CreateTexture failed: ${SDL_GetError()}`); return null; }
+    }
 
     return { win: win, ren: ren, tex: tex, ev: alloc(EVENT_SIZE),
-             width: width, height: height };
+             width: width, height: height, scale: scale };
 }
 
-// Push the framebuffer (a raw ptr to width*height*3 RGB bytes) to the screen.
+// Legacy entry point: logical size on, streaming RGB24 framebuffer texture.
+export fn window_open(title: string, width: i32, height: i32, scale: i32) {
+    return window_open_ex(title, width, height, scale, 1);
+}
+
+export fn window_close(w: object) {
+    if (w.tex != ptr_null()) { SDL_DestroyTexture(w.tex); }
+    SDL_DestroyRenderer(w.ren);
+    SDL_DestroyWindow(w.win);
+    SDL_Quit();
+}
+
+export fn sdl_error(): string { return SDL_GetError(); }
+export fn sdl_clear_error() { SDL_ClearError(); }
+export fn set_hint(name: string, value: string): i32 { return SDL_SetHint(name, value); }
+export fn get_hint(name: string): string { return SDL_GetHint(name); }
+
+// Runtime SDL version as "major.minor.patch" — this is the number that matters,
+// not the header's and not pkg-config's.
+export fn sdl_version_string(): string {
+    SDL_GetVersion(g_ver);
+    let a = ptr_deref_u8(g_ver);
+    let b = ptr_deref_u8(ptr_offset(g_ver, 1, 1));
+    let c = ptr_deref_u8(ptr_offset(g_ver, 2, 1));
+    return `${a}.${b}.${c}`;
+}
+
+export fn set_window_title(w: object, title: string) { SDL_SetWindowTitle(w.win, title); }
+// Writes window width @0 and height @4 of `out` (>= 8 bytes).
+export fn window_size(w: object, out: ptr) {
+    SDL_GetWindowSize(w.win, out, ptr_offset(out, 4, 1));
+}
+export fn set_logical_size(w: object, lw: i32, lh: i32): i32 {
+    return SDL_RenderSetLogicalSize(w.ren, lw, lh);
+}
+// Returns 0 on success. Software renderers return -1: that means "unavailable",
+// never fatal.
+export fn set_vsync(w: object, on: i32): i32 { return SDL_RenderSetVSync(w.ren, on); }
+
+// ===========================================================================
+// FRAME
+// ===========================================================================
+
+export fn sdl_clear(w: object, r: i32, g: i32, b: i32, a: i32) {
+    SDL_SetRenderDrawColor(w.ren, r, g, b, a);
+    SDL_RenderClear(w.ren);
+}
+export fn sdl_present(w: object) { SDL_RenderPresent(w.ren); }
+export fn set_draw_color(w: object, r: i32, g: i32, b: i32, a: i32): i32 {
+    return SDL_SetRenderDrawColor(w.ren, r, g, b, a);
+}
+export fn set_draw_blend(w: object, mode: i32): i32 {
+    return SDL_SetRenderDrawBlendMode(w.ren, mode);
+}
+export fn fill_rect(w: object, x: i32, y: i32, rw: i32, rh: i32): i32 {
+    rect_set(g_rect_a, x, y, rw, rh);
+    return SDL_RenderFillRect(w.ren, g_rect_a);
+}
+
+// Draw `nverts` packed SDL_Vertex (20 bytes each) starting at vertex
+// `first_vert` of `base`. One call per same-texture run; `tex` null means
+// untextured (vertex colours only).
+export fn draw_tris_at(w: object, tex, base: ptr, first_vert: i32, nverts: i32): i32 {
+    return SDL_RenderGeometry(w.ren, tex, ptr_offset(base, first_vert * 20, 1),
+                              nverts, null, 0);
+}
+
+// ===========================================================================
+// TEXTURES
+// ===========================================================================
+
+export fn create_static_tex(w: object, fmt: u32, tw: i32, th: i32) {
+    return SDL_CreateTexture(w.ren, fmt, SDL_TEXTUREACCESS_STATIC, tw, th);
+}
+export fn create_streaming_tex(w: object, fmt: u32, tw: i32, th: i32) {
+    return SDL_CreateTexture(w.ren, fmt, SDL_TEXTUREACCESS_STREAMING, tw, th);
+}
+// Offscreen render target. ARGB8888 is renderer-native, so no conversion
+// texture is allocated and the G5 crash class cannot occur.
+export fn create_target(w: object, tw: i32, th: i32) {
+    return SDL_CreateTexture(w.ren, FMT_ARGB8888, 2, tw, th);
+}
+export fn destroy_tex(tex) { SDL_DestroyTexture(tex); }
+
+// `tex` null restores the backbuffer.
+export fn set_target(w: object, tex): i32 { return SDL_SetRenderTarget(w.ren, tex); }
+export fn get_target(w: object) { return SDL_GetRenderTarget(w.ren); }
+
+export fn update_tex(tex, pixels: ptr, pitch: i32): i32 {
+    return SDL_UpdateTexture(tex, null, pixels, pitch);
+}
+// Dirty-rect upload. `pixels` points at the first byte of the sub-rectangle.
+export fn update_tex_rect(tex, x: i32, y: i32, rw: i32, rh: i32,
+                          pixels: ptr, pitch: i32): i32 {
+    rect_set(g_rect_a, x, y, rw, rh);
+    return SDL_UpdateTexture(tex, g_rect_a, pixels, pitch);
+}
+// Writes format(u32)@0, access(i32)@4, width(i32)@8, height(i32)@12 of `out`
+// (>= 16 bytes). Use it to prove a texture is in a renderer-native format.
+export fn query_tex(tex, out: ptr): i32 {
+    return SDL_QueryTexture(tex, out, ptr_offset(out, 4, 1),
+                            ptr_offset(out, 8, 1), ptr_offset(out, 12, 1));
+}
+export fn set_tex_blend(tex, mode: i32): i32 { return SDL_SetTextureBlendMode(tex, mode); }
+export fn set_tex_alpha(tex, a: i32): i32 { return SDL_SetTextureAlphaMod(tex, a); }
+export fn set_tex_color(tex, r: i32, g: i32, b: i32): i32 {
+    return SDL_SetTextureColorMod(tex, r, g, b);
+}
+
+// Full-texture blit with rotation/flip. `angle` is a C double — pass 0.0.
+// `src`/`dst` are SDL_Rect pointers or null; `center` is an SDL_Point or null.
+// `src`/`dst`/`center` accept null. They are intentionally UNANNOTATED: a
+// `ptr`-annotated Hemlock parameter rejects null with "Cannot convert type to
+// target type" (extern `ptr` params accept it fine).
+export fn copy_ex(w: object, tex, src, dst, angle: f64, center, flip: i32): i32 {
+    return SDL_RenderCopyEx(w.ren, tex, src, dst, angle, center, flip);
+}
+// Integer-scaled blit of a whole texture to (x, y) at `scale`, no rotation.
+export fn copy_scaled(w: object, tex, x: i32, y: i32,
+                      tw: i32, th: i32, scale: i32): i32 {
+    rect_set(g_rect_b, x, y, tw * scale, th * scale);
+    return SDL_RenderCopyEx(w.ren, tex, null, g_rect_b, 0.0, null, 0);
+}
+
+// Read back a sub-rectangle of the current render target into `dst`.
+export fn read_pixels_rect(w: object, x: i32, y: i32, rw: i32, rh: i32,
+                           fmt: u32, dst: ptr, pitch: i32): i32 {
+    rect_set(g_rect_a, x, y, rw, rh);
+    return SDL_RenderReadPixels(w.ren, g_rect_a, fmt, dst, pitch);
+}
+
+// ===========================================================================
+// EVENTS AND INPUT
+// ===========================================================================
+
+export fn pump_events() { SDL_PumpEvents(); }
+
+// Drain the SDL event queue into `out`, a caller-owned array<i32> of at least
+// `max * 3` entries, three ints per event: [type, a, b].
+//
+//   EV_QUIT                       a = 0,             b = 0
+//   EV_KEYDOWN / EV_KEYUP         a = scancode,      b = repeat (0/1)
+//   EV_MOUSEBUTTONDOWN / ..UP     a = button index,  b = 0
+//   EV_MOUSEWHEEL                 a = wheel x,       b = wheel y
+//   anything else                 a = 0,             b = 0
+//
+// Returns the number of events written. The queue is always drained fully —
+// events past `max` are counted but not recorded, so nothing backs up.
+// Allocates nothing. Mouse MOTION is intentionally not reported: use
+// rel_mouse_delta(), which cannot silently break on a struct layout change.
+export fn poll_events(w: object, out, max: i32): i32 {
+    let ev = w.ev;
+    let n = 0;
+    while (SDL_PollEvent(ev) != 0) {
+        if (n < max) {
+            let t = ptr_deref_u32(ev);
+            let a = 0;
+            let b = 0;
+            if (t == EV_KEYDOWN || t == EV_KEYUP) {
+                a = ptr_deref_u32(ptr_offset(ev, KEYSYM_SCANCODE_OFFSET, 1));
+                b = ptr_deref_u8(ptr_offset(ev, KEY_REPEAT_OFFSET, 1));
+            } else if (t == EV_MOUSEBUTTONDOWN || t == EV_MOUSEBUTTONUP) {
+                a = ptr_deref_u8(ptr_offset(ev, MBUTTON_OFFSET, 1));
+            } else if (t == EV_MOUSEWHEEL) {
+                a = ptr_deref_i32(ptr_offset(ev, WHEEL_X_OFFSET, 1));
+                b = ptr_deref_i32(ptr_offset(ev, WHEEL_Y_OFFSET, 1));
+            }
+            let i = n * 3;
+            out[i] = t;
+            out[i + 1] = a;
+            out[i + 2] = b;
+        }
+        n++;
+    }
+    let count = n;
+    if (count > max) { count = max; }
+    let res: i32 = count;
+    return res;
+}
+
+// Continuous (held) keyboard state. Returns a pointer into SDL's
+// scancode -> pressed(0/1) array; query it with held(state, SC_*).
+export fn keystate(): ptr { return SDL_GetKeyboardState(null); }
+export fn held(state: ptr, scancode: i32): bool {
+    return ptr_deref_u8(ptr_offset(state, scancode, 1)) != 0;
+}
+
+// Relative mouse mode. Returns 0 on success.
+// IT RETURNS -1 UNDER SDL_VIDEODRIVER=dummy ("No relative mode implementation
+// available") and the WARP hint does not rescue it. Callers must report the
+// failure and keep rendering. Never treat this as fatal.
+export fn set_relative_mouse(on: i32): i32 { return SDL_SetRelativeMouseMode(on); }
+export fn get_relative_mouse(): i32 { return SDL_GetRelativeMouseMode(); }
+
+// Writes dx @0 and dy @4 of `out` (>= 8 bytes) and returns the button mask
+// (MB_LEFT | MB_MIDDLE | MB_RIGHT). The deltas are consumed by the call.
+export fn rel_mouse_delta(out: ptr): i32 {
+    return SDL_GetRelativeMouseState(out, ptr_offset(out, 4, 1));
+}
+export fn mouse_buttons(): i32 { return SDL_GetMouseState(null, null); }
+// Writes x @0 and y @4 of `out` (>= 8 bytes); returns the button mask.
+export fn mouse_pos(out: ptr): i32 {
+    return SDL_GetMouseState(out, ptr_offset(out, 4, 1));
+}
+export fn show_cursor(on: i32): i32 { return SDL_ShowCursor(on); }
+
+// ===========================================================================
+// TIME
+// ===========================================================================
+
+// Monotonic high-resolution counter and its frequency in ticks/second.
+// u64 FFI returns are exact — no 2^53 workaround is needed.
+export fn perf_counter(): u64 { return SDL_GetPerformanceCounter(); }
+export fn perf_freq(): u64 { return SDL_GetPerformanceFrequency(); }
+
+// ===========================================================================
+// AUDIO — SDL2_mixer (primary)
+// ===========================================================================
+
+export fn mix_version_string(): string {
+    let v = Mix_Linked_Version();
+    let a = ptr_deref_u8(v);
+    let b = ptr_deref_u8(ptr_offset(v, 1, 1));
+    let c = ptr_deref_u8(ptr_offset(v, 2, 1));
+    return `${a}.${b}.${c}`;
+}
+
+// Returns 0 on success, -1 on failure (no device). Failure is not fatal.
+export fn mix_open(freq: i32, format: i32, channels: i32, chunksize: i32): i32 {
+    return Mix_OpenAudio(freq, format, channels, chunksize);
+}
+// Writes freq(i32)@0, format(u16)@4, channels(i32)@8 of `out` (>= 12 bytes).
+// Returns the number of times the device has been opened (0 = not open).
+export fn mix_query_spec(out: ptr): i32 {
+    return Mix_QuerySpec(out, ptr_offset(out, 4, 1), ptr_offset(out, 8, 1));
+}
+export fn mix_alloc_channels(n: i32): i32 { return Mix_AllocateChannels(n); }
+
+// DOES NOT COPY. The returned Mix_Chunk points straight at `mem`, so `mem` must
+// outlive every possible playback — keep it in a table owned for the process
+// lifetime. A use-after-free here is a crash months later.
+export fn mix_quickload_raw(mem: ptr, len: i32) { return Mix_QuickLoad_RAW(mem, len); }
+
+// Loads an encoded WAV from an SDL_RWops (this DOES copy). `freesrc` non-zero
+// closes the RWops. Mix_LoadWAV is a macro and cannot be bound; this is it.
+export fn mix_load_wav_rw(rw, freesrc: i32) { return Mix_LoadWAV_RW(rw, freesrc); }
+export fn rw_from_mem(mem: ptr, size: i32) { return SDL_RWFromMem(mem, size); }
+
+// Mix_PlayChannel is a macro; this is the real symbol. channel -1 = first free.
+// Returns the channel played on, or -1.
+export fn mix_play(chunk, channel: i32, loops: i32): i32 {
+    return Mix_PlayChannelTimed(channel, chunk, loops, -1);
+}
+export fn mix_play_timed(chunk, channel: i32, loops: i32, ms: i32): i32 {
+    return Mix_PlayChannelTimed(channel, chunk, loops, ms);
+}
+export fn mix_set_panning(channel: i32, left: i32, right: i32): i32 {
+    return Mix_SetPanning(channel, left, right);
+}
+export fn mix_set_volume(channel: i32, volume: i32): i32 { return Mix_Volume(channel, volume); }
+export fn mix_set_chunk_volume(chunk, volume: i32): i32 {
+    return Mix_VolumeChunk(chunk, volume);
+}
+export fn mix_playing(channel: i32): i32 { return Mix_Playing(channel); }
+export fn mix_halt(channel: i32): i32 { return Mix_HaltChannel(channel); }
+export fn mix_free_chunk(chunk) { Mix_FreeChunk(chunk); }
+export fn mix_close() { Mix_CloseAudio(); }
+
+// ===========================================================================
+// AUDIO — raw SDL_QueueAudio (documented fallback, same interface shape)
+//
+// Pass callback = NULL in the SDL_AudioSpec (byte 16..23) to select queue mode,
+// so Hemlock never hands a function pointer back to C. SDL_AudioSpec layout:
+//   freq i32@0  format u16@4  channels u8@6  silence u8@7
+//   samples u16@8  padding u16@10  size u32@12  callback ptr@16  userdata ptr@24
+// sizeof == 32; allocate 32 or more and memset it to 0.
+// ===========================================================================
+
+export fn qaudio_open(want: ptr, have: ptr): i32 {
+    return SDL_OpenAudioDevice(null, 0, want, have, 0);
+}
+export fn qaudio_queue(dev: i32, data: ptr, len: i32): i32 {
+    return SDL_QueueAudio(dev, data, len);
+}
+export fn qaudio_size(dev: i32): i32 { return SDL_GetQueuedAudioSize(dev); }
+export fn qaudio_clear(dev: i32) { SDL_ClearQueuedAudio(dev); }
+export fn qaudio_pause(dev: i32, pause_on: i32) { SDL_PauseAudioDevice(dev, pause_on); }
+export fn qaudio_close(dev: i32) { SDL_CloseAudioDevice(dev); }
+export fn qaudio_mix(dst: ptr, src: ptr, format: i32, len: i32, volume: i32) {
+    SDL_MixAudioFormat(dst, src, format, len, volume);
+}
+
+// ===========================================================================
+// LEGACY SURFACE — kept byte-compatible for the frozen modules and examples.
+// New code should not use these.
+// ===========================================================================
+
+// Push a width*height*3 RGB24 framebuffer to the screen.
 export fn present(w: object, pixels: ptr) {
     SDL_UpdateTexture(w.tex, null, pixels, w.width * 3);
     SDL_RenderClear(w.ren);
@@ -117,43 +672,34 @@ export fn present(w: object, pixels: ptr) {
     SDL_RenderPresent(w.ren);
 }
 
-// --- GPU geometry path (SDL_RenderGeometry) ---
-
-// Upload a Wobbleweed texture ({ width, height, data: buffer }) to a static SDL
-// texture sampled with nearest (chunky). Returns the SDL_Texture ptr.
-export fn upload_texture(w: object, tex: object): ptr {
+// Upload a { width, height, data: buffer } RGB24 texture to a static SDL
+// texture. Nearest filtering comes from the SDL_RENDER_SCALE_QUALITY hint set
+// in window_open — do NOT call SDL_SetTextureScaleMode here (see rule 2).
+export fn upload_texture(w: object, tex: object) {
     let t = SDL_CreateTexture(w.ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STATIC,
                               tex.width, tex.height);
     SDL_UpdateTexture(t, null, buffer_ptr(tex.data), tex.width * 3);
-    // NOTE: do NOT call SDL_SetTextureScaleMode(t, ...) here — it segfaults on
-    // the OpenGL renderer for non-native formats like RGB24. Nearest filtering
-    // comes from the SDL_RENDER_SCALE_QUALITY hint set in window_open().
     return t;
 }
 
-// Clear the renderer to a solid color (start of a GPU frame).
 export fn clear(w: object, r: i32, g: i32, b: i32) {
     SDL_SetRenderDrawColor(w.ren, r, g, b, 255);
     SDL_RenderClear(w.ren);
 }
 
-// Draw `nverts` packed SDL_Vertex (20 bytes each) from `vbuf` with `sdltex`
-// (null = untextured, vertex colors only).
 export fn draw_tris(w: object, sdltex, vbuf: ptr, nverts: i32) {
     SDL_RenderGeometry(w.ren, sdltex, vbuf, nverts, null, 0);
 }
 
-// Present the GPU frame.
 export fn present_geom(w: object) { SDL_RenderPresent(w.ren); }
 
-// Read the rendered frame back into `dst` (a width*height*3 RGB buffer) — used
-// for headless PNG verification.
+// Read the rendered frame back into `dst`, a width*height*3 RGB24 buffer.
 export fn read_pixels(w: object, dst) {
     SDL_RenderReadPixels(w.ren, null, SDL_PIXELFORMAT_RGB24, buffer_ptr(dst), w.width * 3);
 }
 
-// Drain pending events. Returns { quit: bool, keys: array<i32> } where `keys`
-// are the SDLK codes pressed this frame.
+// Drain events. Returns { quit: bool, keys: array<i32> } of SDLK codes pressed
+// this frame. Allocates — new code uses poll_events().
 export fn poll(w: object): object {
     let quit = false;
     let keys = [];
@@ -170,19 +716,7 @@ export fn poll(w: object): object {
     return { quit: quit, keys: keys };
 }
 
-// Continuous (held) keyboard state — call after poll() each frame. Returns a
-// pointer into SDL's scancode→pressed(0/1) array; query with held(state, SC_*).
-export fn keystate(): ptr { return SDL_GetKeyboardState(null); }
-export fn held(state: ptr, scancode: i32): bool {
-    return ptr_deref_u8(ptr_offset(state, scancode, 1)) != 0;
-}
-
+// 1 ms resolution and it wraps after ~49 days. Coarse logging only — the frame
+// clock is perf_counter()/perf_freq().
 export fn ticks(): i32 { return SDL_GetTicks(); }
 export fn delay(ms: i32) { SDL_Delay(ms); }
-
-export fn window_close(w: object) {
-    SDL_DestroyTexture(w.tex);
-    SDL_DestroyRenderer(w.ren);
-    SDL_DestroyWindow(w.win);
-    SDL_Quit();
-}

@@ -1,0 +1,386 @@
+// probe_lifecycle.hml — verification program for W1-11 (src/engine.hml, G21).
+//
+// Run COMPILED. Headless is the CI mode; the real display is also exercised.
+//     HC=/home/nbeerbower/Projects/hemlock/hemlockc
+//     $HC -O1 examples/probe_lifecycle.hml -o /tmp/probe_lifecycle
+//     SDL_VIDEODRIVER=dummy /tmp/probe_lifecycle
+//     DISPLAY=:0            /tmp/probe_lifecycle
+//
+// Prints one line per measurement, then `PASS n/n`, and exits 0 only if every
+// assertion held AND the assertion COUNT is the expected one. A probe that
+// silently stops asserting is worse than no probe, so the count is itself an
+// assertion.
+//
+// What it proves:
+//   1. init/shutdown round trip, and `engine_handle` before/after.
+//   2. The registry: register, dedupe, unregister, destroy, cap overflow.
+//   3. The teardown ORDER, read back from the engine's own phase log:
+//      audio -> target -> textures -> renderer -> window -> SDL_Quit.
+//   4. 10 000 frames with a texture create/destroy churn leave /proc/self/statm
+//      flat — the G21 acceptance criterion.
+//   5. Shutdown destroys every registered texture (the count valgrind checks).
+//   6. Shutdown is idempotent.
+
+import { exit } from "@stdlib/process";
+import { getenv } from "@stdlib/env";
+import {
+    engine_init, engine_init_ex, engine_shutdown, engine_handle,
+    engine_alive, engine_width, engine_height, engine_scale,
+    engine_register_tex, engine_unregister_tex, engine_destroy_tex,
+    engine_tex_index, engine_tex_count, engine_tex_cap, engine_tex_at,
+    engine_create_static_tex, engine_create_streaming_tex, engine_create_target,
+    engine_set_target_tex, engine_target_tex, engine_destroy_all_tex,
+    engine_open_audio, engine_set_audio_owned, engine_audio_owned,
+    engine_teardown_steps, engine_teardown_phase,
+    ENGINE_PHASE_AUDIO, ENGINE_PHASE_TARGET, ENGINE_PHASE_TEXTURES,
+    ENGINE_PHASE_RENDERER, ENGINE_PHASE_WINDOW, ENGINE_PHASE_QUIT,
+    ENGINE_TEX_CAP, ENGINE_CHUNKY, ENGINE_LOGICAL
+} from "../src/engine.hml";
+import {
+    sdl_clear, sdl_present, set_target, copy_scaled, create_static_tex,
+    FMT_RGBA32, FMT_ARGB8888, AUDIO_S16LSB
+} from "../src/sdl.hml";
+import { clock_now, clock_ms_between } from "../src/time.hml";
+
+// /proc/self/statm, read through libc. `read_file` returns "" for procfs
+// (the kernel reports st_size 0 and the stdlib trusts it), so this is FFI.
+import "libc.so.6";
+extern fn fopen(path: string, mode: string): ptr;
+extern fn fread(buf: ptr, size: i32, n: i32, f: ptr): i32;
+extern fn fclose(f: ptr): i32;
+
+// The number of assertions this file is expected to make. Update it
+// deliberately, never to make a run go green.
+let g_expected_assertions = 68;
+
+let g_pass: i32 = 0;
+let g_total: i32 = 0;
+let g_statm_buf = alloc(256);
+
+fn ok(p_cond: bool, p_label: string) {
+    g_total++;
+    if (p_cond) { g_pass++; } else { print(`  FAIL  ${p_label}`); }
+}
+
+fn eqi(p_label: string, p_got: i32, p_want: i32) {
+    g_total++;
+    if (p_got == p_want) { g_pass++; }
+    else { print(`  FAIL  ${p_label}: got ${p_got}, want ${p_want}`); }
+}
+
+// Field `p_k` of /proc/self/statm in pages. Field 1 is resident set size.
+fn statm_field(p_k: i32): i32 {
+    let f = fopen("/proc/self/statm", "r");
+    if (f == ptr_null()) { let none: i32 = -1; return none; }
+    let n: i32 = fread(g_statm_buf, 1, 255, f);
+    fclose(f);
+    let field: i32 = 0;
+    let val: i32 = 0;
+    let seen: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let c: i32 = ptr_deref_u8(ptr_offset(g_statm_buf, i, 1));
+        if (c >= 48 && c <= 57) { val = val * 10 + (c - 48); seen = 1; }
+        else {
+            if (seen == 1) {
+                if (field == p_k) { let hit: i32 = val; return hit; }
+                field++;
+                val = 0;
+                seen = 0;
+            }
+        }
+        i++;
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+fn rss_pages(): i32 { let out: i32 = statm_field(1); return out; }
+
+// ---------------------------------------------------------------------------
+// 1. init / handle / shutdown round trip
+// ---------------------------------------------------------------------------
+fn test_roundtrip() {
+    print("[1] init / handle / shutdown");
+    let e = engine_init("probe_lifecycle", 320, 240, 2);
+    ok(e != null, "engine_init returns a handle");
+    if (e == null) { print("FATAL: no engine; nothing else can run"); return; }
+
+    ok(engine_handle(e) != null, "engine_handle non-null while alive");
+    eqi("engine_alive", engine_alive(e), 1);
+    eqi("engine_width", engine_width(e), 320);
+    eqi("engine_height", engine_height(e), 240);
+    eqi("engine_scale", engine_scale(e), 2);
+    eqi("registry starts empty", engine_tex_count(e), 0);
+    eqi("default registry cap", engine_tex_cap(e), ENGINE_TEX_CAP);
+    ok(engine_target_tex(e) == ptr_null(), "no render target recorded yet");
+
+    // The window/renderer actually work.
+    let w = engine_handle(e);
+    sdl_clear(w, 12, 14, 18, 255);
+    sdl_present(w);
+    ok(true, "clear + present through the engine handle");
+
+    let phases: i32 = engine_shutdown(e);
+    eqi("engine_shutdown executes 6 phases", phases, 6);
+    eqi("engine_alive after shutdown", engine_alive(e), 0);
+    ok(engine_handle(e) == null, "engine_handle is null after shutdown");
+    eqi("second engine_shutdown is a no-op", engine_shutdown(e), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 2. the teardown ORDER, asserted from the engine's own phase log
+// ---------------------------------------------------------------------------
+fn test_order() {
+    print("[2] teardown order");
+    let e = engine_init("probe_lifecycle_order", 64, 64, 1);
+    if (e == null) { print("  (skipped: no engine)"); return; }
+
+    // Give every phase something real to do so none of them is trivially
+    // ordered: an audio device (may fail headless — that is fine and the flag
+    // is then honestly 0), a render target, and two ordinary textures.
+    let arc: i32 = engine_open_audio(e, 22050, AUDIO_S16LSB, 1, 512);
+    print(`  mixer open rc         = ${arc} (audio owned = ${engine_audio_owned(e)})`);
+    let tgt = engine_create_target(e, 64, 64);
+    ok(tgt != ptr_null(), "engine_create_target");
+    ok(engine_target_tex(e) == tgt, "target recorded");
+    let a = engine_create_static_tex(e, FMT_RGBA32, 8, 8);
+    let b = engine_create_streaming_tex(e, FMT_RGBA32, 8, 8);
+    ok(a != ptr_null(), "engine_create_static_tex");
+    ok(b != ptr_null(), "engine_create_streaming_tex");
+    eqi("three textures registered", engine_tex_count(e), 3);
+
+    // Bind the target, then shut down without unbinding: the engine must unbind
+    // it itself before destroying it.
+    set_target(engine_handle(e), tgt);
+
+    let phases: i32 = engine_shutdown(e);
+    eqi("6 phases executed", phases, 6);
+    eqi("phase log length", engine_teardown_steps(e), 6);
+    eqi("phase 0 = AUDIO", engine_teardown_phase(e, 0), ENGINE_PHASE_AUDIO);
+    eqi("phase 1 = TARGET", engine_teardown_phase(e, 1), ENGINE_PHASE_TARGET);
+    eqi("phase 2 = TEXTURES", engine_teardown_phase(e, 2), ENGINE_PHASE_TEXTURES);
+    eqi("phase 3 = RENDERER", engine_teardown_phase(e, 3), ENGINE_PHASE_RENDERER);
+    eqi("phase 4 = WINDOW", engine_teardown_phase(e, 4), ENGINE_PHASE_WINDOW);
+    eqi("phase 5 = QUIT", engine_teardown_phase(e, 5), ENGINE_PHASE_QUIT);
+    eqi("registry empty after shutdown", engine_tex_count(e), 0);
+    eqi("audio ownership cleared", engine_audio_owned(e), 0);
+    eqi("out-of-range phase index", engine_teardown_phase(e, 6), -1);
+}
+
+// ---------------------------------------------------------------------------
+// 3. registry semantics
+// ---------------------------------------------------------------------------
+fn test_registry() {
+    print("[3] texture registry");
+    // A tiny cap so the overflow path is reachable without creating 256
+    // textures.
+    let e = engine_init_ex("probe_lifecycle_reg", 64, 64, 1, ENGINE_CHUNKY, 4);
+    if (e == null) { print("  (skipped: no engine)"); return; }
+    let w = engine_handle(e);
+    eqi("custom registry cap", engine_tex_cap(e), 4);
+
+    let t0 = create_static_tex(w, FMT_RGBA32, 4, 4);
+    let t1 = create_static_tex(w, FMT_RGBA32, 4, 4);
+    eqi("register t0 -> index 0", engine_register_tex(e, t0), 0);
+    eqi("register t1 -> index 1", engine_register_tex(e, t1), 1);
+    eqi("re-registering t0 is idempotent", engine_register_tex(e, t0), 0);
+    eqi("count after dedupe", engine_tex_count(e), 2);
+    eqi("engine_tex_index(t1)", engine_tex_index(e, t1), 1);
+    ok(engine_tex_at(e, 0) == t0, "engine_tex_at(0) == t0");
+    ok(engine_tex_at(e, 9) == ptr_null(), "engine_tex_at out of range");
+    eqi("registering a null handle is refused", engine_register_tex(e, ptr_null()), -1);
+
+    // Fill to the cap, then overflow.
+    let t2 = create_static_tex(w, FMT_RGBA32, 4, 4);
+    let t3 = create_static_tex(w, FMT_RGBA32, 4, 4);
+    engine_register_tex(e, t2);
+    engine_register_tex(e, t3);
+    eqi("registry full", engine_tex_count(e), 4);
+    let t4 = create_static_tex(w, FMT_RGBA32, 4, 4);
+    eqi("overflow returns -1", engine_register_tex(e, t4), -1);
+    eqi("overflow did not grow the registry", engine_tex_count(e), 4);
+    // t4 is ours; the engine correctly refused it. Destroy it by hand.
+    engine_unregister_tex(e, t4);
+
+    // Creation helper under a full registry must destroy rather than leak.
+    let t5 = engine_create_static_tex(e, FMT_RGBA32, 4, 4);
+    ok(t5 == ptr_null(), "create helper returns null when the registry is full");
+    eqi("still exactly 4 registered", engine_tex_count(e), 4);
+
+    // destroy_tex removes exactly one, and only a registered one.
+    eqi("engine_destroy_tex(t1)", engine_destroy_tex(e, t1), 1);
+    eqi("count after destroy", engine_tex_count(e), 3);
+    eqi("engine_tex_index(t1) after destroy", engine_tex_index(e, t1), -1);
+    eqi("destroying an unregistered handle is a no-op", engine_destroy_tex(e, t4), 0);
+    eqi("count unchanged by the no-op", engine_tex_count(e), 3);
+
+    // unregister without destroying, then hand it back.
+    eqi("engine_unregister_tex(t0)", engine_unregister_tex(e, t0), 1);
+    eqi("count after unregister", engine_tex_count(e), 2);
+    eqi("re-register the released handle", engine_register_tex(e, t0), 2);
+
+    // set_target_tex only accepts a registered handle.
+    eqi("set_target_tex on an unregistered handle", engine_set_target_tex(e, t4), 0);
+    eqi("set_target_tex on a registered handle", engine_set_target_tex(e, t2), 1);
+
+    let n_before: i32 = engine_tex_count(e);
+    let destroyed: i32 = engine_destroy_all_tex(e);
+    eqi("destroy_all destroys every registered texture", destroyed, n_before);
+    eqi("registry empty after destroy_all", engine_tex_count(e), 0);
+    ok(engine_target_tex(e) == ptr_null(), "destroy_all clears the target record");
+
+    engine_shutdown(e);
+    // t4 was never adopted by the engine and SDL_Quit has already reclaimed it;
+    // no manual destroy here, which is exactly why the registry exists.
+}
+
+// ---------------------------------------------------------------------------
+// 4. 10 000 frames: flat /proc/self/statm  (the G21 acceptance criterion)
+// ---------------------------------------------------------------------------
+//
+// MEASURED CAVEAT, and the reason this test samples three times instead of two.
+// On the software / dummy renderer RSS is dead flat from the first frame. On a
+// real display the OpenGL driver's RSS climbs for roughly the first 6000 frames
+// (shader cache, GL buffer pools, its own arenas) and then stops dead: measured
+// +1200 pages over frames 0-2000, +432 over 2000-4000, +144 over 4000-6000,
+// then EXACTLY 0 over 6000-10000, and a second run in the same process is flat
+// from frame 0. That is driver warm-up, not an engine leak, and no warm-up
+// length is portable across drivers.
+//
+// So the leak assertion is on the STEADY-STATE half (frames n/2..n): a real
+// per-frame leak is linear and shows there just as strongly, while warm-up does
+// not. The whole-run delta is printed for information.
+fn test_frames_flat_rss() {
+    // PROBE_QUICK=1 shortens the loop so the whole probe can be run under
+    // valgrind (which is ~50x slower). It does NOT change any assertion.
+    let quick = getenv("PROBE_QUICK");
+    let frames: i32 = 10000;
+    if (quick != null) { frames = 400; }
+    let half: i32 = frames / 2;
+
+    print(`[4] ${frames} frames, resident set size`);
+    let e = engine_init("probe_lifecycle_frames", 320, 240, 2);
+    if (e == null) { print("  (skipped: no engine)"); return; }
+    let w = engine_handle(e);
+    let tgt = engine_create_target(e, 320, 240);
+    ok(tgt != ptr_null(), "render target for the frame loop");
+
+    let rss0: i32 = rss_pages();
+    let rssmid: i32 = 0;
+    let t0: u64 = clock_now();
+
+    // Frames, with a texture create/destroy churn through the registry every
+    // 100 frames — the registry must not grow and the churn must not leak.
+    let f: i32 = 0;
+    let churns: i32 = 0;
+    while (f < frames) {
+        set_target(w, tgt);
+        sdl_clear(w, 8, 10, 14, 255);
+        set_target(w, null);
+        sdl_clear(w, 0, 0, 0, 255);
+        copy_scaled(w, tgt, 0, 0, 320, 240, 2);
+        sdl_present(w);
+        if (f % 100 == 0) {
+            let scratch = engine_create_static_tex(e, FMT_RGBA32, 32, 32);
+            if (scratch != ptr_null()) {
+                engine_destroy_tex(e, scratch);
+                churns++;
+            }
+        }
+        f++;
+        if (f == half) { rssmid = rss_pages(); }
+    }
+
+    let t1: u64 = clock_now();
+    let rss1: i32 = rss_pages();
+    let ms: f64 = clock_ms_between(t0, t1);
+    let dwhole: i32 = rss1 - rss0;
+    let dsteady: i32 = rss1 - rssmid;
+
+    print(`  frames                = ${frames} in ${ms} ms (${ms / f64(frames)} ms/frame)`);
+    print(`  registry churns       = ${churns} create+destroy pairs`);
+    print(`  RSS @0                = ${rss0} pages (${rss0 * 4} KiB)`);
+    print(`  RSS @${half}             = ${rssmid} pages (${rssmid * 4} KiB)`);
+    print(`  RSS @${frames}            = ${rss1} pages (${rss1 * 4} KiB)`);
+    print(`  RSS delta whole run   = ${dwhole} pages (${dwhole * 4} KiB)  [informational]`);
+    print(`  RSS delta steady half = ${dsteady} pages (${dsteady * 4} KiB)  [the assertion]`);
+
+    ok(rss0 > 0, "statm is readable");
+    // 16 pages / 64 KiB of slack over the steady half. At 10 000 frames that is
+    // a sensitivity of ~13 bytes/frame: a leak of one 24-byte object per frame
+    // would be 29 pages and would fail. This is a leak detector, not a noise
+    // detector.
+    ok(dsteady <= 16, "RSS flat over the steady-state half (delta <= 16 pages)");
+    eqi("registry still holds only the target", engine_tex_count(e), 1);
+
+    engine_shutdown(e);
+}
+
+// ---------------------------------------------------------------------------
+// 5. shutdown really destroys the textures (what valgrind is checking)
+// ---------------------------------------------------------------------------
+fn test_sweep() {
+    print("[5] shutdown sweep");
+    let e = engine_init("probe_lifecycle_sweep", 64, 64, 1);
+    if (e == null) { print("  (skipped: no engine)"); return; }
+    let made: i32 = 0;
+    let i: i32 = 0;
+    while (i < 32) {
+        let t = engine_create_static_tex(e, FMT_RGBA32, 16, 16);
+        if (t != ptr_null()) { made++; }
+        i++;
+    }
+    eqi("32 textures created and registered", engine_tex_count(e), made);
+    eqi("all 32 creations succeeded", made, 32);
+    engine_shutdown(e);
+    eqi("registry empty after the sweep", engine_tex_count(e), 0);
+    print("  32 SDL_Texture destroyed by the sweep (valgrind asserts the rest)");
+}
+
+// ---------------------------------------------------------------------------
+// 6. the legacy window path still works through the engine
+// ---------------------------------------------------------------------------
+fn test_logical_path() {
+    print("[6] legacy logical-size path");
+    let e = engine_init_ex("probe_lifecycle_legacy", 160, 120, 2,
+                           ENGINE_LOGICAL, ENGINE_TEX_CAP);
+    ok(e != null, "engine_init_ex(ENGINE_LOGICAL) opens");
+    if (e == null) { return; }
+    let w = engine_handle(e);
+    // The legacy streaming framebuffer texture belongs to window_close, NOT to
+    // the registry. Asserting it stays out is asserting we cannot double-free
+    // it.
+    ok(w.tex != ptr_null(), "legacy framebuffer texture exists on this path");
+    eqi("legacy framebuffer texture is NOT in the registry",
+        engine_tex_index(e, w.tex), -1);
+    sdl_clear(w, 0, 0, 0, 255);
+    sdl_present(w);
+    eqi("shutdown of the legacy path", engine_shutdown(e), 6);
+}
+
+fn main() {
+    print("probe_lifecycle — W1-11 engine lifecycle and resource registry (G21)");
+    print("");
+    test_roundtrip();
+    test_order();
+    test_registry();
+    test_frames_flat_rss();
+    test_sweep();
+    test_logical_path();
+    print("");
+
+    // The assertion count is itself an assertion: a probe that quietly stops
+    // testing must not pass.
+    let counted: i32 = g_total;
+    if (counted != g_expected_assertions) {
+        print(`  FAIL  assertion count: ran ${counted}, expected ${g_expected_assertions}`);
+        print(`PASS ${g_pass}/${g_total}`);
+        exit(1);
+    }
+    print(`assertion count = ${g_total} (expected ${g_expected_assertions}) OK`);
+    print(`PASS ${g_pass}/${g_total}`);
+    if (g_pass != g_total) { exit(1); }
+}
+
+main();
