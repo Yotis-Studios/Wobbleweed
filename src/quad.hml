@@ -1,0 +1,311 @@
+// quad.hml — screen-space quads. No projection, no matrix, no camera.
+//
+// Everything here writes SDL_Vertex bytes straight into a Batch's `vbuf` in the
+// render target's own pixel coordinates (ARCHITECTURE.md §2.3). It is the whole
+// 2D currency of the engine: overlay plates, meters, sprite cells,
+// full-screen composites and the ring/annulus primitive. `font.hml` and `billboard.hml`
+// build on the primitives at the bottom of this file rather than duplicating
+// the packing code.
+//
+// R1 — this module knows no colour, no icon, no game noun. Every colour, every
+// UV rect, every size and every texture is a parameter supplied by the caller.
+//
+// PERFORMANCE CONTRACT (CLAUDE.md §4)
+//   * screen x/y are pixel-snapped with floor(v + 0.5) exactly once per corner,
+//     never per vertex (ARCHITECTURE.md §2.3 invariant 2),
+//   * no object literal, no array literal, no closure, no defer, no try, no
+//     throw and no template string in any function below,
+//   * every parameter of the per-vertex / per-quad writers is `p_`-prefixed and
+//     copied into a typed local when it is read more than once (rule A1),
+//   * scalar returns go through a named copy-out local (rule A2),
+//   * nothing allocates. The only memory touched is the caller's `vbuf`.
+//
+// UV CONVENTION. `quad_screen` writes ONE uv pair to all six vertices — pass
+// the texel of a known-solid cell (or a null texture) for flat fills.
+// `quad_screen_uv` takes a rect. Neither insets a half texel: with
+// SDL_RENDER_SCALE_QUALITY=0 the sampler is nearest, and a quad whose pixel
+// size equals its texel size then samples 1:1 and stays pixel-exact. Cells that
+// need an inset get it from `atlas_cell_uv` on the way in.
+//
+// WINDING. A rect is (x0,y0) (x1,y0) (x1,y1) / (x0,y0) (x1,y1) (x0,y1) — that
+// is clockwise with y pointing down, matching the emit kernel. SDL_RenderGeometry
+// does not cull, so this is a convention, not a correctness requirement; keep it
+// consistent so a future culling flush does not silently drop the HUD.
+
+import { floor, sin, cos } from "@stdlib/math";
+import { batch_reserve, batch_commit, batch_vbuf, TSTRIDE } from "./batch.hml";
+
+// ---------------------------------------------------------------------------
+// The ONLY place quad.hml touches batch.hml — and, through these three
+// wrappers, the only place font.hml touches it at all.
+//
+//   batch_reserve(b, n_tris)        -> byte cursor into vbuf, or -1 at the cap
+//   batch_commit(b, cursor, tex, depth)  -> ONCE PER TRIANGLE, at
+//                                           cursor + k * TSTRIDE
+//   batch_vbuf(b)                   -> the vertex arena
+// ---------------------------------------------------------------------------
+
+// Reserve `n` triangles. Returns a byte cursor into the batch vertex buffer, or
+// -1 when the batch is full. On -1 the caller MUST NOT write: the cap is hard
+// and this is the only place it is enforced (G2).
+export fn quad_reserve(p_b, p_n: i32): i32 {
+    let cur: i32 = batch_reserve(p_b, p_n);
+    return cur;
+}
+
+// Publish `n` triangles starting at byte cursor `cur` with one painter depth
+// and one texture. Layers that are not sorted (SKY, HUD) ignore the depth.
+export fn quad_commit(p_b, p_cur: i32, p_n: i32, p_depth: f64, p_tex) {
+    let n: i32 = p_n;
+    let o: i32 = p_cur;
+    for (let k = 0; k < n; k++) {
+        batch_commit(p_b, o, p_tex, p_depth);
+        o = o + TSTRIDE;
+    }
+}
+
+// The batch's vertex arena. Hoist it out of any loop (rule N4).
+export fn quad_vbuf(p_b): ptr {
+    let out: ptr = batch_vbuf(p_b);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Primitive writers — no batch, no allocation, no bounds checking.
+// `p_off` is a byte offset into `p_buf`. The caller owns both.
+// ---------------------------------------------------------------------------
+
+// One SDL_Vertex, 20 bytes (ARCHITECTURE.md §2.3). x/y are written verbatim:
+// snap before you call, once per corner, not once per vertex.
+export fn quad_write_vert(p_buf: ptr, p_off: i32, p_x: f64, p_y: f64,
+                          p_u: f64, p_v: f64,
+                          p_r: i32, p_g: i32, p_bl: i32, p_a: i32) {
+    let o: i32 = p_off;
+    let rgba: u32 = u32(p_r & 255) | (u32(p_g & 255) << 8)
+                    | (u32(p_bl & 255) << 16) | (u32(p_a & 255) << 24);
+    ptr_write_f32(ptr_offset(p_buf, o, 1), p_x);
+    ptr_write_f32(ptr_offset(p_buf, o + 4, 1), p_y);
+    ptr_write_u32(ptr_offset(p_buf, o + 8, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 12, 1), p_u);
+    ptr_write_f32(ptr_offset(p_buf, o + 16, 1), p_v);
+}
+
+// Two triangles, 120 bytes, one flat colour, an axis-aligned pixel rect and an
+// axis-aligned uv rect. Corners are snapped here so callers never have to.
+// This is the hot path for text: font.hml calls it once per glyph.
+export fn quad_write_rect(p_buf: ptr, p_off: i32,
+                          p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64,
+                          p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
+                          p_r: i32, p_g: i32, p_bl: i32, p_a: i32) {
+    let x0: f64 = floor(p_x0 + 0.5);
+    let y0: f64 = floor(p_y0 + 0.5);
+    let x1: f64 = floor(p_x1 + 0.5);
+    let y1: f64 = floor(p_y1 + 0.5);
+    let u0: f64 = p_u0;
+    let v0: f64 = p_v0;
+    let u1: f64 = p_u1;
+    let v1: f64 = p_v1;
+    // The four colour bytes are constant across the quad and contiguous at
+    // +8..+11, so they go out as ONE little-endian u32 (memory order r,g,b,a)
+    // instead of four ptr_write_u8 calls. Measured on this box, 125 quads:
+    // 48 writes/quad 0.122 ms -> 24 writes/quad 0.075 ms.
+    let rgba: u32 = u32(p_r & 255) | (u32(p_g & 255) << 8)
+                    | (u32(p_bl & 255) << 16) | (u32(p_a & 255) << 24);
+    let o: i32 = p_off;
+    ptr_write_f32(ptr_offset(p_buf, o, 1), x0);
+    ptr_write_f32(ptr_offset(p_buf, o + 4, 1), y0);
+    ptr_write_u32(ptr_offset(p_buf, o + 8, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 12, 1), u0);
+    ptr_write_f32(ptr_offset(p_buf, o + 16, 1), v0);
+
+    ptr_write_f32(ptr_offset(p_buf, o + 20, 1), x1);
+    ptr_write_f32(ptr_offset(p_buf, o + 24, 1), y0);
+    ptr_write_u32(ptr_offset(p_buf, o + 28, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 32, 1), u1);
+    ptr_write_f32(ptr_offset(p_buf, o + 36, 1), v0);
+
+    ptr_write_f32(ptr_offset(p_buf, o + 40, 1), x1);
+    ptr_write_f32(ptr_offset(p_buf, o + 44, 1), y1);
+    ptr_write_u32(ptr_offset(p_buf, o + 48, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 52, 1), u1);
+    ptr_write_f32(ptr_offset(p_buf, o + 56, 1), v1);
+
+    ptr_write_f32(ptr_offset(p_buf, o + 60, 1), x0);
+    ptr_write_f32(ptr_offset(p_buf, o + 64, 1), y0);
+    ptr_write_u32(ptr_offset(p_buf, o + 68, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 72, 1), u0);
+    ptr_write_f32(ptr_offset(p_buf, o + 76, 1), v0);
+
+    ptr_write_f32(ptr_offset(p_buf, o + 80, 1), x1);
+    ptr_write_f32(ptr_offset(p_buf, o + 84, 1), y1);
+    ptr_write_u32(ptr_offset(p_buf, o + 88, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 92, 1), u1);
+    ptr_write_f32(ptr_offset(p_buf, o + 96, 1), v1);
+
+    ptr_write_f32(ptr_offset(p_buf, o + 100, 1), x0);
+    ptr_write_f32(ptr_offset(p_buf, o + 104, 1), y1);
+    ptr_write_u32(ptr_offset(p_buf, o + 108, 1), rgba);
+    ptr_write_f32(ptr_offset(p_buf, o + 112, 1), u0);
+    ptr_write_f32(ptr_offset(p_buf, o + 116, 1), v1);
+}
+
+// ---------------------------------------------------------------------------
+// Batched quads. Each returns the number of TRIANGLES emitted: 0 means the
+// batch was full and nothing was written (the cap is never exceeded, G2).
+// ---------------------------------------------------------------------------
+
+// Flat-colour rect at (x, y) sized (w, h) in target pixels, sampling the single
+// texel (u, v). Pass a null texture for pure vertex colour.
+export fn quad_screen(p_b, p_tex, p_x: f64, p_y: f64, p_w: f64, p_h: f64,
+                      p_u: f64, p_v: f64,
+                      p_r: i32, p_g: i32, p_bl: i32, p_a: i32,
+                      p_depth: f64): i32 {
+    let out: i32 = quad_screen_uv(p_b, p_tex, p_x, p_y, p_w, p_h,
+                                  p_u, p_v, p_u, p_v,
+                                  p_r, p_g, p_bl, p_a, p_depth);
+    return out;
+}
+
+// Textured rect: pixel rect (x, y, w, h), uv rect (u0, v0) .. (u1, v1).
+export fn quad_screen_uv(p_b, p_tex, p_x: f64, p_y: f64, p_w: f64, p_h: f64,
+                         p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
+                         p_r: i32, p_g: i32, p_bl: i32, p_a: i32,
+                         p_depth: f64): i32 {
+    let cur: i32 = batch_reserve(p_b, 2);
+    if (cur < 0) { let miss: i32 = 0; return miss; }
+    let buf: ptr = batch_vbuf(p_b);
+    // Byte-for-byte what quad_write_rect writes — that stays the reference
+    // implementation, and probe_font.hml asserts the two agree on every field.
+    // It is repeated here because this is the per-element entry point of the
+    // HUD layer and the 14-argument call plus the per-quad colour pack are
+    // measurable at 125 quads/frame (CLAUDE.md N9). quad_screen and
+    // quad_fullscreen delegate here rather than repeating it a third time.
+    let x0: f64 = floor(p_x + 0.5);
+    let y0: f64 = floor(p_y + 0.5);
+    let x1: f64 = floor(p_x + p_w + 0.5);
+    let y1: f64 = floor(p_y + p_h + 0.5);
+    let u0: f64 = p_u0;
+    let v0: f64 = p_v0;
+    let u1: f64 = p_u1;
+    let v1: f64 = p_v1;
+    let rgba: u32 = u32(p_r & 255) | (u32(p_g & 255) << 8)
+                    | (u32(p_bl & 255) << 16) | (u32(p_a & 255) << 24);
+    ptr_write_f32(ptr_offset(buf, cur, 1), x0);
+    ptr_write_f32(ptr_offset(buf, cur + 4, 1), y0);
+    ptr_write_u32(ptr_offset(buf, cur + 8, 1), rgba);
+    ptr_write_f32(ptr_offset(buf, cur + 12, 1), u0);
+    ptr_write_f32(ptr_offset(buf, cur + 16, 1), v0);
+    ptr_write_f32(ptr_offset(buf, cur + 20, 1), x1);
+    ptr_write_f32(ptr_offset(buf, cur + 24, 1), y0);
+    ptr_write_u32(ptr_offset(buf, cur + 28, 1), rgba);
+    ptr_write_f32(ptr_offset(buf, cur + 32, 1), u1);
+    ptr_write_f32(ptr_offset(buf, cur + 36, 1), v0);
+    ptr_write_f32(ptr_offset(buf, cur + 40, 1), x1);
+    ptr_write_f32(ptr_offset(buf, cur + 44, 1), y1);
+    ptr_write_u32(ptr_offset(buf, cur + 48, 1), rgba);
+    ptr_write_f32(ptr_offset(buf, cur + 52, 1), u1);
+    ptr_write_f32(ptr_offset(buf, cur + 56, 1), v1);
+    ptr_write_f32(ptr_offset(buf, cur + 60, 1), x0);
+    ptr_write_f32(ptr_offset(buf, cur + 64, 1), y0);
+    ptr_write_u32(ptr_offset(buf, cur + 68, 1), rgba);
+    ptr_write_f32(ptr_offset(buf, cur + 72, 1), u0);
+    ptr_write_f32(ptr_offset(buf, cur + 76, 1), v0);
+    ptr_write_f32(ptr_offset(buf, cur + 80, 1), x1);
+    ptr_write_f32(ptr_offset(buf, cur + 84, 1), y1);
+    ptr_write_u32(ptr_offset(buf, cur + 88, 1), rgba);
+    ptr_write_f32(ptr_offset(buf, cur + 92, 1), u1);
+    ptr_write_f32(ptr_offset(buf, cur + 96, 1), v1);
+    ptr_write_f32(ptr_offset(buf, cur + 100, 1), x0);
+    ptr_write_f32(ptr_offset(buf, cur + 104, 1), y1);
+    ptr_write_u32(ptr_offset(buf, cur + 108, 1), rgba);
+    ptr_write_f32(ptr_offset(buf, cur + 112, 1), u0);
+    ptr_write_f32(ptr_offset(buf, cur + 116, 1), v1);
+    batch_commit(p_b, cur, p_tex, p_depth);
+    batch_commit(p_b, cur + 60, p_tex, p_depth);
+    let out: i32 = 2;
+    return out;
+}
+
+// The whole render target, (0,0)..(sw,sh). The composite / flash / fade quad.
+export fn quad_fullscreen(p_b, p_tex, p_sw: f64, p_sh: f64,
+                          p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
+                          p_r: i32, p_g: i32, p_bl: i32, p_a: i32,
+                          p_depth: f64): i32 {
+    let out: i32 = quad_screen_uv(p_b, p_tex, 0.0, 0.0, p_sw, p_sh,
+                                  p_u0, p_v0, p_u1, p_v1,
+                                  p_r, p_g, p_bl, p_a, p_depth);
+    return out;
+}
+
+// An elliptical annulus of `segs` segments — 2 triangles per segment, so the
+// 8-segment call the vignette wants is exactly 16 triangles. Inner ring at
+// radii (rxi, ryi) with alpha `a_in`, outer ring at (rxo, ryo) with alpha
+// `a_out`; rgb is constant, which is what a darkening vignette or a damage
+// flash ring needs. Every vertex samples the single texel (u, v), so the whole
+// ring stays inside one texture run and costs one draw call.
+//
+// Segment i spans [i, i+1] * 2pi/segs starting at +x. The loop closes exactly
+// (segment segs-1 reuses segment 0's angle), so there is no seam.
+export fn quad_ring(p_b, p_tex, p_cx: f64, p_cy: f64,
+                    p_rxi: f64, p_ryi: f64, p_rxo: f64, p_ryo: f64,
+                    p_segs: i32, p_u: f64, p_v: f64,
+                    p_r: i32, p_g: i32, p_bl: i32,
+                    p_a_in: i32, p_a_out: i32, p_depth: f64): i32 {
+    let segs: i32 = p_segs;
+    if (segs < 3) { let bad: i32 = 0; return bad; }
+    let ntri: i32 = segs * 2;
+    let cur: i32 = batch_reserve(p_b, ntri);
+    if (cur < 0) { let miss: i32 = 0; return miss; }
+    let buf: ptr = batch_vbuf(p_b);
+    let cx: f64 = p_cx;
+    let cy: f64 = p_cy;
+    let rxi: f64 = p_rxi;
+    let ryi: f64 = p_ryi;
+    let rxo: f64 = p_rxo;
+    let ryo: f64 = p_ryo;
+    let u: f64 = p_u;
+    let v: f64 = p_v;
+    let r: i32 = p_r;
+    let g: i32 = p_g;
+    let bl: i32 = p_bl;
+    let ai: i32 = p_a_in;
+    let ao: i32 = p_a_out;
+    let step: f64 = 6.283185307179586 / f64(segs);
+    let o: i32 = cur;
+    for (let i = 0; i < segs; i++) {
+        let t0: f64 = f64(i) * step;
+        let t1: f64 = f64(i + 1) * step;
+        let c0: f64 = cos(t0);
+        let s0: f64 = sin(t0);
+        let c1: f64 = cos(t1);
+        let s1: f64 = sin(t1);
+        let ix0: f64 = floor(cx + c0 * rxi + 0.5);
+        let iy0: f64 = floor(cy + s0 * ryi + 0.5);
+        let ix1: f64 = floor(cx + c1 * rxi + 0.5);
+        let iy1: f64 = floor(cy + s1 * ryi + 0.5);
+        let ox0: f64 = floor(cx + c0 * rxo + 0.5);
+        let oy0: f64 = floor(cy + s0 * ryo + 0.5);
+        let ox1: f64 = floor(cx + c1 * rxo + 0.5);
+        let oy1: f64 = floor(cy + s1 * ryo + 0.5);
+        // inner0, inner1, outer1  /  inner0, outer1, outer0
+        quad_write_vert(buf, o, ix0, iy0, u, v, r, g, bl, ai);
+        quad_write_vert(buf, o + 20, ix1, iy1, u, v, r, g, bl, ai);
+        quad_write_vert(buf, o + 40, ox1, oy1, u, v, r, g, bl, ao);
+        quad_write_vert(buf, o + 60, ix0, iy0, u, v, r, g, bl, ai);
+        quad_write_vert(buf, o + 80, ox1, oy1, u, v, r, g, bl, ao);
+        quad_write_vert(buf, o + 100, ox0, oy0, u, v, r, g, bl, ao);
+        o = o + 120;
+    }
+    let co: i32 = cur;
+    for (let k = 0; k < ntri; k++) {
+        batch_commit(p_b, co, p_tex, p_depth);
+        co = co + TSTRIDE;
+    }
+    let out: i32 = ntri;
+    return out;
+}
+
+// Byte size of one quad in a vertex buffer. Exported so callers can size their
+// own scratch arenas without re-deriving 6 * VSTRIDE.
+export let QUAD_BYTES = 120;
+export let QUAD_TRIS = 2;

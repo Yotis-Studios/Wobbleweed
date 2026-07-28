@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // postfx.hml — the PS1 finishing pass for the CPU framebuffer.
 //
 // PS1 video output was 15-bit color (5 bits per channel); the GPU hid the

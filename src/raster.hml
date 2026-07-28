@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // raster.hml — the triangle rasterizer (the retro core).
 //
 // Edge-function barycentric coverage with a z-buffer. Attribute interpolation

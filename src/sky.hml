@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // sky.hml — the retro sky: a vertical gradient plus chunky, pixelated cloud
 // streaks that pan with the camera (yaw → horizontal, pitch → vertical). Drawn
 // as a screen-space background layer before the world, and resets the depth

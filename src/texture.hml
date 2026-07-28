@@ -1,15 +1,353 @@
-// texture.hml — textures for the rasterizer.
+// texture.hml — RGBA8 procedural texture container.  (Nightshade W1-8 / G13)
 //
-// A texture is { width, height, data } where data is a width*height*3 RGB
-// buffer. Sampling is nearest-neighbour (chunky, on purpose). Includes a couple
-// of procedural generators so the engine is self-contained.
+// A texture is { width, height, data } where `data` is a width*height*4 byte
+// buffer in **R, G, B, A memory order** — exactly the layout of
+// SDL_PIXELFORMAT_RGBA32 (376840196) on a little-endian host, so a texture can
+// be handed to SDL_UpdateTexture with pitch = width*4 and no conversion of any
+// kind takes place.  (The *8888 format names are packed-integer names, not byte
+// order: ARGB8888 is B,G,R,A in memory.  RGBA32 is the one whose bytes read the
+// way its name does.)
+//
+// This module is GENERIC.  It is a container and a blitter.  It knows nothing
+// about what is drawn into it: no colours, no materials, no game nouns.  The
+// three procedural generators that used to live here (grass / sky / checker)
+// were texture *content* and content belongs to the application — see the
+// LEGACY section at the bottom for why three of them still exist.
+//
+// Sampling is nearest-neighbour, always, everywhere (SDL_RENDER_SCALE_QUALITY
+// is pinned to "0" in window_open).
+//
+// Byte order note used throughout: offset (y*width + x)*4 holds R, then G, then
+// B, then A.  A 32-bit little-endian read of that offset therefore yields
+// r | g<<8 | b<<16 | a<<24.
 
+// Bytes per pixel.  Load-bearing: pitch is always width * TEX_BPP.
+export let TEX_BPP = 4;
+
+// ---------------------------------------------------------------------------
+// construction
+// ---------------------------------------------------------------------------
+
+// A zero-filled (transparent black) RGBA8 texture.
 export fn tex_new(w: i32, h: i32): object {
+    return { width: w, height: h, data: buffer(w * h * 4) };
+}
+
+// Wrap an existing w*h*4 buffer without copying.  The caller keeps ownership.
+export fn tex_wrap(w: i32, h: i32, data: buffer): object {
+    return { width: w, height: h, data: data };
+}
+
+// Raw base pointer.  HOIST THIS OUT OF LOOPS (N4: buffer_ptr in a loop costs
+// ~25 %).  Valid only while the texture object is alive.
+export fn tex_ptr(t: object): ptr { return buffer_ptr(t.data); }
+
+// Total byte size, and the pitch SDL wants.
+export fn tex_bytes(t: object): i32 { return t.width * t.height * 4; }
+export fn tex_pitch(t: object): i32 { return t.width * 4; }
+
+// Byte offset of texel (x, y).  No bounds check — the caller has one.
+export fn tex_offset(p_t: object, p_x: i32, p_y: i32): i32 {
+    let w: i32 = p_t.width;
+    let out: i32 = (p_y * w + p_x) * 4;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// texel access
+//
+// tex_set / tex_get are called once per texel of every generated texture, so
+// they follow the hot-function skeleton: p_-prefixed parameters copied into
+// typed locals, no allocation, no closure, no call in the body.  Out-of-range
+// coordinates are ignored (set) or return 0 (get) rather than throwing: a
+// generator that walks one texel off the edge should produce a visible seam,
+// not a crash on the boot path.
+// ---------------------------------------------------------------------------
+
+export fn tex_set(p_t: object, p_x: i32, p_y: i32,
+                  p_r: i32, p_g: i32, p_b: i32, p_a: i32) {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_t.width;
+    let h: i32 = p_t.height;
+    if (x < 0) { return; }
+    if (y < 0) { return; }
+    if (x >= w) { return; }
+    if (y >= h) { return; }
+    let d = p_t.data;
+    let o: i32 = (y * w + x) * 4;
+    d[o] = p_r & 255;
+    d[o + 1] = p_g & 255;
+    d[o + 2] = p_b & 255;
+    d[o + 3] = p_a & 255;
+}
+
+// Opaque set — alpha forced to 255.  The common case for opaque surfaces.
+export fn tex_set_rgb(p_t: object, p_x: i32, p_y: i32,
+                      p_r: i32, p_g: i32, p_b: i32) {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_t.width;
+    let h: i32 = p_t.height;
+    if (x < 0) { return; }
+    if (y < 0) { return; }
+    if (x >= w) { return; }
+    if (y >= h) { return; }
+    let d = p_t.data;
+    let o: i32 = (y * w + x) * 4;
+    d[o] = p_r & 255;
+    d[o + 1] = p_g & 255;
+    d[o + 2] = p_b & 255;
+    d[o + 3] = 255;
+}
+
+// The whole texel as one little-endian word: r | g<<8 | b<<16 | a<<24.
+// This is bit-identical to the 32-bit value SDL stores for RGBA32, which is
+// what makes a byte-for-byte round-trip check a single comparison per texel.
+// Returns 0 for out-of-range coordinates.
+export fn tex_get(p_t: object, p_x: i32, p_y: i32): u32 {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_t.width;
+    let h: i32 = p_t.height;
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= w) { return 0; }
+    if (y >= h) { return 0; }
+    let d = p_t.data;
+    let o: i32 = (y * w + x) * 4;
+    // Assembled from bytes rather than read as a u32 so the result is defined
+    // regardless of host endianness and needs no alignment guarantee.
+    let r: u32 = u32(d[o]);
+    let g: u32 = u32(d[o + 1]);
+    let b: u32 = u32(d[o + 2]);
+    let a: u32 = u32(d[o + 3]);
+    let out: u32 = r + g * 256 + b * 65536 + a * 16777216;
+    return out;
+}
+
+// One channel: 0 = R, 1 = G, 2 = B, 3 = A.  0 for out-of-range coordinates.
+export fn tex_ch(p_t: object, p_x: i32, p_y: i32, p_c: i32): i32 {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_t.width;
+    let h: i32 = p_t.height;
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= w) { return 0; }
+    if (y >= h) { return 0; }
+    let d = p_t.data;
+    let o: i32 = (y * w + x) * 4 + (p_c & 3);
+    let out: i32 = d[o];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// bulk operations
+// ---------------------------------------------------------------------------
+
+// Flood the whole texture.
+export fn tex_fill(p_t: object, p_r: i32, p_g: i32, p_b: i32, p_a: i32) {
+    let w: i32 = p_t.width;
+    let h: i32 = p_t.height;
+    let n: i32 = w * h;
+    let r: i32 = p_r & 255;
+    let g: i32 = p_g & 255;
+    let b: i32 = p_b & 255;
+    let a: i32 = p_a & 255;
+    let d = p_t.data;
+    let o: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        d[o] = r;
+        d[o + 1] = g;
+        d[o + 2] = b;
+        d[o + 3] = a;
+        o = o + 4;
+    }
+}
+
+// Flood an axis-aligned rectangle, clipped to the texture.
+export fn tex_fill_rect(p_t: object, p_x: i32, p_y: i32, p_w: i32, p_h: i32,
+                        p_r: i32, p_g: i32, p_b: i32, p_a: i32) {
+    let tw: i32 = p_t.width;
+    let th: i32 = p_t.height;
+    let x0: i32 = p_x;
+    let y0: i32 = p_y;
+    let x1: i32 = p_x + p_w;
+    let y1: i32 = p_y + p_h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > tw) { x1 = tw; }
+    if (y1 > th) { y1 = th; }
+    if (x0 >= x1) { return; }
+    if (y0 >= y1) { return; }
+    let r: i32 = p_r & 255;
+    let g: i32 = p_g & 255;
+    let b: i32 = p_b & 255;
+    let a: i32 = p_a & 255;
+    let d = p_t.data;
+    for (let y = y0; y < y1; y++) {
+        let o: i32 = (y * tw + x0) * 4;
+        for (let x = x0; x < x1; x++) {
+            d[o] = r;
+            d[o + 1] = g;
+            d[o + 2] = b;
+            d[o + 3] = a;
+            o = o + 4;
+        }
+    }
+}
+
+// Copy a w*h rectangle from `src` at (sx, sy) into `dst` at (dx, dy).
+// A straight replace, including alpha — no blending.  The rectangle is clipped
+// against BOTH textures, so partially-off-edge blits are legal and safe.
+// Returns the number of texels actually written.
+export fn tex_blit(p_dst: object, p_dx: i32, p_dy: i32,
+                   p_src: object, p_sx: i32, p_sy: i32,
+                   p_w: i32, p_h: i32): i32 {
+    let dw: i32 = p_dst.width;
+    let dh: i32 = p_dst.height;
+    let sw: i32 = p_src.width;
+    let sh: i32 = p_src.height;
+    let dx: i32 = p_dx;
+    let dy: i32 = p_dy;
+    let sx: i32 = p_sx;
+    let sy: i32 = p_sy;
+    let cw: i32 = p_w;
+    let ch: i32 = p_h;
+
+    // Clip the source origin into range, moving the destination with it.
+    if (sx < 0) { dx = dx - sx; cw = cw + sx; sx = 0; }
+    if (sy < 0) { dy = dy - sy; ch = ch + sy; sy = 0; }
+    // Clip the destination origin into range, moving the source with it.
+    if (dx < 0) { sx = sx - dx; cw = cw + dx; dx = 0; }
+    if (dy < 0) { sy = sy - dy; ch = ch + dy; dy = 0; }
+    // Clip the far edges against both.
+    if (sx + cw > sw) { cw = sw - sx; }
+    if (sy + ch > sh) { ch = sh - sy; }
+    if (dx + cw > dw) { cw = dw - dx; }
+    if (dy + ch > dh) { ch = dh - dy; }
+    if (cw <= 0) { return 0; }
+    if (ch <= 0) { return 0; }
+
+    let sd = p_src.data;
+    let dd = p_dst.data;
+    for (let y = 0; y < ch; y++) {
+        let so: i32 = ((sy + y) * sw + sx) * 4;
+        let doo: i32 = ((dy + y) * dw + dx) * 4;
+        for (let x = 0; x < cw; x++) {
+            dd[doo] = sd[so];
+            dd[doo + 1] = sd[so + 1];
+            dd[doo + 2] = sd[so + 2];
+            dd[doo + 3] = sd[so + 3];
+            so = so + 4;
+            doo = doo + 4;
+        }
+    }
+    let out: i32 = cw * ch;
+    return out;
+}
+
+// Copy a rectangle, skipping source texels whose alpha is 0.  This is what a
+// glyph or sprite blit into an atlas wants.  Returns texels written.
+export fn tex_blit_keyed(p_dst: object, p_dx: i32, p_dy: i32,
+                         p_src: object, p_sx: i32, p_sy: i32,
+                         p_w: i32, p_h: i32): i32 {
+    let dw: i32 = p_dst.width;
+    let dh: i32 = p_dst.height;
+    let sw: i32 = p_src.width;
+    let sh: i32 = p_src.height;
+    let dx: i32 = p_dx;
+    let dy: i32 = p_dy;
+    let sx: i32 = p_sx;
+    let sy: i32 = p_sy;
+    let cw: i32 = p_w;
+    let ch: i32 = p_h;
+
+    if (sx < 0) { dx = dx - sx; cw = cw + sx; sx = 0; }
+    if (sy < 0) { dy = dy - sy; ch = ch + sy; sy = 0; }
+    if (dx < 0) { sx = sx - dx; cw = cw + dx; dx = 0; }
+    if (dy < 0) { sy = sy - dy; ch = ch + dy; dy = 0; }
+    if (sx + cw > sw) { cw = sw - sx; }
+    if (sy + ch > sh) { ch = sh - sy; }
+    if (dx + cw > dw) { cw = dw - dx; }
+    if (dy + ch > dh) { ch = dh - dy; }
+    if (cw <= 0) { return 0; }
+    if (ch <= 0) { return 0; }
+
+    let sd = p_src.data;
+    let dd = p_dst.data;
+    let n: i32 = 0;
+    for (let y = 0; y < ch; y++) {
+        let so: i32 = ((sy + y) * sw + sx) * 4;
+        let doo: i32 = ((dy + y) * dw + dx) * 4;
+        for (let x = 0; x < cw; x++) {
+            if (sd[so + 3] != 0) {
+                dd[doo] = sd[so];
+                dd[doo + 1] = sd[so + 1];
+                dd[doo + 2] = sd[so + 2];
+                dd[doo + 3] = sd[so + 3];
+                n++;
+            }
+            so = so + 4;
+            doo = doo + 4;
+        }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// RGBA8 -> RGB24 into a caller-owned width*height*3 buffer.  png.hml's
+// write_png takes RGB24, so this is the screenshot/dump path.  Alpha is
+// discarded, not composited.
+export fn tex_to_rgb24(p_t: object, p_dst: buffer) {
+    let w: i32 = p_t.width;
+    let h: i32 = p_t.height;
+    let n: i32 = w * h;
+    let s = p_t.data;
+    let d = p_dst;
+    let so: i32 = 0;
+    let doo: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        d[doo] = s[so];
+        d[doo + 1] = s[so + 1];
+        d[doo + 2] = s[so + 2];
+        so = so + 4;
+        doo = doo + 3;
+    }
+}
+
+// ===========================================================================
+// LEGACY — RGB24, NOT ON THE SHIPPING PATH.
+// ===========================================================================
+//
+// Everything below produces the old 3-bytes-per-texel { width, height, data }
+// object and is consumed ONLY by the frozen CPU rasterizer (raster.hml,
+// scene.hml, scene_gpu.hml) and the twelve examples that predate Nightshade,
+// via sdl.hml's legacy `upload_texture` (which uploads FMT_RGB24 at pitch
+// width*3).
+//
+// W1-8 asks for these three generators to be deleted, because the engine must
+// ship no texture content (R1).  They cannot be deleted yet: BUILD_PLAN W1-11
+// and the Wave-1 gate BOTH require `examples/walk_gpu.hml` to keep building and
+// running, and walk_gpu.hml, geom_scene.hml, bench_gpu.hml, bench_cpu.hml,
+// bench_flat.hml, bench_scale.hml, bench_drawcalls.hml, walk.hml,
+// scene_png.hml, ground_png.hml, probe_alpha.hml, repro_batchbuf_bug.hml,
+// repro_batchbuf_fix.hml and repro_backend_divergence.hml all import them by
+// name.  None of those files is owned by W1-8, so they cannot be ported here.
+//
+// DELETE THIS ENTIRE SECTION as soon as one task owns both this file and those
+// examples (the natural home is W1-11, the legacy-quarantine task).  Nothing on
+// the Nightshade shipping path may import any of it.
+//
+// New code uses the RGBA8 surface above and atlas.hml.
+
+fn rgb24_new(w: i32, h: i32): object {
     return { width: w, height: h, data: buffer(w * h * 3) };
 }
 
-// Deterministic per-texel hash -> 0..255. Done in i64 with 32-bit masking so
-// the big-prime multiplies don't overflow.
+// Deterministic per-texel hash -> 0..255.  i64 with 32-bit masking so the
+// big-prime multiplies do not trap on overflow.
 fn hash2(x: i32, y: i32): i32 {
     let mask: i64 = 4294967295;
     let n: i64 = (i64(x) * 374761393 + i64(y) * 668265263) & mask;
@@ -18,9 +356,9 @@ fn hash2(x: i32, y: i32): i32 {
     return i32(n & 255);
 }
 
-// Procedural grass: noisy greens with a few darker blades. Tiles seamlessly-ish.
+// LEGACY. Procedural grass: noisy greens with a few darker blades.
 export fn tex_grass(w: i32, h: i32): object {
-    let t = tex_new(w, h);
+    let t = rgb24_new(w, h);
     let d = t.data;
     for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
@@ -39,11 +377,10 @@ export fn tex_grass(w: i32, h: i32): object {
 
 fn fabs(x: f64): f64 { if (x < 0.0) { return 0.0 - x; } return x; }
 
-// Sky panorama: a vertical gradient plus chunky, pixelated cloud streaks,
-// tileable horizontally so the GPU sky quad can pan seamlessly with camera yaw.
-// V (0..1) runs deep-blue overhead -> pale at the horizon.
+// LEGACY. Sky panorama: vertical gradient plus chunky cloud streaks, tileable
+// horizontally.
 export fn tex_sky(w: i32, h: i32): object {
-    let t = tex_new(w, h);
+    let t = rgb24_new(w, h);
     let d = t.data;
     let CH = 8;                  // cloud block size (chunky)
     let cellsx = w / CH;         // horizontal period -> seamless wrap
@@ -77,9 +414,9 @@ export fn tex_sky(w: i32, h: i32): object {
     return t;
 }
 
-// Checkerboard — handy for *seeing* the affine texture warp clearly.
+// LEGACY. Checkerboard — for seeing the affine texture warp clearly.
 export fn tex_checker(w: i32, h: i32, cells: i32): object {
-    let t = tex_new(w, h);
+    let t = rgb24_new(w, h);
     let d = t.data;
     let cs = w / cells;
     for (let y = 0; y < h; y++) {

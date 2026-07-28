@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // framebuffer.hml — color + depth buffers for the software rasterizer.
 //
 //   color : buffer of width*height*3 bytes, 24-bit RGB, row-major.

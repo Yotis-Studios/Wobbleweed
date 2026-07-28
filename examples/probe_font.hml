@@ -1,0 +1,651 @@
+// probe_font.hml — W1-9 verification: screen quads (quad.hml) + bitmap font
+// (font.hml), against ENGINE_GAPS.md G14 and BUILD_PLAN W1-9.
+//
+//   hemlockc -O1 examples/probe_font.hml -o /tmp/probe_font
+//   SDL_VIDEODRIVER=dummy /tmp/probe_font          # headless
+//   DISPLAY=:0 /tmp/probe_font                     # real display
+//
+// Exits 0 only when every assertion passes AND the number of assertions that
+// ran equals EXPECT_ASSERTS. A probe that exits 0 while printing FAIL is worse
+// than no probe, so both are checked and any mismatch is exit(1).
+//
+// What it proves, in order:
+//   1  the SDL_Vertex byte layout quad.hml writes (§2.3), field by field
+//   2  pixel snapping, winding and uv mapping of every quad primitive
+//   3  quad_ring produces exactly 2 triangles per segment (16 at segs = 8),
+//      closes without a seam, and puts the right alpha on each rim
+//   4  the batch cap is hard: an over-cap quad writes nothing and returns 0
+//   5  glyph registration, both bitfield forms, and codepoint lookup
+//   6  font_bake is texel-exact against the source bitfields
+//   7  font_text geometry, advance, newline and uv rects
+//   8  the triangle budget truncates, reports the count, and never overflows
+//   9  the shadow pass sits at exactly (+dx, +dy) behind the face
+//  10  a real 320x240 render + SDL_RenderReadPixels is pixel-exact per texel,
+//      in ONE draw call, with no filtering
+//  11  250 HUD triangles cost <= 0.3 ms
+//
+// NOTE ON THE GLYPH DATA IN THIS FILE. The four 4x6 glyphs below are TEST
+// FIXTURES belonging to the probe, not engine content. `font.hml` contains no
+// glyph, no alphabet and no codepoint (RULE R1) — grep it.
+
+import { exit } from "@stdlib/process";
+import { floor, divi, sqrt } from "@stdlib/math";
+import { window_open_ex, window_close, create_static_tex, update_tex,
+         set_tex_blend, create_target, set_target, sdl_clear, read_pixels_rect,
+         destroy_tex, FMT_RGBA32, FMT_ARGB8888, BLEND_BLEND } from "../src/sdl.hml";
+import { batch_new, batch_reset, batch_flush, batch_count, batch_vbuf,
+         batch_overflow_count, batch_depth_at, LAYER_HUD } from "../src/batch.hml";
+import { quad_screen, quad_screen_uv, quad_fullscreen, quad_ring,
+         quad_write_rect, quad_write_vert, quad_reserve, quad_commit,
+         quad_vbuf, QUAD_BYTES, QUAD_TRIS } from "../src/quad.hml";
+import { font_new, font_add_glyph, font_add_glyph_packed, font_bake, font_text,
+         font_text_shadowed, font_width, font_height, font_glyph_index,
+         font_glyph_count, font_last_dropped, font_last_emitted,
+         font_last_truncated, font_tri_cost, font_set_glyph_advance,
+         FONT_OK, FONT_TRUNC_BUDGET, FONT_TRUNC_BATCH } from "../src/font.hml";
+import { clock_now, clock_ms_between } from "../src/time.hml";
+import { write_png } from "../src/png.hml";
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_n: i32 = 0;
+
+// Every assertion this probe is contractually required to run.
+let EXPECT_ASSERTS = 99;
+
+fn ck(name: string, cond: i32) {
+    g_n++;
+    if (cond == 1) { g_pass++; } else { g_fail++; eprint(`FAIL ${g_n}: ${name}`); }
+}
+fn ck_i(name: string, got: i32, want: i32) {
+    g_n++;
+    if (got == want) { g_pass++; }
+    else { g_fail++; eprint(`FAIL ${g_n}: ${name} — got ${got} want ${want}`); }
+}
+fn ck_f(name: string, got: f64, want: f64, eps: f64) {
+    g_n++;
+    let d: f64 = got - want;
+    if (d < 0.0) { d = 0.0 - d; }
+    if (d <= eps) { g_pass++; }
+    else { g_fail++; eprint(`FAIL ${g_n}: ${name} — got ${got} want ${want}`); }
+}
+
+// --- vertex buffer readers (the consumer side of the §2.3 contract) ---------
+fn vx(buf: ptr, v: i32): f64 { let o: f64 = ptr_read_f32(ptr_offset(buf, v * 20, 1)); return o; }
+fn vy(buf: ptr, v: i32): f64 { let o: f64 = ptr_read_f32(ptr_offset(buf, v * 20 + 4, 1)); return o; }
+fn vr(buf: ptr, v: i32): i32 { let o: i32 = i32(ptr_read_u8(ptr_offset(buf, v * 20 + 8, 1))); return o; }
+fn vg(buf: ptr, v: i32): i32 { let o: i32 = i32(ptr_read_u8(ptr_offset(buf, v * 20 + 9, 1))); return o; }
+fn vb(buf: ptr, v: i32): i32 { let o: i32 = i32(ptr_read_u8(ptr_offset(buf, v * 20 + 10, 1))); return o; }
+fn va(buf: ptr, v: i32): i32 { let o: i32 = i32(ptr_read_u8(ptr_offset(buf, v * 20 + 11, 1))); return o; }
+fn vu(buf: ptr, v: i32): f64 { let o: f64 = ptr_read_f32(ptr_offset(buf, v * 20 + 12, 1)); return o; }
+fn vv(buf: ptr, v: i32): f64 { let o: f64 = ptr_read_f32(ptr_offset(buf, v * 20 + 16, 1)); return o; }
+
+// ===========================================================================
+// The test font: 4 wide, 6 tall, advance 5, line height 7.
+// Row bitfields, top row first, leftmost pixel in bit 3.
+// ===========================================================================
+
+fn glyph_rows(which: i32): array<i32> {
+    if (which == 0) {                      // 'A'  .##. #..# #### #..# #..# ....
+        return [0b0110, 0b1001, 0b1111, 0b1001, 0b1001, 0b0000];
+    }
+    if (which == 1) {                      // 'B'  ###. #..# ###. #..# ###. ....
+        return [0b1110, 0b1001, 0b1110, 0b1001, 0b1110, 0b0000];
+    }
+    if (which == 2) {                      // 'C'  .### #... #... #... .### ....
+        return [0b0111, 0b1000, 0b1000, 0b1000, 0b0111, 0b0000];
+    }
+    return [0b0000, 0b0000, 0b0000, 0b0000, 0b0100, 0b0000];   // '.'
+}
+
+// The same four glyphs as one packed u64 each (top row most significant).
+fn glyph_packed(which: i32): u64 {
+    let rows = glyph_rows(which);
+    let acc: u64 = 0;
+    for (let r = 0; r < 6; r++) { acc = (acc << 4) | u64(rows[r]); }
+    let out: u64 = acc;
+    return out;
+}
+
+// ===========================================================================
+
+fn main() {
+    let ATLAS_W = 32;
+    let ATLAS_H = 32;
+    let GW = 4;
+    let GH = 6;
+    let ADV = 5;
+    let LINE = 7;
+    // bake colour of the glyph texels (probe fixture, not engine content)
+    let BR = 200; let BG = 180; let BB = 160;
+
+    // -----------------------------------------------------------------------
+    // 1. The SDL_Vertex byte layout, written by quad_write_rect (§2.3)
+    // -----------------------------------------------------------------------
+    let scratch: ptr = alloc(4096);
+    quad_write_rect(scratch, 0, 10.0, 20.0, 30.0, 26.0,
+                    0.25, 0.5, 0.75, 1.0, 11, 22, 33, 44);
+
+    ck_i("QUAD_TRIS", QUAD_TRIS, 2);
+    ck_i("QUAD_BYTES", QUAD_BYTES, 120);
+    ck_f("v0.x", vx(scratch, 0), 10.0, 0.0);
+    ck_f("v0.y", vy(scratch, 0), 20.0, 0.0);
+    ck_f("v1.x", vx(scratch, 1), 30.0, 0.0);
+    ck_f("v1.y", vy(scratch, 1), 20.0, 0.0);
+    ck_f("v2.x", vx(scratch, 2), 30.0, 0.0);
+    ck_f("v2.y", vy(scratch, 2), 26.0, 0.0);
+    ck("tri1 shares corner A", (vx(scratch, 3) == 10.0 && vy(scratch, 3) == 20.0) ? 1 : 0);
+    ck("tri1 shares corner C", (vx(scratch, 4) == 30.0 && vy(scratch, 4) == 26.0) ? 1 : 0);
+    ck("tri1 has corner D", (vx(scratch, 5) == 10.0 && vy(scratch, 5) == 26.0) ? 1 : 0);
+    ck("rgba on every vertex",
+       (vr(scratch, 0) == 11 && vg(scratch, 0) == 22 && vb(scratch, 0) == 33 && va(scratch, 0) == 44
+        && vr(scratch, 5) == 11 && vg(scratch, 5) == 22 && vb(scratch, 5) == 33
+        && va(scratch, 5) == 44) ? 1 : 0);
+    ck_f("v0.u", vu(scratch, 0), 0.25, 0.0);
+    ck_f("v0.v", vv(scratch, 0), 0.5, 0.0);
+    ck_f("v2.u", vu(scratch, 2), 0.75, 0.0);
+    ck_f("v2.v", vv(scratch, 2), 1.0, 0.0);
+
+    // pixel snap: 10.4 -> 10, 10.6 -> 11, -0.4 -> 0, -0.6 -> -1
+    quad_write_rect(scratch, 0, 10.4, 10.6, 0.0 - 0.4, 0.0 - 0.6,
+                    0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0);
+    ck("floor(v+0.5) snap",
+       (vx(scratch, 0) == 10.0 && vy(scratch, 0) == 11.0
+        && vx(scratch, 1) == 0.0 && vy(scratch, 5) == (0.0 - 1.0)) ? 1 : 0);
+
+    // quad_write_vert writes verbatim (no snap) — the low-level primitive
+    quad_write_vert(scratch, 0, 3.25, 4.75, 0.1, 0.2, 1, 2, 3, 4);
+    ck("quad_write_vert is verbatim",
+       (vx(scratch, 0) == 3.25 && vy(scratch, 0) == 4.75) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 2. Batched primitives
+    // -----------------------------------------------------------------------
+    let b = batch_new(1024, 1.0, LAYER_HUD);
+    let buf: ptr = quad_vbuf(b);
+    ck("quad_vbuf is the batch arena", (buf == batch_vbuf(b)) ? 1 : 0);
+
+    batch_reset(b);
+    let t1: i32 = quad_screen(b, null, 4.0, 8.0, 16.0, 6.0, 0.5, 0.5,
+                              9, 8, 7, 255, 0.0);
+    ck_i("quad_screen returns 2", t1, 2);
+    ck_i("quad_screen bumped b.n", batch_count(b), 2);
+    ck("quad_screen extents",
+       (vx(buf, 0) == 4.0 && vy(buf, 0) == 8.0
+        && vx(buf, 2) == 20.0 && vy(buf, 2) == 14.0) ? 1 : 0);
+    ck("quad_screen uses one texel on all 6 verts",
+       (vu(buf, 0) == 0.5 && vv(buf, 0) == 0.5
+        && vu(buf, 3) == 0.5 && vv(buf, 5) == 0.5) ? 1 : 0);
+
+    batch_reset(b);
+    let t2: i32 = quad_screen_uv(b, null, 0.0, 0.0, 8.0, 8.0,
+                                 0.125, 0.25, 0.375, 0.5, 1, 2, 3, 4, 0.0);
+    ck_i("quad_screen_uv returns 2", t2, 2);
+    ck("quad_screen_uv maps the uv rect",
+       (vu(buf, 0) == 0.125 && vv(buf, 0) == 0.25
+        && vu(buf, 2) == 0.375 && vv(buf, 2) == 0.5) ? 1 : 0);
+
+    batch_reset(b);
+    let t3: i32 = quad_fullscreen(b, null, 320.0, 240.0, 0.0, 0.0, 1.0, 1.0,
+                                  255, 255, 255, 128, 0.05);
+    ck_i("quad_fullscreen returns 2", t3, 2);
+    ck("quad_fullscreen covers the target",
+       (vx(buf, 0) == 0.0 && vy(buf, 0) == 0.0
+        && vx(buf, 2) == 320.0 && vy(buf, 2) == 240.0) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 3. The vignette ring
+    // -----------------------------------------------------------------------
+    batch_reset(b);
+    let RIN: f64 = 60.0;
+    let ROUT: f64 = 200.0;
+    let tr: i32 = quad_ring(b, null, 160.0, 120.0, RIN, RIN, ROUT, ROUT,
+                            8, 0.5, 0.5, 12, 13, 14, 0, 200, 0.0);
+    ck_i("quad_ring segs=8 -> 16 triangles", tr, 16);
+    ck_i("quad_ring bumped b.n by 16", batch_count(b), 16);
+
+    // every vertex sits on one of the two rims (snapped, so allow 1 px)
+    let rim_ok: i32 = 1;
+    let alpha_ok: i32 = 1;
+    for (let v = 0; v < 48; v++) {
+        let dx: f64 = vx(buf, v) - 160.0;
+        let dy: f64 = vy(buf, v) - 120.0;
+        let d: f64 = sqrt(dx * dx + dy * dy);
+        let ai: f64 = d - RIN;
+        if (ai < 0.0) { ai = 0.0 - ai; }
+        let ao: f64 = d - ROUT;
+        if (ao < 0.0) { ao = 0.0 - ao; }
+        if (ai > 1.0 && ao > 1.0) { rim_ok = 0; }
+        // inner rim must carry a_in, outer rim a_out
+        if (ai <= 1.0 && va(buf, v) != 0) { alpha_ok = 0; }
+        if (ao <= 1.0 && va(buf, v) != 200) { alpha_ok = 0; }
+    }
+    ck("quad_ring: every vertex on a rim", rim_ok);
+    ck("quad_ring: inner alpha a_in, outer alpha a_out", alpha_ok);
+    // the ring closes: last segment's second inner vertex == first segment's first
+    ck("quad_ring closes without a seam",
+       (vx(buf, 43) == vx(buf, 0) && vy(buf, 43) == vy(buf, 0)) ? 1 : 0);
+    ck("quad_ring rgb constant",
+       (vr(buf, 0) == 12 && vg(buf, 0) == 13 && vb(buf, 0) == 14
+        && vr(buf, 47) == 12 && vb(buf, 47) == 14) ? 1 : 0);
+    batch_reset(b);
+    ck_i("quad_ring rejects segs < 3",
+         quad_ring(b, null, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 2, 0.0, 0.0,
+                   0, 0, 0, 0, 0, 0.0), 0);
+
+    // -----------------------------------------------------------------------
+    // 4. The cap is hard (G2): over-cap writes nothing, corrupts nothing
+    // -----------------------------------------------------------------------
+    let small = batch_new(8, 1.0, LAYER_HUD);
+    batch_reset(small);
+    let placed: i32 = 0;
+    for (let i = 0; i < 40; i++) {
+        placed = placed + quad_screen(small, null, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0,
+                                      255, 255, 255, 255, 0.0);
+    }
+    ck_i("over-cap: exactly cap triangles land", placed, 8);
+    ck_i("over-cap: b.n never exceeds cap", batch_count(small), 8);
+    ck_i("over-cap: drops are counted", batch_overflow_count(small), 72);
+    // a ring bigger than the whole batch is refused whole, not half-written
+    batch_reset(small);
+    ck_i("over-cap ring is refused atomically",
+         quad_ring(small, null, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 8, 0.0, 0.0,
+                   0, 0, 0, 0, 0, 0.0), 0);
+    ck_i("refused ring left b.n at 0", batch_count(small), 0);
+
+    // -----------------------------------------------------------------------
+    // 5. Glyph registration and lookup
+    // -----------------------------------------------------------------------
+    let f = font_new(GW, GH, ADV, LINE, 64);
+    font_add_glyph(f, 65, glyph_rows(0));            // 'A'
+    font_add_glyph(f, 66, glyph_rows(1));            // 'B'
+    font_add_glyph_packed(f, 67, glyph_packed(2));   // 'C', packed form
+    font_add_glyph(f, 46, glyph_rows(3));            // '.'
+    ck_i("4 glyphs registered", font_glyph_count(f), 4);
+    ck_i("lookup 'A'", font_glyph_index(f, 65), 0);
+    ck_i("lookup 'C' (packed)", font_glyph_index(f, 67), 2);
+    ck_i("lookup of an unregistered codepoint", font_glyph_index(f, 90), 0 - 1);
+    ck_i("lookup above the LUT falls back to scan", font_glyph_index(f, 9000), 0 - 1);
+    // the packed form must decode to exactly the row form
+    let packed_ok: i32 = 1;
+    for (let r = 0; r < GH; r++) {
+        if (f.rows[2 * GH + r] != glyph_rows(2)[r]) { packed_ok = 0; }
+    }
+    ck("font_add_glyph_packed == font_add_glyph", packed_ok);
+
+    // -----------------------------------------------------------------------
+    // 6. font_bake is texel-exact
+    // -----------------------------------------------------------------------
+    let apix: buffer = buffer(ATLAS_W * ATLAS_H * 4);
+    let ap: ptr = buffer_ptr(apix);
+    for (let i = 0; i < ATLAS_W * ATLAS_H * 4; i++) { apix[i] = 0; }
+    let grows: i32 = font_bake(f, ap, ATLAS_W, ATLAS_H, 0, 0, 8, BR, BG, BB, 255);
+    ck_i("font_bake used 1 grid row", grows, 1);
+
+    let bake_ok: i32 = 1;
+    for (let gi = 0; gi < 4; gi++) {
+        let rows = glyph_rows(gi);
+        for (let ry = 0; ry < GH; ry++) {
+            for (let rx = 0; rx < GW; rx++) {
+                let want: i32 = (rows[ry] >> (GW - 1 - rx)) & 1;
+                let o: i32 = ((ry * ATLAS_W) + (gi * GW + rx)) * 4;
+                let ga: i32 = i32(apix[o + 3]);
+                if (want == 1) {
+                    if (ga != 255) { bake_ok = 0; }
+                    if (i32(apix[o]) != BR) { bake_ok = 0; }
+                    if (i32(apix[o + 1]) != BG) { bake_ok = 0; }
+                    if (i32(apix[o + 2]) != BB) { bake_ok = 0; }
+                } else {
+                    if (ga != 0) { bake_ok = 0; }
+                }
+            }
+        }
+    }
+    ck("font_bake: every texel matches its bitfield", bake_ok);
+    // nothing outside the baked grid was touched
+    let clean: i32 = 1;
+    for (let y = GH; y < ATLAS_H; y++) {
+        for (let x = 0; x < ATLAS_W; x++) {
+            let o: i32 = ((y * ATLAS_W) + x) * 4;
+            if (i32(apix[o]) != 0 || i32(apix[o + 3]) != 0) { clean = 0; }
+        }
+    }
+    ck("font_bake: writes only its own cells", clean);
+    ck("font_bake rejects an atlas that is too small",
+       (font_bake(f, ap, 8, 8, 0, 0, 8, 255, 255, 255, 255) == (0 - 1)) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 7. Measurement and text geometry
+    // -----------------------------------------------------------------------
+    ck_i("font_width('ABC.')", font_width(f, "ABC."), 20);
+    ck_i("font_width of an unmapped char still advances", font_width(f, "AZ"), 10);
+    ck_i("font_width takes the widest line", font_width(f, "A\nABC."), 20);
+    ck_i("font_height counts lines", font_height(f, "A\nB\nC"), 21);
+    ck_i("font_tri_cost", font_tri_cost(f, "ABC."), 8);
+    ck_i("font_tri_cost ignores unmapped chars", font_tri_cost(f, "AZB"), 4);
+
+    batch_reset(b);
+    let tt: i32 = font_text(f, b, null, 10.0, 20.0, "ABC.", 255, 254, 253, 252, 100);
+    ck_i("font_text: 2 triangles per glyph", tt, 8);
+    ck_i("font_text: nothing dropped", font_last_dropped(), 0);
+    ck_i("font_text: not truncated", font_last_truncated(), FONT_OK);
+    ck_i("font_last_emitted", font_last_emitted(), 8);
+    ck("first glyph at the origin",
+       (vx(buf, 0) == 10.0 && vy(buf, 0) == 20.0
+        && vx(buf, 2) == 14.0 && vy(buf, 2) == 26.0) ? 1 : 0);
+    ck("fourth glyph advanced 3 * adv",
+       (vx(buf, 18) == 25.0 && vy(buf, 18) == 20.0) ? 1 : 0);
+    ck("glyph uv rect is exact texel boundaries (no inset)",
+       (vu(buf, 0) == 0.0 && vv(buf, 0) == 0.0
+        && vu(buf, 2) == (4.0 / 32.0) && vv(buf, 2) == (6.0 / 32.0)) ? 1 : 0);
+    ck("third glyph samples its own cell",
+       (vu(buf, 12) == (8.0 / 32.0) && vu(buf, 14) == (12.0 / 32.0)) ? 1 : 0);
+    ck("text carries the caller's tint",
+       (vr(buf, 0) == 255 && vg(buf, 0) == 254 && vb(buf, 0) == 253
+        && va(buf, 0) == 252) ? 1 : 0);
+
+    batch_reset(b);
+    font_text(f, b, null, 10.0, 20.0, "A\nB", 255, 255, 255, 255, 100);
+    ck("newline returns to x0 and drops one line height",
+       (vx(buf, 6) == 10.0 && vy(buf, 6) == 27.0) ? 1 : 0);
+
+    // per-glyph advance override
+    font_set_glyph_advance(f, 46, 3);
+    ck_i("font_set_glyph_advance", font_width(f, ".A"), 8);
+    font_set_glyph_advance(f, 46, ADV);
+
+    // --- one encoder, three writers -------------------------------------
+    // quad_write_rect is the reference implementation of the §2.3 byte layout.
+    // quad_screen_uv and font_text hand-inline it for speed; if either ever
+    // drifts, these two assertions catch it before a pixel moves.
+    batch_reset(b);
+    quad_screen_uv(b, null, 10.0, 20.0, 4.0, 6.0, 0.1, 0.2, 0.3, 0.4,
+                   11, 22, 33, 44, 0.0);
+    quad_write_rect(scratch, 0, 10.0, 20.0, 14.0, 26.0, 0.1, 0.2, 0.3, 0.4,
+                    11, 22, 33, 44);
+    let same_q: i32 = 1;
+    for (let i = 0; i < 120; i++) {
+        if (ptr_read_u8(ptr_offset(buf, i, 1)) != ptr_read_u8(ptr_offset(scratch, i, 1))) {
+            same_q = 0;
+        }
+    }
+    ck("quad_screen_uv == quad_write_rect, byte for byte", same_q);
+
+    batch_reset(b);
+    font_text(f, b, null, 10.0, 20.0, "A", 7, 8, 9, 10, 100);
+    quad_write_rect(scratch, 0, 10.0, 20.0, 14.0, 26.0,
+                    0.0, 0.0, 4.0 / 32.0, 6.0 / 32.0, 7, 8, 9, 10);
+    let same_f: i32 = 1;
+    for (let i = 0; i < 120; i++) {
+        if (ptr_read_u8(ptr_offset(buf, i, 1)) != ptr_read_u8(ptr_offset(scratch, i, 1))) {
+            same_f = 0;
+        }
+    }
+    ck("font_text glyph == quad_write_rect, byte for byte", same_f);
+
+    // font_text snaps a fractional origin, then stays on the pixel grid
+    batch_reset(b);
+    font_text(f, b, null, 10.4, 20.6, "AB", 255, 255, 255, 255, 100);
+    ck("font_text snaps a fractional origin",
+       (vx(buf, 0) == 10.0 && vy(buf, 0) == 21.0
+        && vx(buf, 6) == 15.0 && vy(buf, 6) == 21.0) ? 1 : 0);
+
+    // the reserve / commit / vbuf helpers other producers build on
+    batch_reset(b);
+    let mc: i32 = quad_reserve(b, 2);
+    ck_i("quad_reserve returns a byte cursor", mc, 0);
+    quad_write_rect(quad_vbuf(b), mc, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0,
+                    1, 2, 3, 4);
+    quad_commit(b, mc, 2, 0.5, null);
+    ck_i("quad_commit published both triangles", batch_count(b), 2);
+    ck_f("quad_commit wrote the depth on every triangle", batch_depth_at(b, 1), 0.5, 0.0);
+
+    // -----------------------------------------------------------------------
+    // 8. The triangle budget truncates and reports (G14)
+    // -----------------------------------------------------------------------
+    batch_reset(b);
+    let long_s: string = "ABC.ABC.ABC.ABC.ABC.";   // 20 glyphs, 40 triangles
+    let cut: i32 = font_text(f, b, null, 0.0, 0.0, long_s, 255, 255, 255, 255, 11);
+    ck_i("budget 11 emits 10 triangles", cut, 10);
+    ck_i("budget: the rest is reported dropped", font_last_dropped(), 15);
+    ck_i("budget: truncation reason", font_last_truncated(), FONT_TRUNC_BUDGET);
+    ck_i("budget: the batch holds exactly what was emitted", batch_count(b), 10);
+
+    // budget 0 draws nothing at all
+    batch_reset(b);
+    ck_i("budget 0 emits nothing",
+         font_text(f, b, null, 0.0, 0.0, long_s, 255, 255, 255, 255, 0), 0);
+    ck_i("budget 0 drops the whole string", font_last_dropped(), 20);
+
+    // a batch that fills mid-string stops cleanly and says so
+    let tiny = batch_new(6, 1.0, LAYER_HUD);
+    batch_reset(tiny);
+    let tcut: i32 = font_text(f, tiny, null, 0.0, 0.0, long_s,
+                              255, 255, 255, 255, 1000);
+    ck_i("batch-full truncation emits cap triangles", tcut, 6);
+    ck_i("batch-full truncation reason", font_last_truncated(), FONT_TRUNC_BATCH);
+    ck_i("batch-full: never exceeded the cap", batch_count(tiny), 6);
+    ck_i("batch-full: dropped count", font_last_dropped(), 17);
+
+    // -----------------------------------------------------------------------
+    // 9. The shadow pass
+    // -----------------------------------------------------------------------
+    batch_reset(b);
+    let sh: i32 = font_text_shadowed(f, b, null, 30.0, 40.0, "AB",
+                                     250, 240, 230, 255, 5, 6, 7, 200,
+                                     1.0, 1.0, 100);
+    ck_i("shadowed text costs 4 triangles per glyph", sh, 8);
+    ck("shadow is emitted first, at (+1,+1)",
+       (vx(buf, 0) == 31.0 && vy(buf, 0) == 41.0
+        && vr(buf, 0) == 5 && vg(buf, 0) == 6 && vb(buf, 0) == 7
+        && va(buf, 0) == 200) ? 1 : 0);
+    ck("face is emitted second, at the origin",
+       (vx(buf, 12) == 30.0 && vy(buf, 12) == 40.0
+        && vr(buf, 12) == 250 && va(buf, 12) == 255) ? 1 : 0);
+    batch_reset(b);
+    ck_i("shadowed text honours the shared budget",
+         font_text_shadowed(f, b, null, 0.0, 0.0, long_s,
+                            255, 255, 255, 255, 0, 0, 0, 255,
+                            1.0, 1.0, 12), 12);
+
+    // -----------------------------------------------------------------------
+    // 10. Render it for real: 320x240, one draw call, pixel-exact readback
+    // -----------------------------------------------------------------------
+    let w = window_open_ex("probe_font", 320, 240, 1, 0);
+    if (w == null) {
+        eprint("probe_font: no SDL window/renderer — cannot run the render tests");
+        report();
+        exit(1);
+    }
+    let atlas_tex = create_static_tex(w, FMT_RGBA32, ATLAS_W, ATLAS_H);
+    ck("atlas texture created", (atlas_tex != ptr_null()) ? 1 : 0);
+    update_tex(atlas_tex, ap, ATLAS_W * 4);
+    set_tex_blend(atlas_tex, BLEND_BLEND);
+
+    let target = create_target(w, 320, 240);
+    ck("render target created", (target != ptr_null()) ? 1 : 0);
+    set_target(w, target);
+    sdl_clear(w, 0, 0, 0, 255);
+
+    batch_reset(b);
+    let TX: f64 = 12.0;
+    let TY: f64 = 30.0;
+    let shown: i32 = font_text(f, b, atlas_tex, TX, TY, "ABC.", 255, 255, 255, 255, 100);
+    let calls: i32 = batch_flush(w, b);
+    ck_i("one texture run -> one draw call", calls, 1);
+    ck_i("8 triangles submitted", shown, 8);
+
+    let px: buffer = buffer(320 * 240 * 4);
+    let pp: ptr = buffer_ptr(px);
+    let rr: i32 = read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+    ck_i("SDL_RenderReadPixels succeeded", rr, 0);
+
+    // ARGB8888 memory byte order is B,G,R,A (ARCHITECTURE.md D8 / CLAUDE.md §5).
+    let exact: i32 = 1;
+    let lit: i32 = 0;
+    for (let gi = 0; gi < 4; gi++) {
+        let rows = glyph_rows(gi);
+        for (let ry = 0; ry < GH; ry++) {
+            for (let rx = 0; rx < GW; rx++) {
+                let want: i32 = (rows[ry] >> (GW - 1 - rx)) & 1;
+                let sx: i32 = i32(TX) + gi * ADV + rx;
+                let sy: i32 = i32(TY) + ry;
+                let o: i32 = ((sy * 320) + sx) * 4;
+                let pb: i32 = i32(px[o]);
+                let pg: i32 = i32(px[o + 1]);
+                let pr: i32 = i32(px[o + 2]);
+                if (want == 1) {
+                    lit++;
+                    if (pr != BR || pg != BG || pb != BB) { exact = 0; }
+                } else {
+                    if (pr != 0 || pg != 0 || pb != 0) { exact = 0; }
+                }
+            }
+        }
+    }
+    ck("320x240 readback is texel-exact, no filtering", exact);
+    ck("the glyphs actually lit pixels", (lit == 35) ? 1 : 0);
+    // one pixel outside the text must still be background
+    let obg: i32 = ((29 * 320) + 12) * 4;
+    ck("nothing bled above the text row",
+       (i32(px[obg]) == 0 && i32(px[obg + 1]) == 0 && i32(px[obg + 2]) == 0) ? 1 : 0);
+
+    // the ring composites too: 16 triangles, still one draw call with the text
+    batch_reset(b);
+    font_text(f, b, atlas_tex, TX, TY, "ABC.", 255, 255, 255, 255, 100);
+    quad_ring(b, atlas_tex, 160.0, 120.0, 70.0, 55.0, 210.0, 170.0,
+              8, 0.5 / f64(ATLAS_W), 0.5 / f64(ATLAS_H), 40, 20, 60, 0, 180, 0.0);
+    let calls2: i32 = batch_flush(w, b);
+    ck_i("text + ring share one texture run", calls2, 1);
+
+    // PNG for the visual critic (evidence, not the assertion)
+    let rgb: buffer = buffer(320 * 240 * 3);
+    for (let i = 0; i < 320 * 240; i++) {
+        rgb[i * 3] = px[i * 4 + 2];
+        rgb[i * 3 + 1] = px[i * 4 + 1];
+        rgb[i * 3 + 2] = px[i * 4];
+    }
+    write_png("/tmp/probe_font.png", rgb, 320, 240);
+
+    // A checksum of the exact readback, so a future change that moves a single
+    // pixel is caught even without the golden file. FNV-1a over the 320x240
+    // ARGB readback of the text-only frame above.
+    let h: u64 = 14695981039346656037;
+    for (let i = 0; i < 320 * 240 * 4; i++) {
+        h = (h ^ u64(px[i])) * 1099511628211;
+    }
+    print(`readback fnv1a = ${h}`);
+
+    // -----------------------------------------------------------------------
+    // 11. Budget: 250 HUD triangles in <= 0.3 ms
+    //
+    // Measured against the HUD batch cap ARCHITECTURE.md §2.4 specifies (768).
+    // The cap matters because batch_commit is O(cap) on this build — see the
+    // diagnostic sweep printed below, which is NOT a quad/font cost.
+    // -----------------------------------------------------------------------
+    set_target(w, null);
+    let REPS = 500;
+    let HUD_CAP = 768;
+    let big = batch_new(HUD_CAP, 1.0, LAYER_HUD);
+
+    // Each budget number is the MINIMUM of 3 timed trials. A budget gate must
+    // measure the machine's capability, not its current noise; the minimum is
+    // the only statistic that is stable under an unrelated load.
+    let TRIALS = 5;
+
+    // 125 textured quads = 250 triangles, the ART_BIBLE HUD budget
+    let ms_quad: f64 = 1000.0;
+    for (let trial = 0; trial < TRIALS; trial++) {
+        let t_a: u64 = clock_now();
+        for (let rep = 0; rep < REPS; rep++) {
+            batch_reset(big);
+            for (let i = 0; i < 125; i++) {
+                quad_screen_uv(big, atlas_tex, f64(i - divi(i, 20) * 20) * 16.0,
+                               f64(divi(i, 20)) * 12.0, 16.0, 12.0,
+                               0.0, 0.0, 0.125, 0.1875, 255, 255, 255, 255, 0.0);
+            }
+        }
+        let t_b: u64 = clock_now();
+        let m: f64 = clock_ms_between(t_a, t_b) / f64(REPS);
+        if (m < ms_quad) { ms_quad = m; }
+    }
+
+    // the same 250 triangles as text, which is the realistic HUD shape:
+    // 42 + 42 + 41 glyphs across three lines
+    let hud_line: string = "ABC.ABC.ABC.ABC.ABC.ABC.ABC.ABC.ABC.ABC.AB";
+    let ms_text: f64 = 1000.0;
+    for (let trial = 0; trial < TRIALS; trial++) {
+        let t_c: u64 = clock_now();
+        for (let rep = 0; rep < REPS; rep++) {
+            batch_reset(big);
+            font_text(f, big, atlas_tex, 2.0, 0.0, hud_line, 255, 255, 255, 255, 84);
+            font_text(f, big, atlas_tex, 2.0, 8.0, hud_line, 255, 255, 255, 255, 84);
+            font_text(f, big, atlas_tex, 2.0, 16.0, hud_line, 255, 255, 255, 255, 82);
+        }
+        let t_d: u64 = clock_now();
+        let m2: f64 = clock_ms_between(t_c, t_d) / f64(REPS);
+        if (m2 < ms_text) { ms_text = m2; }
+    }
+    ck_i("the timed text really is 250 triangles", batch_count(big), 250);
+
+    // emit + flush together, into the target, exactly as the frame does it
+    set_target(w, target);
+    let ms_full: f64 = 1000.0;
+    for (let trial = 0; trial < TRIALS; trial++) {
+        let t_e: u64 = clock_now();
+        for (let rep = 0; rep < REPS; rep++) {
+            batch_reset(big);
+            font_text(f, big, atlas_tex, 2.0, 0.0, hud_line, 255, 255, 255, 255, 84);
+            font_text(f, big, atlas_tex, 2.0, 8.0, hud_line, 255, 255, 255, 255, 84);
+            font_text(f, big, atlas_tex, 2.0, 16.0, hud_line, 255, 255, 255, 255, 82);
+            batch_flush(w, big);
+        }
+        let t_f: u64 = clock_now();
+        let m3: f64 = clock_ms_between(t_e, t_f) / f64(REPS);
+        if (m3 < ms_full) { ms_full = m3; }
+    }
+    set_target(w, null);
+
+    print(`250 HUD tris @ cap ${HUD_CAP}: quads ${ms_quad} ms | text ${ms_text} ms | text+flush ${ms_full} ms`);
+    ck("250 HUD triangles (quads) <= 0.3 ms", (ms_quad <= 0.3) ? 1 : 0);
+    ck("250 HUD triangles (text) <= 0.3 ms", (ms_text <= 0.3) ? 1 : 0);
+    ck("250 HUD triangles emit+flush <= 0.3 ms", (ms_full <= 0.3) ? 1 : 0);
+
+    // Diagnostic, NOT an assertion: the same 250 quads against larger batch
+    // caps. quad.hml writes the same bytes every time, so any growth here is
+    // batch_commit's O(cap) array revalidation (see the task report).
+    let caps: array<i32> = [256, 768, 2048, 3500];
+    for (let ci = 0; ci < 4; ci++) {
+        let cap: i32 = caps[ci];
+        let bx = batch_new(cap, 1.0, LAYER_HUD);
+        let s0: u64 = clock_now();
+        for (let rep = 0; rep < REPS; rep++) {
+            batch_reset(bx);
+            for (let i = 0; i < 125; i++) {
+                quad_screen_uv(bx, atlas_tex, 0.0, 0.0, 16.0, 12.0,
+                               0.0, 0.0, 0.125, 0.1875, 255, 255, 255, 255, 0.0);
+            }
+        }
+        let s1: u64 = clock_now();
+        print(`  diag: 250 tris at batch cap ${cap} = ${clock_ms_between(s0,s1)/f64(REPS)} ms`);
+    }
+
+    destroy_tex(atlas_tex);
+    destroy_tex(target);
+    free(scratch);
+    window_close(w);
+
+    report();
+    if (g_fail == 0 && g_n == EXPECT_ASSERTS) { exit(0); }
+    exit(1);
+}
+
+fn report() {
+    print(`PASS ${g_pass}/${g_n}`);
+    if (g_fail != 0) { eprint(`probe_font: ${g_fail} FAILED`); }
+    if (g_n != EXPECT_ASSERTS) {
+        eprint(`probe_font: ran ${g_n} assertions, expected ${EXPECT_ASSERTS}`);
+    }
+}
+
+main();

@@ -1,0 +1,601 @@
+// audio.hml — SDL2_mixer device + a PCM registry that OWNS EVERY BUFFER FOR THE
+// PROCESS LIFETIME, plus panned/volumed playback and voice accounting.
+//
+// This module is GENERIC. It knows about a sample rate, a sample format, a
+// number of output channels, a number of voices, opaque PCM byte buffers, gain
+// in 0..1 and pan in -1..+1. It knows nothing about any particular game: no
+// sound names, no categories, no mixing policy, no content. Every value is a
+// parameter supplied by the caller.
+//
+// ---------------------------------------------------------------------------
+// THE ONE RULE THAT IS LOAD-BEARING
+// ---------------------------------------------------------------------------
+// `Mix_QuickLoad_RAW` DOES NOT COPY. The `Mix_Chunk` it returns points straight
+// at the bytes you handed it, and SDL_mixer's audio thread reads those bytes on
+// every callback for as long as the chunk can be played. If that memory dies,
+// the mixer reads freed memory from another thread and the program dies later,
+// somewhere else, for no visible reason.
+//
+// Therefore: `audio_register_pcm` pushes the caller's `buffer` into `g_a_src`,
+// a top-level array, and NEVER removes it. A top-level array holds a live
+// reference, so the buffer's refcount can never reach zero and the bytes stay
+// at a fixed address for the whole process. The caller may drop its own handle
+// the instant `audio_register_pcm` returns; `probe_audio2.hml` asserts exactly
+// that by registering from inside a function whose local goes out of scope, then
+// churning allocations, then playing and reading the bytes back.
+//
+// Nothing in this file ever frees a PCM buffer. There is deliberately no
+// `audio_unregister`. If you add one, you have added a use-after-free.
+//
+// ---------------------------------------------------------------------------
+// PANNING REQUIRES A MULTI-CHANNEL DEVICE — MEASURED, NOT ASSUMED
+// ---------------------------------------------------------------------------
+// `Mix_SetPanning` is a DOCUMENTED NO-OP on a mono device: SDL_mixer 2.0.4
+// checks `channels != 2 && channels != 4 && channels != 6` and returns 1
+// (success) without registering an effect. So `Mix_OpenAudio(freq, fmt, 1, n)`
+// gives you a working mixer with panning silently disabled — it reports success
+// at every step and the sound is centred forever.
+//
+// `audio_can_pan()` reports the truth. Open with 2 output channels if you want
+// stereo placement.
+//
+// A device opened with 2 output channels expects INTERLEAVED STEREO samples,
+// and `Mix_QuickLoad_RAW` performs no conversion whatsoever. Handing it a mono
+// buffer plays at double speed. `audio_register_pcm_mono` exists for that case:
+// it expands mono source PCM into a registry-owned device-format buffer once,
+// at registration time, and owns both the source and the expansion forever.
+//
+// ---------------------------------------------------------------------------
+// GRACEFUL FAILURE
+// ---------------------------------------------------------------------------
+// `audio_init` returns 1 on success and 0 on failure, and NEVER throws, aborts
+// or prints. A box with no sound card, a headless CI runner, a bad
+// `SDL_AUDIODRIVER` — all of them return 0, leave `audio_error()` set, and
+// leave every other entry point safe to call. `audio_register_pcm` still works
+// with no device (the chunk is built later, if a device ever opens), and
+// `audio_play` returns -1 and increments the drop counter. Game code never
+// needs an `if (audio)` branch.
+//
+// ---------------------------------------------------------------------------
+// H-7: TEST AN FFI POINTER WITH `p == ptr_null()`, NEVER `p == null`.
+// `p == null` is TRUE interpreted and FALSE compiled. Every guard in this file
+// uses `ptr_null()`.
+// ---------------------------------------------------------------------------
+
+import { mix_open, mix_query_spec, mix_alloc_channels, mix_quickload_raw,
+         mix_play_timed, mix_set_panning, mix_set_volume, mix_set_chunk_volume,
+         mix_playing, mix_halt, mix_free_chunk, mix_close, mix_version_string,
+         sdl_error, sdl_clear_error,
+         AUDIO_S16LSB, AUDIO_F32LSB, MIX_MAX_VOLUME } from "./sdl.hml";
+
+// ===========================================================================
+// CONSTANTS
+// ===========================================================================
+
+// SDL audio sample formats, re-exported so a caller needs only this module.
+export let AUDIO_FMT_S16 = AUDIO_S16LSB;       // 0x8010, signed 16-bit LE
+export let AUDIO_FMT_F32 = AUDIO_F32LSB;       // 0x8120, float32 LE
+
+// SDL_mixer's per-channel volume ceiling. Gains in this module are 0..1 and are
+// scaled to this internally; the constant is exported for diagnostics only.
+export let AUDIO_MAX_VOLUME = MIX_MAX_VOLUME;  // 128
+
+// Suggested device parameters. These are ENGINE DEFAULTS, not policy — pass
+// whatever you want to audio_init. 22050/S16/512 is the PS1-era-appropriate
+// setting that ENGINE_GAPS G18 measured on this box.
+export let AUDIO_DEFAULT_FREQ    = 22050;
+export let AUDIO_DEFAULT_CHUNK   = 512;
+export let AUDIO_DEFAULT_VOICES  = 16;
+
+// loops argument for audio_play_looped: -1 repeats until stopped.
+export let AUDIO_LOOP_FOREVER = -1;
+
+// ===========================================================================
+// STATE
+// ===========================================================================
+
+let g_a_ready    = 0;      // 1 when a device is open and voices are allocated
+let g_a_freq     = 0;      // OBTAINED device rate, not the requested one
+let g_a_format   = 0;      // OBTAINED device sample format
+let g_a_outch    = 0;      // OBTAINED device output channel count
+let g_a_bps      = 0;      // bytes per sample frame per channel, from the format
+let g_a_voices   = 0;      // mixer channels actually allocated
+let g_a_master   = 1.0;    // master gain 0..1, applied at play time
+let g_a_err      = "";     // last failure reason; "" when healthy
+
+// ---- the registry. Parallel arrays, index = sound id. NEVER shrinks. -------
+let g_a_src      = [];     // caller's PCM buffer — RETAINED FOREVER
+let g_a_srcbytes = [];     // byte length of the source
+let g_a_srcch    = [];     // source channel count, 0 = "already device format"
+let g_a_dev      = [];     // device-format buffer — RETAINED FOREVER
+//                            (the same object as g_a_src when no conversion ran)
+let g_a_devbytes = [];     // byte length of the device-format buffer
+let g_a_chunk    = [];     // Mix_Chunk ptr, or ptr_null() while no device
+
+// ---- per-voice bookkeeping, rebuilt at every init --------------------------
+let g_a_vsnd     = [];     // sound id last started on this voice, -1 = none
+let g_a_vseq     = [];     // monotonic start order, for oldest-first stealing
+
+// ---- counters --------------------------------------------------------------
+let g_a_seq      = 0;
+let g_a_plays    = 0;
+let g_a_drops    = 0;
+let g_a_steals   = 0;
+
+// Scratch for Mix_QuerySpec. Allocated once, at module load, never per frame.
+let g_a_spec = buffer(16);
+
+// ===========================================================================
+// INTERNALS
+// ===========================================================================
+
+// Bytes per single sample from an SDL audio format word: the low byte is the
+// bit depth (S16LSB 0x8010 -> 16 -> 2, F32LSB 0x8120 -> 32 -> 4).
+fn a_fmt_bytes(p_fmt: i32): i32 {
+    let bits: i32 = p_fmt & 255;
+    let out: i32 = bits / 8;
+    if (out < 1) { out = 1; }
+    let r: i32 = out;
+    return r;
+}
+
+// Build the Mix_Chunk for one registered sound. Assumes a device is open.
+// Returns 1 on success, 0 on failure (chunk left as ptr_null()).
+fn a_build_chunk(p_id: i32): i32 {
+    let id: i32 = p_id;
+    let dev = g_a_dev[id];
+    let n: i32 = g_a_devbytes[id];
+    if (n <= 0) { g_a_chunk[id] = ptr_null(); let z: i32 = 0; return z; }
+    let c = mix_quickload_raw(buffer_ptr(dev), n);
+    g_a_chunk[id] = c;
+    if (c == ptr_null()) { let z2: i32 = 0; return z2; }
+    let ok: i32 = 1;
+    return ok;
+}
+
+// Expand p_src (p_ch channels) into a NEW registry-owned buffer with
+// g_a_outch channels, replicating each source frame across the output channels.
+// Returns the new buffer. Only called when p_ch == 1 and g_a_outch > 1.
+fn a_expand_mono(p_src, p_bytes: i32) {
+    let bps: i32 = g_a_bps;
+    let outch: i32 = g_a_outch;
+    let frames: i32 = p_bytes / bps;
+    let dst = buffer(frames * bps * outch);
+    let s = buffer_ptr(p_src);
+    let d = buffer_ptr(dst);
+    let i: i32 = 0;
+    while (i < frames) {
+        let so: i32 = i * bps;
+        let c: i32 = 0;
+        while (c < outch) {
+            let dof: i32 = (i * outch + c) * bps;
+            let b: i32 = 0;
+            while (b < bps) {
+                ptr_write_u8(ptr_offset(d, dof + b, 1),
+                             ptr_deref_u8(ptr_offset(s, so + b, 1)));
+                b++;
+            }
+            c++;
+        }
+        i++;
+    }
+    return dst;
+}
+
+// (Re)build every registered sound's device-format buffer and chunk for the
+// device that is currently open. Called from audio_init.
+fn a_rebuild_all() {
+    let n: i32 = g_a_src.length;
+    let i: i32 = 0;
+    while (i < n) {
+        let ch: i32 = g_a_srcch[i];
+        if (ch == 1 && g_a_outch > 1) {
+            let ex = a_expand_mono(g_a_src[i], g_a_srcbytes[i]);
+            g_a_dev[i] = ex;
+            g_a_devbytes[i] = g_a_srcbytes[i] * g_a_outch;
+        } else {
+            g_a_dev[i] = g_a_src[i];
+            g_a_devbytes[i] = g_a_srcbytes[i];
+        }
+        a_build_chunk(i);
+        i++;
+    }
+}
+
+// Free the Mix_Chunk STRUCTS (not the PCM — QuickLoad_RAW chunks are flagged
+// unallocated, so Mix_FreeChunk releases only the 32-byte header) and null the
+// slots so a play after shutdown is a counted drop, never a use-after-free.
+fn a_release_chunks() {
+    let n: i32 = g_a_chunk.length;
+    let i: i32 = 0;
+    while (i < n) {
+        let c = g_a_chunk[i];
+        if (c != ptr_null()) { mix_free_chunk(c); }
+        g_a_chunk[i] = ptr_null();
+        i++;
+    }
+}
+
+// Pick a voice: the first idle one, else steal the least recently started.
+// Returns -1 only when no voices exist at all.
+fn a_pick_voice(): i32 {
+    let n: i32 = g_a_voices;
+    if (n < 1) { let bad: i32 = 0 - 1; return bad; }
+    let i: i32 = 0;
+    while (i < n) {
+        if (mix_playing(i) == 0) { let free_v: i32 = i; return free_v; }
+        i++;
+    }
+    let best: i32 = 0;
+    let bseq: i32 = g_a_vseq[0];
+    i = 1;
+    while (i < n) {
+        let s: i32 = g_a_vseq[i];
+        if (s < bseq) { bseq = s; best = i; }
+        i++;
+    }
+    mix_halt(best);
+    g_a_steals = g_a_steals + 1;
+    let out: i32 = best;
+    return out;
+}
+
+// The single playback path. gain 0..1, pan -1..+1, loops (0 = play once).
+fn a_play(p_id: i32, p_gain: f64, p_pan: f64, p_loops: i32): i32 {
+    if (g_a_ready == 0) { g_a_drops = g_a_drops + 1; let d0: i32 = 0 - 1; return d0; }
+    let id: i32 = p_id;
+    if (id < 0 || id >= g_a_chunk.length) {
+        g_a_drops = g_a_drops + 1; let d1: i32 = 0 - 1; return d1;
+    }
+    let ck = g_a_chunk[id];
+    if (ck == ptr_null()) { g_a_drops = g_a_drops + 1; let d2: i32 = 0 - 1; return d2; }
+
+    let ch: i32 = a_pick_voice();
+    if (ch < 0) { g_a_drops = g_a_drops + 1; let d3: i32 = 0 - 1; return d3; }
+
+    // Pan BEFORE the play call, on a channel we chose ourselves, so the very
+    // first sample is already positioned. Mix_PlayChannelTimed(-1, ...) would
+    // pick the channel for us and leave a frame of unpanned audio.
+    let pan: f64 = p_pan;
+    if (pan < -1.0) { pan = -1.0; }
+    if (pan > 1.0) { pan = 1.0; }
+    let l: f64 = 1.0 - pan;
+    let r: f64 = 1.0 + pan;
+    if (l > 1.0) { l = 1.0; }
+    if (r > 1.0) { r = 1.0; }
+    let li: i32 = i32(l * 255.0 + 0.5);
+    let ri: i32 = i32(r * 255.0 + 0.5);
+    mix_set_panning(ch, li, ri);
+
+    let g: f64 = p_gain * g_a_master;
+    if (g < 0.0) { g = 0.0; }
+    if (g > 1.0) { g = 1.0; }
+    mix_set_volume(ch, i32(g * 128.0 + 0.5));
+
+    let got: i32 = mix_play_timed(ck, ch, p_loops, 0 - 1);
+    if (got < 0) { g_a_drops = g_a_drops + 1; let d4: i32 = 0 - 1; return d4; }
+    g_a_seq = g_a_seq + 1;
+    g_a_vseq[got] = g_a_seq;
+    g_a_vsnd[got] = id;
+    g_a_plays = g_a_plays + 1;
+    let out: i32 = got;
+    return out;
+}
+
+// ===========================================================================
+// LIFECYCLE
+// ===========================================================================
+
+// Open the audio device and allocate voices.
+//
+//   p_freq          requested sample rate, e.g. 22050
+//   p_format        AUDIO_FMT_S16 or AUDIO_FMT_F32
+//   p_out_channels  1 = mono (PANNING IS A NO-OP), 2 = stereo
+//   p_chunk_samples device buffer in sample frames, e.g. 512 (~23 ms at 22050)
+//   p_voices        simultaneous voices, e.g. 16
+//
+// Returns 1 on success, 0 on failure. NEVER throws and never aborts. On failure
+// audio_error() says why and every other entry point stays safe to call.
+//
+// SDL_mixer calls SDL_InitSubSystem(SDL_INIT_AUDIO) itself, so this works with
+// or without a window.
+//
+// Calling it while a device is already open is a NO-OP that returns 1 — the
+// parameters are ignored. To change the device, audio_shutdown() first; every
+// registered sound is then rebuilt for the new device on the next audio_init,
+// including a re-expansion if the output channel count changed.
+//
+// NOTE (measured, and reported as an sdl.hml gap): Mix_CloseAudio does not
+// release the SDL audio subsystem, so after audio_shutdown() the SDL audio
+// DRIVER is still selected and a later audio_init cannot pick a different one.
+// Only SDL_QuitSubSystem(SDL_INIT_AUDIO) clears that, and sdl.hml does not
+// export it yet. Reopening with different device PARAMETERS works fine.
+export fn audio_init(p_freq: i32, p_format: i32, p_out_channels: i32,
+                     p_chunk_samples: i32, p_voices: i32): i32 {
+    if (g_a_ready == 1) { let already: i32 = 1; return already; }
+    g_a_err = "";
+    sdl_clear_error();
+
+    if (mix_open(p_freq, p_format, p_out_channels, p_chunk_samples) != 0) {
+        g_a_err = `Mix_OpenAudio failed: ${sdl_error()}`;
+        g_a_ready = 0;
+        let fail: i32 = 0;
+        return fail;
+    }
+
+    // Trust the OBTAINED spec, never the requested one — SDL_mixer opens with
+    // SDL_AUDIO_ALLOW_ANY_CHANGE and may hand back a different rate or channel
+    // count, and Mix_QuickLoad_RAW does no conversion to cover for you.
+    let sp = buffer_ptr(g_a_spec);
+    if (mix_query_spec(sp) < 1) {
+        mix_close();
+        g_a_err = "Mix_QuerySpec reports no open device";
+        g_a_ready = 0;
+        let fail2: i32 = 0;
+        return fail2;
+    }
+    g_a_freq   = ptr_deref_i32(sp);
+    g_a_format = ptr_deref_u16(ptr_offset(sp, 4, 1));
+    g_a_outch  = ptr_deref_i32(ptr_offset(sp, 8, 1));
+    g_a_bps    = a_fmt_bytes(g_a_format);
+
+    let v: i32 = mix_alloc_channels(p_voices);
+    if (v < 1) {
+        mix_close();
+        g_a_err = "Mix_AllocateChannels allocated no voices";
+        g_a_ready = 0;
+        let fail3: i32 = 0;
+        return fail3;
+    }
+    g_a_voices = v;
+
+    g_a_vsnd.clear();
+    g_a_vseq.clear();
+    let i: i32 = 0;
+    while (i < v) { g_a_vsnd.push(0 - 1); g_a_vseq.push(0); i++; }
+
+    g_a_ready = 1;
+    a_rebuild_all();
+    let ok: i32 = 1;
+    return ok;
+}
+
+// Halt everything, release the chunk headers, close the device.
+// THE PCM BUFFERS ARE NOT RELEASED — the registry owns them for the process
+// lifetime and the sound ids stay valid. audio_init() after this rebuilds them.
+export fn audio_shutdown() {
+    if (g_a_ready == 1) { mix_halt(0 - 1); }
+    a_release_chunks();
+    if (g_a_ready == 1) { mix_close(); }
+    g_a_ready = 0;
+    g_a_voices = 0;
+    g_a_vsnd.clear();
+    g_a_vseq.clear();
+}
+
+export fn audio_ready(): i32 { let out: i32 = g_a_ready; return out; }
+export fn audio_error(): string { let out: string = g_a_err; return out; }
+export fn audio_out_freq(): i32 { let out: i32 = g_a_freq; return out; }
+export fn audio_out_format(): i32 { let out: i32 = g_a_format; return out; }
+export fn audio_out_channels(): i32 { let out: i32 = g_a_outch; return out; }
+export fn audio_voice_capacity(): i32 { let out: i32 = g_a_voices; return out; }
+export fn audio_version_string(): string { return mix_version_string(); }
+
+// 1 when Mix_SetPanning does something. SDL_mixer 2.0.4 panning is implemented
+// for 2, 4 and 6 output channels and is a silent no-op for every other count.
+export fn audio_can_pan(): i32 {
+    let c: i32 = g_a_outch;
+    let out: i32 = 0;
+    if (c == 2 || c == 4 || c == 6) { out = 1; }
+    let r: i32 = out;
+    return r;
+}
+
+// ===========================================================================
+// PCM REGISTRY — every buffer here is owned until the process exits
+// ===========================================================================
+
+// Register PCM that is ALREADY in the device's format (rate, sample format and
+// channel count). Zero copy: the registry retains p_pcm and Mix_QuickLoad_RAW
+// points straight at it.
+//
+// The caller may drop its handle immediately. Returns the sound id, or -1 if
+// p_bytes is not positive. Registration succeeds with no device open; the chunk
+// is built by the next audio_init.
+export fn audio_register_pcm(p_pcm, p_bytes: i32): i32 {
+    if (p_bytes <= 0) { let bad: i32 = 0 - 1; return bad; }
+    let id: i32 = g_a_src.length;
+    g_a_src.push(p_pcm);              // <-- the retention. Never undone.
+    g_a_srcbytes.push(p_bytes);
+    g_a_srcch.push(0);                // 0 = already device format
+    g_a_dev.push(p_pcm);
+    g_a_devbytes.push(p_bytes);
+    g_a_chunk.push(ptr_null());
+    if (g_a_ready == 1) { a_build_chunk(id); }
+    let out: i32 = id;
+    return out;
+}
+
+// Register MONO PCM in the device's sample format. If the device is
+// multi-channel the source is expanded once, here, into a second buffer the
+// registry also owns forever; if the device is mono (or not yet open) this is
+// identical to audio_register_pcm.
+//
+// Use this when you want audio_play_panned to do something: panning needs a
+// stereo device, and a stereo device needs interleaved stereo samples because
+// Mix_QuickLoad_RAW converts nothing.
+export fn audio_register_pcm_mono(p_pcm, p_bytes: i32): i32 {
+    if (p_bytes <= 0) { let bad: i32 = 0 - 1; return bad; }
+    let id: i32 = g_a_src.length;
+    g_a_src.push(p_pcm);              // <-- the retention. Never undone.
+    g_a_srcbytes.push(p_bytes);
+    g_a_srcch.push(1);
+    if (g_a_ready == 1 && g_a_outch > 1) {
+        let ex = a_expand_mono(p_pcm, p_bytes);
+        g_a_dev.push(ex);             // <-- also retained forever
+        g_a_devbytes.push(p_bytes * g_a_outch);
+    } else {
+        g_a_dev.push(p_pcm);
+        g_a_devbytes.push(p_bytes);
+    }
+    g_a_chunk.push(ptr_null());
+    if (g_a_ready == 1) { a_build_chunk(id); }
+    let out: i32 = id;
+    return out;
+}
+
+export fn audio_sound_count(): i32 { let out: i32 = g_a_src.length; return out; }
+
+// Byte length of the device-format buffer actually handed to the mixer.
+export fn audio_sound_bytes(p_id: i32): i32 {
+    let id: i32 = p_id;
+    if (id < 0 || id >= g_a_devbytes.length) { let bad: i32 = 0; return bad; }
+    let out: i32 = g_a_devbytes[id];
+    return out;
+}
+
+// 1 when this sound has a live Mix_Chunk and can be played right now.
+export fn audio_sound_ready(p_id: i32): i32 {
+    let id: i32 = p_id;
+    if (id < 0 || id >= g_a_chunk.length) { let bad: i32 = 0; return bad; }
+    let c = g_a_chunk[id];
+    let out: i32 = 0;
+    if (c != ptr_null()) { out = 1; }
+    let r: i32 = out;
+    return r;
+}
+
+// Read one byte back THROUGH THE REGISTRY-OWNED buffer. This exists so a test
+// can prove the bytes the mixer is reading are still alive and unchanged after
+// the caller dropped its handle. Returns -1 for an out-of-range id or offset.
+export fn audio_sound_byte(p_id: i32, p_off: i32): i32 {
+    let id: i32 = p_id;
+    if (id < 0 || id >= g_a_dev.length) { let bad: i32 = 0 - 1; return bad; }
+    let off: i32 = p_off;
+    if (off < 0 || off >= g_a_devbytes[id]) { let bad2: i32 = 0 - 1; return bad2; }
+    let out: i32 = ptr_deref_u8(ptr_offset(buffer_ptr(g_a_dev[id]), off, 1));
+    return out;
+}
+
+// Total PCM bytes the registry is holding alive: sources plus any expansions.
+export fn audio_registry_bytes(): i32 {
+    let n: i32 = g_a_src.length;
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        acc = acc + g_a_srcbytes[i];
+        if (g_a_srcch[i] == 1 && g_a_devbytes[i] != g_a_srcbytes[i]) {
+            acc = acc + g_a_devbytes[i];
+        }
+        i++;
+    }
+    let out: i32 = acc;
+    return out;
+}
+
+// ===========================================================================
+// PLAYBACK
+// ===========================================================================
+
+// Play once, centred, at p_gain (0..1) times the master gain.
+// Returns the voice index, or -1 if it was dropped (no device, bad id, or no
+// voice could be obtained). Never throws.
+export fn audio_play(p_id: i32, p_gain: f64): i32 {
+    return a_play(p_id, p_gain, 0.0, 0);
+}
+
+// Play once at p_pan: -1 hard left, 0 centre, +1 hard right.
+// Requires audio_can_pan() == 1 to be audible; the call is harmless otherwise.
+export fn audio_play_panned(p_id: i32, p_gain: f64, p_pan: f64): i32 {
+    return a_play(p_id, p_gain, p_pan, 0);
+}
+
+// p_loops is the number of REPEATS after the first play; AUDIO_LOOP_FOREVER
+// (-1) loops until stopped.
+export fn audio_play_looped(p_id: i32, p_gain: f64, p_pan: f64, p_loops: i32): i32 {
+    return a_play(p_id, p_gain, p_pan, p_loops);
+}
+
+// Stop one voice. Returns 0 always (mirrors Mix_HaltChannel).
+export fn audio_stop_voice(p_ch: i32): i32 {
+    if (g_a_ready == 0) { let z: i32 = 0; return z; }
+    let ch: i32 = p_ch;
+    if (ch < 0 || ch >= g_a_voices) { let z2: i32 = 0; return z2; }
+    mix_halt(ch);
+    g_a_vsnd[ch] = 0 - 1;
+    g_a_vseq[ch] = 0;
+    let out: i32 = 0;
+    return out;
+}
+
+export fn audio_stop_all() {
+    if (g_a_ready == 0) { return; }
+    mix_halt(0 - 1);
+    let n: i32 = g_a_voices;
+    let i: i32 = 0;
+    while (i < n) { g_a_vsnd[i] = 0 - 1; g_a_vseq[i] = 0; i++; }
+}
+
+// Master gain, 0..1. Applied when a voice STARTS, so it shapes the next sound
+// rather than ducking what is already playing.
+export fn audio_set_volume(p_gain: f64) {
+    let g: f64 = p_gain;
+    if (g < 0.0) { g = 0.0; }
+    if (g > 1.0) { g = 1.0; }
+    g_a_master = g;
+}
+
+export fn audio_get_volume(): f64 { let out: f64 = g_a_master; return out; }
+
+// Set the per-chunk volume ceiling of one registered sound, 0..1. Multiplies
+// with the channel volume, so it is the right place for a per-sound trim.
+export fn audio_set_sound_volume(p_id: i32, p_gain: f64): i32 {
+    let id: i32 = p_id;
+    if (id < 0 || id >= g_a_chunk.length) { let bad: i32 = 0 - 1; return bad; }
+    let c = g_a_chunk[id];
+    if (c == ptr_null()) { let bad2: i32 = 0 - 1; return bad2; }
+    let g: f64 = p_gain;
+    if (g < 0.0) { g = 0.0; }
+    if (g > 1.0) { g = 1.0; }
+    let out: i32 = mix_set_chunk_volume(c, i32(g * 128.0 + 0.5));
+    return out;
+}
+
+// How many voices are sounding right now.
+export fn audio_voices_active(): i32 {
+    if (g_a_ready == 0) { let z: i32 = 0; return z; }
+    let out: i32 = mix_playing(0 - 1);
+    return out;
+}
+
+// The sound id last started on a voice, or -1.
+export fn audio_voice_sound(p_ch: i32): i32 {
+    let ch: i32 = p_ch;
+    if (ch < 0 || ch >= g_a_vsnd.length) { let bad: i32 = 0 - 1; return bad; }
+    let out: i32 = g_a_vsnd[ch];
+    return out;
+}
+
+// ===========================================================================
+// ACCOUNTING — cheap counters, always compiled in
+// ===========================================================================
+
+export fn audio_plays_total(): i32 { let out: i32 = g_a_plays; return out; }
+export fn audio_drops_total(): i32 { let out: i32 = g_a_drops; return out; }
+export fn audio_steals_total(): i32 { let out: i32 = g_a_steals; return out; }
+
+export fn audio_reset_counters() {
+    g_a_plays = 0;
+    g_a_drops = 0;
+    g_a_steals = 0;
+}
+
+// One-line diagnostic. Built on demand — never call this per frame (N3).
+export fn audio_report_string(): string {
+    let s: string = `audio ${g_a_freq}Hz fmt=${g_a_format} ch=${g_a_outch} `;
+    let t: string = `voices=${audio_voices_active()}/${g_a_voices} `;
+    let u: string = `sounds=${g_a_src.length} bytes=${audio_registry_bytes()} `;
+    let v: string = `plays=${g_a_plays} drops=${g_a_drops} steals=${g_a_steals}`;
+    let out: string = s + t + u + v;
+    return out;
+}

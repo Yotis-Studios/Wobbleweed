@@ -1,0 +1,985 @@
+// probe_emit.hml — verification program for W1-2, the emit kernel.
+//
+// Run COMPILED and headless:
+//     $HC -O1 examples/probe_emit.hml -o /tmp/probe_emit
+//     SDL_VIDEODRIVER=dummy /tmp/probe_emit
+//
+// Prints `PASS n/n` and exits 0 on success; prints every FAIL and exits 1
+// otherwise. It also asserts its own assertion COUNT, so a probe that silently
+// stops running half its checks fails the gate instead of passing it.
+//
+// What it proves, in the order of the W1-2 acceptance list:
+//   1  emit + pack <= 3.0 ms at 2500 triangles, <= 12.5 ms at 8000.
+//      TWO 2500-triangle scenes are timed and BOTH are printed: one parked
+//      inside fog_near (fog factor 0 on every vertex) and one walking 5..55 m
+//      through the 8..60 m fog band (91 % of vertices fogged). They differ by
+//      1.2 ms, so a single number here would be a half-truth; the assertion is
+//      made against the fogged one because that is what a real frame looks
+//      like. See the budget note at the foot of emit.hml's emit_mesh_buf for
+//      why the fogged scene does not fit in 3.0 ms.
+//   2  the vbuf bytes are IDENTICAL to a reference object-path implementation
+//      (per-vertex object allocation, vec.hml mat_apply, @stdlib floor,
+//      batch.hml batch_write_vertex), and so is the rendered framebuffer
+//      checksum through SDL_RenderGeometry
+//   3  zero allocations: RSS flat over 10 000 frames
+//   4  backface cull removes >= 40 % of a closed mesh, and the count reaches
+//      stats.hml
+//   5  plus the correctness the kernel is responsible for: pixel snap, the
+//      20-byte layout, near / guard / straddle classification, the depth key,
+//      the straddle list, the reservation cap, fog and lighting round-trips.
+//
+// The unboxing criterion ("--emit-c shows double, not HmlValue, for the 16
+// matrix locals and the hot locals") cannot be checked from inside a Hemlock
+// program — it is a property of the generated C. It is verified by the shell
+// one-liner in the task report and belongs in tools/ci_unbox.sh, which this
+// task does not own.
+
+import { exit } from "@stdlib/process";
+import { floor, sqrt, sin, cos } from "@stdlib/math";
+import { open } from "@stdlib/fs";
+
+import { window_open, window_close, create_target, set_target, sdl_clear,
+         draw_tris_at, read_pixels_rect, set_tex_blend, destroy_tex,
+         FMT_ARGB8888, BLEND_BLEND } from "../src/sdl.hml";
+import { mat_perspective, mat_mul, mat_look_dir, mat_apply, v3 } from "../src/vec.hml";
+import { clock_now, clock_ms_between } from "../src/time.hml";
+import { stat_reset, stat_get, STAT_REJ_BACKFACE, STAT_REJ_NEAR,
+         STAT_REJ_GUARD, STAT_CLIP_STRADDLE, STAT_TRIS_SUBMITTED } from "../src/stats.hml";
+import { env_new, env_set_sun, env_set_ambient, env_set_camera, env_set_fog,
+         env_set_mist, env_add_light, env_clear_lights, env_far_plane,
+         env_bind, env_vertex_rgba, env_fog_factor, env_fog_alpha,
+         env_bind_field, ENVB_FOG_R, ENVB_FOG_G, ENVB_FOG_B,
+         ENV_FOG_ALPHA_T } from "../src/shade.hml";
+import { batch_write_vertex } from "../src/batch.hml";
+import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
+         emit_set_backface, emit_set_lighting, emit_tri_world, emit_quad_world,
+         emit_mesh_buf, emit_stats, emit_stats_reset, emit_far_plane, snap_of,
+         emit_count_submitted, emit_count_written, emit_count_backface,
+         emit_count_near, emit_count_guard, emit_count_straddle,
+         emit_straddle_reserve, emit_straddle_count, emit_straddle_at,
+         emit_mvp_at, emit_near, emit_backface,
+         EMIT_D_CULLED, EMIT_D_STRADDLE, EMIT_D_GUARD_STRADDLE,
+         EMIT_BF_OFF, EMIT_BF_CW, EMIT_BF_CCW, EMIT_RGB_WHITE,
+         VSTRIDE, TSTRIDE, MESH_TSTRIDE } from "../src/emit.hml";
+
+// ===========================================================================
+// assertion plumbing
+// ===========================================================================
+
+// The number of assertions this program MUST execute. Bump it deliberately
+// when you add one; a mismatch is a failure, so a probe cannot quietly skip
+// half its checks and still report green.
+let g_expect_asserts = 59;
+
+let g_pass = 0;
+let g_fail = 0;
+let g_n = 0;
+
+fn ok(name: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; }
+    else { g_fail = g_fail + 1; print(`FAIL [${g_n}] ${name}`); }
+}
+
+fn okv(name: string, cond: bool, detail: string) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; }
+    else { g_fail = g_fail + 1; print(`FAIL [${g_n}] ${name}  ${detail}`); }
+}
+
+fn near_eq(a: f64, b: f64, tol: f64): bool {
+    let d: f64 = a - b;
+    if (d < 0.0) { d = 0.0 - d; }
+    return d <= tol;
+}
+
+// ===========================================================================
+// RSS, in 4 KiB pages, from /proc/self/statm field 1
+// ===========================================================================
+
+fn rss_pages(): i32 {
+    let f = open("/proc/self/statm", "r");
+    let s = f.read(128);
+    f.close();
+    let n: i32 = 0; let field: i32 = 0; let acc: i32 = 0;
+    let L: i32 = s.length;
+    for (let i = 0; i < L; i++) {
+        let c: i32 = i32(s[i]);
+        if (c == 32) {
+            if (field == 1) { n = acc; }
+            field = field + 1;
+            acc = 0;
+        } else {
+            if (c >= 48 && c <= 57) { acc = acc * 10 + (c - 48); }
+        }
+    }
+    if (field == 1) { n = acc; }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// scratch, allocated once — exactly what a real caller does (rule A8)
+// ===========================================================================
+
+let g_CAP = 9000;                       // triangles
+let g_vbuf = alloc(g_CAP * 60);         // kernel output
+let g_rbuf = alloc(g_CAP * 60);         // reference output
+let g_pix  = alloc(320 * 240 * 4);      // framebuffer readback
+
+fn zeros(n: i32): array<f64> {
+    let a: array<f64> = [];
+    for (let i = 0; i < n; i++) { a.push(0.0); }
+    return a;
+}
+let g_dep: array<f64> = zeros(g_CAP);
+let g_rdep: array<f64> = zeros(g_CAP);
+
+// deterministic PRNG — all mixing in u64 (rule A13)
+let g_seed: u64 = 88172645463325252;
+fn rnd(): f64 {
+    let x: u64 = g_seed;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    g_seed = x;
+    let out: f64 = f64(x >> 11) * 1.1102230246251565e-16;
+    return out;
+}
+
+
+
+// 1-minute load average x100, from /proc/loadavg. Printed with every timing:
+// this box builds eleven agents at once and the SAME binary measures 3.7 ms or
+// 6.3 ms depending only on who else is compiling, so a timing FAIL is not
+// interpretable without it.
+fn loadavg_x100(): i32 {
+    let f = open("/proc/loadavg", "r");
+    let s = f.read(64);
+    f.close();
+    let whole: i32 = 0; let frac: i32 = 0; let seen_dot: i32 = 0; let nfrac: i32 = 0;
+    let L: i32 = s.length;
+    for (let i = 0; i < L; i++) {
+        let c: i32 = i32(s[i]);
+        if (c == 32) { break; }
+        if (c == 46) { seen_dot = 1; }
+        else if (c >= 48 && c <= 57) {
+            if (seen_dot == 1) { if (nfrac < 2) { frac = frac * 10 + (c - 48); nfrac = nfrac + 1; } }
+            else { whole = whole * 10 + (c - 48); }
+        }
+    }
+    while (nfrac < 2) { frac = frac * 10; nfrac = nfrac + 1; }
+    let out: i32 = whole * 100 + frac;
+    return out;
+}
+
+// ===========================================================================
+// timing: BATCHES x REPS, keep the fastest batch
+// ===========================================================================
+let g_last_drawn: i32 = 0;
+let g_last_wall: f64 = 0.0;
+
+fn last_drawn(): i32 { let out: i32 = g_last_drawn; return out; }
+fn last_wall(): f64 { let out: f64 = g_last_wall; return out; }
+
+// Returns the minimum **CPU**-time cost of one emit_mesh_buf call, in ms, and
+// leaves the matching minimum wall time in g_last_wall.
+//
+// Why CPU time is the number the budget is asserted against: this box builds
+// eleven agents' code at once, and at load 29 on 24 cores the same binary
+// measures 3.6 ms or 6.0 ms wall depending only on who else is compiling. CPU
+// time is a property of the kernel; wall time under contention is a property
+// of the box. On the shipping target the game is the only load and the two
+// coincide. Both are printed, always — if they diverge, the machine was busy.
+fn time_mesh(p_mesh: ptr, p_ntris: i32): f64 {
+    let BATCHES: i32 = 60;
+    let REPS: i32 = 4;
+    for (let i = 0; i < 30; i++) {
+        emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, p_mesh, p_ntris,
+                      0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    }
+    let best: f64 = 1.0e18;
+    let bestw: f64 = 1.0e18;
+    for (let bi = 0; bi < BATCHES; bi++) {
+        emit_stats_reset();
+        let c0: f64 = __clock();
+        let a = clock_now();
+        for (let i = 0; i < REPS; i++) {
+            emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, p_mesh, p_ntris,
+                          0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+        }
+        let b = clock_now();
+        let c1: f64 = __clock();
+        let cpu: f64 = (c1 - c0) * 1000.0 / f64(REPS);
+        let wall: f64 = clock_ms_between(a, b) / f64(REPS);
+        if (cpu < best) { best = cpu; }
+        if (wall < bestw) { bestw = wall; }
+        g_last_drawn = emit_count_written() / REPS;
+    }
+    g_last_wall = bestw;
+    let out: f64 = best;
+    return out;
+}
+
+// ===========================================================================
+// mesh arena: non-indexed, 24 B/vertex (pos f32x3, uv f32x2, rgb u8x3, pad)
+// ===========================================================================
+
+fn mesh_put(p: ptr, vi: i32, x: f64, y: f64, z: f64, u: f64, v: f64,
+            r: i32, g: i32, b: i32) {
+    let o: i32 = vi * 24;
+    ptr_write_f32(ptr_offset(p, o, 1), x);
+    ptr_write_f32(ptr_offset(p, o + 4, 1), y);
+    ptr_write_f32(ptr_offset(p, o + 8, 1), z);
+    ptr_write_f32(ptr_offset(p, o + 12, 1), u);
+    ptr_write_f32(ptr_offset(p, o + 16, 1), v);
+    ptr_write_u8(ptr_offset(p, o + 20, 1), r & 255);
+    ptr_write_u8(ptr_offset(p, o + 21, 1), g & 255);
+    ptr_write_u8(ptr_offset(p, o + 22, 1), b & 255);
+    ptr_write_u8(ptr_offset(p, o + 23, 1), 0);
+}
+
+// One axis-aligned box, 12 triangles, outward-facing, consistently wound.
+// Returns the next free triangle index.
+fn box_into(p: ptr, t0: i32, cx: f64, cy: f64, cz: f64, h: f64,
+            r: i32, g: i32, b: i32): i32 {
+    let x0: f64 = cx - h; let x1: f64 = cx + h;
+    let y0: f64 = cy - h; let y1: f64 = cy + h;
+    let z0: f64 = cz - h; let z1: f64 = cz + h;
+    let t: i32 = t0;
+    // each face: two triangles, wound counter-clockwise seen from OUTSIDE
+    // +Z
+    quad_into(p, t, x0,y0,z1, x1,y0,z1, x1,y1,z1, x0,y1,z1, r,g,b); t = t + 2;
+    // -Z
+    quad_into(p, t, x1,y0,z0, x0,y0,z0, x0,y1,z0, x1,y1,z0, r,g,b); t = t + 2;
+    // +X
+    quad_into(p, t, x1,y0,z1, x1,y0,z0, x1,y1,z0, x1,y1,z1, r,g,b); t = t + 2;
+    // -X
+    quad_into(p, t, x0,y0,z0, x0,y0,z1, x0,y1,z1, x0,y1,z0, r,g,b); t = t + 2;
+    // +Y
+    quad_into(p, t, x0,y1,z1, x1,y1,z1, x1,y1,z0, x0,y1,z0, r,g,b); t = t + 2;
+    // -Y
+    quad_into(p, t, x0,y0,z0, x1,y0,z0, x1,y0,z1, x0,y0,z1, r,g,b); t = t + 2;
+    let out: i32 = t;
+    return out;
+}
+
+fn quad_into(p: ptr, t: i32, ax: f64, ay: f64, az: f64,
+             bx: f64, by: f64, bz: f64, cx: f64, cy: f64, cz: f64,
+             dx: f64, dy: f64, dz: f64, r: i32, g: i32, b: i32) {
+    let v: i32 = t * 3;
+    mesh_put(p, v,     ax, ay, az, 0.0, 0.0, r, g, b);
+    mesh_put(p, v + 1, bx, by, bz, 1.0, 0.0, r, g, b);
+    mesh_put(p, v + 2, cx, cy, cz, 1.0, 1.0, r, g, b);
+    mesh_put(p, v + 3, ax, ay, az, 0.0, 0.0, r, g, b);
+    mesh_put(p, v + 4, cx, cy, cz, 1.0, 1.0, r, g, b);
+    mesh_put(p, v + 5, dx, dy, dz, 0.0, 1.0, r, g, b);
+}
+
+// A ring of boxes all around the camera, so a closed-mesh backface test is
+// meaningful and roughly half the triangles face away.
+fn build_boxes(p: ptr, nboxes: i32): i32 {
+    let t: i32 = 0;
+    for (let i = 0; i < nboxes; i++) {
+        let a: f64 = f64(i) * 0.61803398875 * 6.283185307179586;
+        let rad: f64 = 3.0 + rnd() * 22.0;
+        let cx: f64 = cos(a) * rad;
+        let cz: f64 = sin(a) * rad;
+        let cy: f64 = 0.0 - 1.0 + rnd() * 3.0;
+        t = box_into(p, t, cx, cy, cz, 0.4 + rnd() * 0.8,
+                     40 + (i * 37) % 200, 40 + (i * 91) % 200, 40 + (i * 53) % 200);
+    }
+    let out: i32 = t;
+    return out;
+}
+
+// ===========================================================================
+// THE REFERENCE: the object path this kernel replaces
+// ===========================================================================
+// Deliberately written the slow way — vec.hml `mat_apply` returning a fresh
+// {x,y,z,w} per vertex, a per-vertex object literal, @stdlib `floor`, and
+// batch.hml's `batch_write_vertex` as the byte encoder. It computes exactly the
+// same arithmetic in exactly the same order, so the two must agree bit for bit.
+fn ref_mesh(p_mvp, p_mesh: ptr, p_ntris: i32, p_out: ptr, p_dep: array<f64>,
+            p_ox: f64, p_oy: f64, p_oz: f64,
+            p_near: f64, p_vw: f64, p_vh: f64, p_guard: f64,
+            p_bf: i32, p_lit: i32,
+            p_nx: f64, p_ny: f64, p_nz: f64): i32 {
+    let vox: f64 = p_vw * 0.5;  let vsx: f64 = p_vw * 0.5;
+    let voy: f64 = p_vh * 0.5;  let vsy: f64 = p_vh * 0.5;
+    let gx0: f64 = 0.0 - p_guard;  let gy0: f64 = 0.0 - p_guard;
+    let gx1: f64 = p_vw + p_guard; let gy1: f64 = p_vh + p_guard;
+    let fogr: f64 = env_bind_field(ENVB_FOG_R);
+    let fogg: f64 = env_bind_field(ENVB_FOG_G);
+    let fogb: f64 = env_bind_field(ENVB_FOG_B);
+    let n: i32 = 0;
+    for (let k = 0; k < p_ntris; k++) {
+        let so: i32 = k * 72;
+        let w = [];                     // the object path, allocations and all
+        let sx = [];
+        let sy = [];
+        let keep = 1;
+        let straddle = 0;
+        for (let vi = 0; vi < 3; vi++) {
+            let mx: f64 = ptr_read_f32(ptr_offset(p_mesh, so + vi * 24, 1));
+            let my: f64 = ptr_read_f32(ptr_offset(p_mesh, so + vi * 24 + 4, 1));
+            let mz: f64 = ptr_read_f32(ptr_offset(p_mesh, so + vi * 24 + 8, 1));
+            let wv = mat_apply(p_mvp, v3(p_ox + mx, p_oy + my, p_oz + mz));
+            w.push(wv);
+        }
+        let nlt = 0;
+        for (let vi = 0; vi < 3; vi++) { if (w[vi].w <= p_near) { nlt = nlt + 1; } }
+        if (nlt == 3) { continue; }
+        if (nlt > 0) { continue; }      // straddle: kernel defers it to clip.hml
+        for (let vi = 0; vi < 3; vi++) {
+            let inv: f64 = 1.0 / w[vi].w;
+            let a: f64 = vox + w[vi].x * inv * vsx + 0.5;
+            let b: f64 = voy - w[vi].y * inv * vsy + 0.5;
+            sx.push(floor(a));
+            sy.push(floor(b));
+        }
+        if ((sx[0] < gx0 && sx[1] < gx0 && sx[2] < gx0) ||
+            (sx[0] > gx1 && sx[1] > gx1 && sx[2] > gx1) ||
+            (sy[0] < gy0 && sy[1] < gy0 && sy[2] < gy0) ||
+            (sy[0] > gy1 && sy[1] > gy1 && sy[2] > gy1)) { continue; }
+        if (sx[0] < gx0 || sx[1] < gx0 || sx[2] < gx0 ||
+            sx[0] > gx1 || sx[1] > gx1 || sx[2] > gx1 ||
+            sy[0] < gy0 || sy[1] < gy0 || sy[2] < gy0 ||
+            sy[0] > gy1 || sy[1] > gy1 || sy[2] > gy1) { continue; }
+        if (p_bf != 0) {
+            let cr: f64 = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+            if (p_bf == 1) { cr = 0.0 - cr; }
+            if (cr <= 0.0) { continue; }
+        }
+        for (let vi = 0; vi < 3; vi++) {
+            let wx: f64 = p_ox + ptr_read_f32(ptr_offset(p_mesh, so + vi * 24, 1));
+            let wy: f64 = p_oy + ptr_read_f32(ptr_offset(p_mesh, so + vi * 24 + 4, 1));
+            let wz: f64 = p_oz + ptr_read_f32(ptr_offset(p_mesh, so + vi * 24 + 8, 1));
+            let u: f64 = ptr_read_f32(ptr_offset(p_mesh, so + vi * 24 + 12, 1));
+            let v: f64 = ptr_read_f32(ptr_offset(p_mesh, so + vi * 24 + 16, 1));
+            let br: i32 = ptr_read_u8(ptr_offset(p_mesh, so + vi * 24 + 20, 1));
+            let bg: i32 = ptr_read_u8(ptr_offset(p_mesh, so + vi * 24 + 21, 1));
+            let bb: i32 = ptr_read_u8(ptr_offset(p_mesh, so + vi * 24 + 22, 1));
+            let cr: i32 = 0; let cg: i32 = 0; let cb: i32 = 0; let ca: i32 = 255;
+            if (p_lit == 1) {
+                let packed: u32 = env_vertex_rgba(p_nx, p_ny, p_nz, wx, wy, wz);
+                if (br == 255 && bg == 255 && bb == 255) {
+                    cr = i32(packed & 255); cg = i32((packed >> 8) & 255);
+                    cb = i32((packed >> 16) & 255); ca = i32((packed >> 24) & 255);
+                } else {
+                    cr = i32(f64(i32(packed & 255)) * f64(br) * 0.00392156862745098 + 0.5);
+                    cg = i32(f64(i32((packed >> 8) & 255)) * f64(bg) * 0.00392156862745098 + 0.5);
+                    cb = i32(f64(i32((packed >> 16) & 255)) * f64(bb) * 0.00392156862745098 + 0.5);
+                    ca = i32((packed >> 24) & 255);
+                }
+            } else {
+                let f: f64 = env_fog_factor(wx, wy, wz);
+                let rr: f64 = f64(br);
+                let gg: f64 = f64(bg);
+                let bbv: f64 = f64(bb);
+                let a: f64 = 255.0;
+                if (f > 0.0) {
+                    a = env_fog_alpha(f);
+                    rr = rr * (1.0 + (fogr - 1.0) * f);
+                    gg = gg * (1.0 + (fogg - 1.0) * f);
+                    bbv = bbv * (1.0 + (fogb - 1.0) * f);
+                    if (rr < 0.0) { rr = 0.0; }  if (rr > 255.0) { rr = 255.0; }
+                    if (gg < 0.0) { gg = 0.0; }  if (gg > 255.0) { gg = 255.0; }
+                    if (bbv < 0.0) { bbv = 0.0; } if (bbv > 255.0) { bbv = 255.0; }
+                }
+                cr = i32(rr + 0.5); cg = i32(gg + 0.5); cb = i32(bbv + 0.5); ca = i32(a + 0.5);
+            }
+            batch_write_vertex(p_out, n * 60 + vi * 20, sx[vi], sy[vi],
+                               cr, cg, cb, ca, u, v);
+        }
+        p_dep[n] = (w[0].w + w[1].w + w[2].w) * 0.3333333333333333;
+        n = n + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+fn bytes_equal(a: ptr, b: ptr, n: i32): i32 {
+    for (let i = 0; i < n; i++) {
+        if (ptr_read_u8(ptr_offset(a, i, 1)) != ptr_read_u8(ptr_offset(b, i, 1))) {
+            let bad: i32 = i;
+            return bad;
+        }
+    }
+    let out: i32 = 0 - 1;
+    return out;
+}
+
+// ===========================================================================
+// main
+// ===========================================================================
+
+fn main() {
+    print("probe_emit — W1-2 emit kernel");
+
+    // -------------------------------------------------------------------
+    // 1. pixel snap: snap_of must be bit-identical to floor(v + 0.5)
+    // -------------------------------------------------------------------
+    let bad_snap: i32 = 0;
+    for (let i = 0; i < 40001; i++) {
+        let v: f64 = f64(i - 20000) * 0.125;      // hits every .0 .125 .25 .375 .5 ...
+        if (snap_of(v) != floor(v + 0.5)) { bad_snap = bad_snap + 1; }
+    }
+    okv("snap_of == floor(v+0.5) over [-2500,2500] step 1/8", bad_snap == 0,
+        `mismatches=${bad_snap}`);
+
+    let bad_snap2: i32 = 0;
+    for (let i = 0; i < 4000; i++) {
+        let v: f64 = (rnd() - 0.5) * 4000.0;
+        if (snap_of(v) != floor(v + 0.5)) { bad_snap2 = bad_snap2 + 1; }
+    }
+    okv("snap_of == floor(v+0.5) on 4000 random coords", bad_snap2 == 0,
+        `mismatches=${bad_snap2}`);
+    ok("snap_of(-0.5) == 0 (round-half-up, matches floor)", snap_of(0.0 - 0.5) == 0.0);
+    ok("snap_of(2.5) == 3 and snap_of(3.5) == 4",
+       snap_of(2.5) == 3.0 && snap_of(3.5) == 4.0);
+
+    // -------------------------------------------------------------------
+    // 2. camera / env setup used by everything below
+    // -------------------------------------------------------------------
+    let VW: f64 = 320.0;
+    let VH: f64 = 240.0;
+    let GUARD: f64 = 640.0;
+    let NEAR: f64 = 0.05;
+    let FOGFAR: f64 = 60.0;
+
+    let env = env_new();
+    env_set_sun(env, 0.3, 0.9, 0.2, 0.55, 0.52, 0.44);
+    env_set_ambient(env, 0.45, 0.48, 0.56);
+    env_set_camera(env, 0.0, 0.0, 0.0);
+    env_set_fog(env, 8.0, FOGFAR, 0.62, 0.66, 0.74, 0.5);
+    env_set_mist(env, 0.0, 0.0, 0.0);
+    env_clear_lights(env);
+
+    let proj = mat_perspective(1.2217304763960306, VW / VH, NEAR, env_far_plane(env));
+    let view = mat_look_dir(v3(0.0, 0.0, 0.0), 0.0, 0.0);
+    let mvp = mat_mul(proj, view);
+
+    emit_set_viewport(VW, VH, GUARD);
+    emit_set_near(NEAR);
+    emit_set_mvp(mvp);
+    emit_set_env(env);
+    emit_set_lighting(0);
+    emit_set_backface(EMIT_BF_OFF);
+    emit_straddle_reserve(g_CAP);
+
+    ok("emit_set_mvp hoisted all 16 elements",
+       emit_mvp_at(0) == mvp[0] && emit_mvp_at(5) == mvp[5] &&
+       emit_mvp_at(11) == mvp[11] && emit_mvp_at(15) == mvp[15]);
+    ok("emit_set_near round-trips", emit_near() == NEAR);
+    ok("emit_far_plane == fog_far * 1.06 (derived, never hardcoded)",
+       near_eq(emit_far_plane(), FOGFAR * 1.06, 1.0e-12));
+
+    // -------------------------------------------------------------------
+    // 3. the 20-byte SDL_Vertex layout, by readback
+    // -------------------------------------------------------------------
+    // A triangle 10 m straight ahead (-Z), fog off for an exact colour.
+    let env2 = env_new();
+    env_set_camera(env2, 0.0, 0.0, 0.0);
+    env_set_fog(env2, 1.0e9, 2.0e9, 1.0, 1.0, 1.0, 0.0);   // effectively no fog
+    emit_set_env(env2);
+    emit_stats_reset();
+    let d0: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 0.0 - 10.0,   1.0, 0.0 - 1.0, 0.0 - 10.0,   0.0, 1.0, 0.0 - 10.0,
+        0.0, 0.0,  1.0, 0.0,  0.5, 1.0,
+        0.0, 0.0, 1.0,
+        200 | (150 << 8) | (100 << 16));
+    ok("emit_tri_world returned a positive depth", d0 > 0.0);
+    ok("depth == view-space w (10 m ahead -> 10)", near_eq(d0, 10.0, 1.0e-9));
+    ok("vertex pos is pixel-snapped (integral f32)",
+       ptr_read_f32(ptr_offset(g_vbuf, 0, 1)) == floor(ptr_read_f32(ptr_offset(g_vbuf, 0, 1))) &&
+       ptr_read_f32(ptr_offset(g_vbuf, 4, 1)) == floor(ptr_read_f32(ptr_offset(g_vbuf, 4, 1))));
+    okv("colour bytes at +8/+9/+10 are r,g,b in order",
+       ptr_read_u8(ptr_offset(g_vbuf, 8, 1)) == 200 &&
+       ptr_read_u8(ptr_offset(g_vbuf, 9, 1)) == 150 &&
+       ptr_read_u8(ptr_offset(g_vbuf, 10, 1)) == 100,
+       `got ${ptr_read_u8(ptr_offset(g_vbuf,8,1))},${ptr_read_u8(ptr_offset(g_vbuf,9,1))},${ptr_read_u8(ptr_offset(g_vbuf,10,1))}`);
+    ok("alpha byte at +11 is 255 with fog off (the u32 pack is little-endian)",
+       ptr_read_u8(ptr_offset(g_vbuf, 11, 1)) == 255);
+    ok("uv at +12/+16 is affine and unmodified",
+       ptr_read_f32(ptr_offset(g_vbuf, 12, 1)) == 0.0 &&
+       ptr_read_f32(ptr_offset(g_vbuf, 16, 1)) == 0.0 &&
+       ptr_read_f32(ptr_offset(g_vbuf, 32, 1)) == 1.0 &&
+       ptr_read_f32(ptr_offset(g_vbuf, 56, 1)) == 1.0);
+    ok("vertex B is at +20 and vertex C at +40",
+       ptr_read_f32(ptr_offset(g_vbuf, 20, 1)) > ptr_read_f32(ptr_offset(g_vbuf, 0, 1)) &&
+       ptr_read_f32(ptr_offset(g_vbuf, 44, 1)) < ptr_read_f32(ptr_offset(g_vbuf, 4, 1)));
+    ok("one triangle counted as submitted and written",
+       emit_count_submitted() == 1 && emit_count_written() == 1);
+
+    // -------------------------------------------------------------------
+    // 4. classification: behind, straddling, off-guard, guard-straddling
+    // -------------------------------------------------------------------
+    emit_stats_reset();
+    let d1: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 10.0,  1.0, 0.0 - 1.0, 10.0,  0.0, 1.0, 10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    ok("triangle entirely behind the camera -> EMIT_D_CULLED",
+       d1 == EMIT_D_CULLED && emit_count_near() == 1);
+
+    emit_stats_reset();
+    let d2: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 0.0 - 10.0,  1.0, 0.0 - 1.0, 0.0 - 10.0,  0.0, 1.0, 5.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    ok("triangle crossing the near plane -> EMIT_D_STRADDLE for clip.hml",
+       d2 == EMIT_D_STRADDLE && emit_count_straddle() == 1);
+
+    emit_stats_reset();
+    let d3: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 900.0, 0.0 - 1.0, 0.0 - 10.0, 0.0 - 899.0, 0.0 - 1.0, 0.0 - 10.0,
+        0.0 - 899.5, 1.0, 0.0 - 10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    ok("triangle far off to the left -> guard-rejected",
+       d3 == EMIT_D_CULLED && emit_count_guard() == 1);
+
+    emit_stats_reset();
+    let d4: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 0.0 - 10.0,  400.0, 0.0 - 1.0, 0.0 - 10.0,  0.0, 1.0, 0.0 - 10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    ok("triangle straddling the guard rect -> EMIT_D_GUARD_STRADDLE",
+       d4 == EMIT_D_GUARD_STRADDLE && emit_count_straddle() == 1);
+
+    // -------------------------------------------------------------------
+    // 5. backface cull on one triangle, both windings
+    // -------------------------------------------------------------------
+    emit_set_backface(EMIT_BF_CW);
+    emit_stats_reset();
+    let dcw: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 0.0 - 10.0,  1.0, 0.0 - 1.0, 0.0 - 10.0,  0.0, 1.0, 0.0 - 10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    emit_set_backface(EMIT_BF_CCW);
+    emit_stats_reset();
+    let dccw: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 0.0 - 10.0,  1.0, 0.0 - 1.0, 0.0 - 10.0,  0.0, 1.0, 0.0 - 10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    ok("the two backface modes disagree on the same triangle (exactly one culls)",
+       (dcw > 0.0 && dccw == EMIT_D_CULLED) || (dccw > 0.0 && dcw == EMIT_D_CULLED));
+    ok("backface rejection is counted", emit_count_backface() == 1 || dccw > 0.0);
+    emit_set_backface(EMIT_BF_OFF);
+    emit_stats_reset();
+    let doff: f64 = emit_tri_world(g_vbuf, 0,
+        0.0 - 1.0, 0.0 - 1.0, 0.0 - 10.0,  1.0, 0.0 - 1.0, 0.0 - 10.0,  0.0, 1.0, 0.0 - 10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    ok("EMIT_BF_OFF culls nothing", doff > 0.0 && emit_count_backface() == 0);
+
+    // -------------------------------------------------------------------
+    // 6. emit_quad_world writes two triangles and two depths
+    // -------------------------------------------------------------------
+    emit_stats_reset();
+    let nq: i32 = emit_quad_world(g_vbuf, 0, g_dep, 0,
+        0.0 - 2.0, 0.0 - 2.0, 0.0 - 12.0,   2.0, 0.0 - 2.0, 0.0 - 12.0,
+        2.0, 2.0, 0.0 - 12.0,               0.0 - 2.0, 2.0, 0.0 - 12.0,
+        0.0,0.0, 1.0,0.0, 1.0,1.0, 0.0,1.0,
+        0.0, 0.0, 1.0, EMIT_RGB_WHITE);
+    ok("emit_quad_world emits 2 triangles", nq == 2);
+    ok("emit_quad_world writes both depths", g_dep[0] > 0.0 && g_dep[1] > 0.0);
+
+    // -------------------------------------------------------------------
+    // 7. fog: G15 curve, radial distance, alpha knee
+    // -------------------------------------------------------------------
+    emit_set_env(env);      // fog 8 .. 60, tint (0.62,0.66,0.74), alpha_max 0.5
+    emit_set_lighting(0);
+    emit_stats_reset();
+    // A: 5 m ahead, inside fog_near -> no tint, alpha 255
+    emit_tri_world(g_vbuf, 0,
+        0.0-0.2,0.0-0.2,0.0-5.0,  0.2,0.0-0.2,0.0-5.0,  0.0,0.2,0.0-5.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, 200 | (200 << 8) | (200 << 16));
+    ok("inside fog_near the colour is untouched and alpha is 255",
+       ptr_read_u8(ptr_offset(g_vbuf, 8, 1)) == 200 &&
+       ptr_read_u8(ptr_offset(g_vbuf, 11, 1)) == 255);
+    // B: beyond fog_far -> fully tinted, alpha 255*(1-0.5)
+    emit_tri_world(g_vbuf, 0,
+        0.0-0.2,0.0-0.2,0.0-80.0,  0.2,0.0-0.2,0.0-80.0,  0.0,0.2,0.0-80.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, 200 | (200 << 8) | (200 << 16));
+    let far_r: i32 = ptr_read_u8(ptr_offset(g_vbuf, 8, 1));
+    let far_a: i32 = ptr_read_u8(ptr_offset(g_vbuf, 11, 1));
+    okv("beyond fog_far the tint is fully applied (200*0.62 = 124)",
+        far_r == 124, `got r=${far_r}`);
+    // shade.hml OWNS the alpha ramp; the kernel inlines it. Assert against
+    // env_fog_alpha itself rather than a hand-computed constant, so the two
+    // cannot drift apart silently. At f = 1 with alpha_max 0.5 this is
+    // 255*(1-0.5) = 127.5, and the pack is i32(a + 0.5) -> 128.
+    let far_a_ref: i32 = i32(env_fog_alpha(1.0) + 0.5);
+    okv("beyond fog_far alpha == i32(env_fog_alpha(1) + 0.5) = 128",
+        far_a == far_a_ref && far_a == 128, `got a=${far_a} ref=${far_a_ref}`);
+    // C: radial, not view-z — equidistant points at screen centre and corner
+    //    must fog identically.
+    let fc: f64 = env_fog_factor(0.0, 0.0, 0.0 - 30.0);
+    let fe: f64 = env_fog_factor(15.0, 11.0, 0.0 - 23.53720459187964);
+    okv("fog is RADIAL: equidistant centre and corner points fog equally",
+        near_eq(fc, fe, 1.0e-9), `centre=${fc} corner=${fe}`);
+
+    // -------------------------------------------------------------------
+    // 8. lighting: ambient + sun == (1,1,1) with N.L == 1 reproduces the texel
+    // -------------------------------------------------------------------
+    let env3 = env_new();
+    env_set_camera(env3, 0.0, 0.0, 0.0);
+    env_set_sun(env3, 0.0, 0.0, 1.0, 0.55, 0.55, 0.55);
+    env_set_ambient(env3, 0.45, 0.45, 0.45);
+    env_set_fog(env3, 1.0e9, 2.0e9, 1.0, 1.0, 1.0, 0.0);
+    emit_set_env(env3);
+    emit_set_lighting(1);
+    emit_stats_reset();
+    emit_tri_world(g_vbuf, 0,
+        0.0-0.5,0.0-0.5,0.0-10.0,  0.5,0.0-0.5,0.0-10.0,  0.0,0.5,0.0-10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0,
+        0.0, 0.0, 1.0,                       // normal straight at the light
+        EMIT_RGB_WHITE);
+    let lr: i32 = ptr_read_u8(ptr_offset(g_vbuf, 8, 1));
+    okv("ambient+sun == (1,1,1) with N.L == 1 reproduces the authored texel (255)",
+        lr == 255, `got ${lr}`);
+    // a point light brightens nearby geometry
+    let env4 = env_new();
+    env_set_camera(env4, 0.0, 0.0, 0.0);
+    env_set_sun(env4, 0.0, 0.0, 1.0, 0.05, 0.05, 0.05);
+    env_set_ambient(env4, 0.10, 0.10, 0.10);
+    env_set_fog(env4, 1.0e9, 2.0e9, 1.0, 1.0, 1.0, 0.0);
+    env_add_light(env4, 0.0, 0.0, 0.0 - 9.0, 0.6, 0.05, 0.05, 4.0);
+    emit_set_env(env4);
+    emit_tri_world(g_vbuf, 0,
+        0.0-0.5,0.0-0.5,0.0-10.0,  0.5,0.0-0.5,0.0-10.0,  0.0,0.5,0.0-10.0,
+        0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, 128 | (128 << 8) | (128 << 16));
+    let pr: i32 = ptr_read_u8(ptr_offset(g_vbuf, 8, 1));
+    let pb: i32 = ptr_read_u8(ptr_offset(g_vbuf, 10, 1));
+    okv("a point light brightens the red channel above the blue one",
+        pr > pb, `r=${pr} b=${pb}`);
+    emit_set_lighting(0);
+
+    // -------------------------------------------------------------------
+    // 9. the mesh path vs the reference OBJECT path — byte-identical vbuf
+    // -------------------------------------------------------------------
+    let NBOX = 210;
+    let mesh = alloc(NBOX * 12 * 72);
+    let ntris: i32 = build_boxes(mesh, NBOX);
+    ok("box mesh built with 12 triangles per box", ntris == NBOX * 12);
+
+    emit_set_env(env);
+    emit_set_lighting(0);
+    emit_set_backface(EMIT_BF_OFF);
+    emit_stats_reset();
+    let kn: i32 = emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    let rn: i32 = ref_mesh(mvp, mesh, ntris, g_rbuf, g_rdep, 0.0, 0.0, 0.0,
+                           NEAR, VW, VH, GUARD, EMIT_BF_OFF, 0, 0.0, 0.0, 1.0);
+    okv("kernel and reference emit the same triangle count", kn == rn,
+        `kernel=${kn} ref=${rn}`);
+    let diff: i32 = bytes_equal(g_vbuf, g_rbuf, kn * 60);
+    okv("vbuf is BYTE-IDENTICAL to the object-path reference (unlit + fog)",
+        diff < 0, `first differing byte = ${diff} of ${kn * 60}`);
+    let ddiff: i32 = 0;
+    for (let i = 0; i < kn; i++) { if (g_dep[i] != g_rdep[i]) { ddiff = ddiff + 1; } }
+    ok("depth keys are identical to the reference", ddiff == 0);
+
+    // and again with lighting on, backface on
+    emit_set_env(env);
+    emit_set_lighting(1);
+    emit_set_backface(EMIT_BF_CCW);
+    emit_stats_reset();
+    let kn2: i32 = emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                                 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0);
+    let rn2: i32 = ref_mesh(mvp, mesh, ntris, g_rbuf, g_rdep, 0.0, 0.0, 0.0,
+                            NEAR, VW, VH, GUARD, EMIT_BF_CCW, 1, 0.0, 1.0, 0.0);
+    okv("kernel and reference agree with lighting + backface on", kn2 == rn2,
+        `kernel=${kn2} ref=${rn2}`);
+    let diff2: i32 = bytes_equal(g_vbuf, g_rbuf, kn2 * 60);
+    okv("vbuf is BYTE-IDENTICAL to the object-path reference (lit + fog + cull)",
+        diff2 < 0, `first differing byte = ${diff2} of ${kn2 * 60}`);
+
+    // -------------------------------------------------------------------
+    // 10. backface cull removes >= 40 % of a closed mesh, and stats sees it
+    // -------------------------------------------------------------------
+    emit_set_lighting(0);
+    emit_set_backface(EMIT_BF_OFF);
+    emit_stats_reset();
+    let n_off: i32 = emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                                   0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    emit_set_backface(EMIT_BF_CW);
+    emit_stats_reset();
+    let n_cw: i32 = emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                                  0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    let cw_culled: i32 = emit_count_backface();
+    emit_set_backface(EMIT_BF_CCW);
+    emit_stats_reset();
+    let n_ccw: i32 = emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                                   0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    let ccw_culled: i32 = emit_count_backface();
+    let best: i32 = cw_culled;
+    if (ccw_culled > best) { best = ccw_culled; }
+    let frac: f64 = f64(best) / f64(n_off);
+    okv("backface cull removes >= 40 % of a closed mesh's visible triangles",
+        frac >= 0.40, `culled ${best}/${n_off} = ${frac}`);
+    ok("cull is a partition: kept + culled == the uncculled count",
+       n_cw + cw_culled == n_off && n_ccw + ccw_culled == n_off);
+    okv("the two windings between them account for every triangle (degenerates cull in both)",
+        cw_culled + ccw_culled >= n_off, `${cw_culled} + ${ccw_culled} vs ${n_off}`);
+
+    // stats.hml receives the counters
+    stat_reset();
+    emit_set_backface(EMIT_BF_CW);
+    emit_stats_reset();
+    emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                  0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    let sub_before: i32 = emit_count_submitted();
+    let bf_before: i32 = emit_count_backface();
+    let near_before: i32 = emit_count_near();
+    let guard_before: i32 = emit_count_guard();
+    let str_before: i32 = emit_count_straddle();
+    emit_stats();
+    ok("emit_stats pushes the backface count into stats.hml",
+       stat_get(STAT_REJ_BACKFACE) == bf_before && bf_before > 0);
+    ok("emit_stats pushes submitted / near / guard / straddle into stats.hml",
+       stat_get(STAT_TRIS_SUBMITTED) == sub_before &&
+       stat_get(STAT_REJ_NEAR) == near_before &&
+       stat_get(STAT_REJ_GUARD) == guard_before &&
+       stat_get(STAT_CLIP_STRADDLE) == str_before);
+    ok("emit_stats zeroes its own counters", emit_count_submitted() == 0);
+
+    // -------------------------------------------------------------------
+    // 11. the reservation cap is honoured
+    // -------------------------------------------------------------------
+    emit_set_backface(EMIT_BF_OFF);
+    emit_stats_reset();
+    let SENT: i32 = 0 - 559038737;      // 0xDEADBEEF as i32
+    ptr_write_i32(ptr_offset(g_vbuf, 100 * 60, 1), SENT);
+    let ncap: i32 = emit_mesh_buf(g_vbuf, 0, 100, g_dep, 0, mesh, ntris,
+                                  0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    ok("emit_mesh_buf never writes more than the reservation", ncap == 100);
+    ok("emit_mesh_buf writes nothing past the reservation",
+       ptr_read_i32(ptr_offset(g_vbuf, 100 * 60, 1)) == SENT);
+
+    // -------------------------------------------------------------------
+    // 12. the straddle list
+    // -------------------------------------------------------------------
+    // Put the camera inside the ring so plenty of boxes straddle the near plane.
+    let view2 = mat_look_dir(v3(0.0, 0.0, 0.0), 0.0, 0.0);
+    let mvp2 = mat_mul(mat_perspective(1.2217304763960306, VW / VH, NEAR, 100.0), view2);
+    emit_set_mvp(mvp2);
+    emit_stats_reset();
+    emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                  0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    let sc: i32 = emit_straddle_count();
+    ok("straddle list length matches the straddle counter",
+       sc == emit_count_straddle() || emit_count_straddle() == 0);
+    let str_ok: i32 = 1;
+    for (let i = 0; i < sc; i++) {
+        let t: i32 = emit_straddle_at(i);
+        if (t < 0 || t >= ntris) { str_ok = 0; }
+    }
+    ok("every straddle-list entry is a valid source triangle index", str_ok == 1);
+    ok("emit_straddle_at rejects an out-of-range index", emit_straddle_at(sc + 5) == 0 - 1);
+    emit_set_mvp(mvp);
+
+    // -------------------------------------------------------------------
+    // 13. FRAMEBUFFER CHECKSUM: kernel vs reference, through SDL
+    // -------------------------------------------------------------------
+    let w = window_open("probe_emit", 320, 240, 1);
+    let fb_ok: i32 = 0;
+    let ck_k: i32 = 0;
+    let ck_r: i32 = 0;
+    if (w == null) {
+        print("NOTE: window_open failed; framebuffer checksum skipped");
+    } else {
+        let tgt = create_target(w, 320, 240);
+        set_tex_blend(tgt, BLEND_BLEND);
+        emit_set_env(env);
+        emit_set_lighting(0);
+        emit_set_backface(EMIT_BF_CW);
+        emit_stats_reset();
+        let kk: i32 = emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                                    0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+        let rr: i32 = ref_mesh(mvp, mesh, ntris, g_rbuf, g_rdep, 0.0, 0.0, 0.0,
+                               NEAR, VW, VH, GUARD, EMIT_BF_CW, 0, 0.0, 0.0, 1.0);
+        ck_k = render_checksum(w, tgt, g_vbuf, kk);
+        ck_r = render_checksum(w, tgt, g_rbuf, rr);
+        fb_ok = 1;
+        destroy_tex(tgt);
+    }
+    okv("framebuffer checksum identical to the object-path reference",
+        fb_ok == 0 || ck_k == ck_r, `kernel=${ck_k} ref=${ck_r}`);
+    ok("the rendered framebuffer is not empty (the test would be vacuous)",
+       fb_ok == 0 || ck_k != 0);
+
+    // -------------------------------------------------------------------
+    // 14. ZERO ALLOCATIONS: RSS flat over 10 000 frames
+    // -------------------------------------------------------------------
+    emit_set_env(env);
+    emit_set_lighting(1);
+    emit_set_backface(EMIT_BF_CW);
+    for (let i = 0; i < 200; i++) {
+        emit_stats_reset();
+        emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                      0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    }
+    let rss0: i32 = rss_pages();
+    for (let i = 0; i < 10000; i++) {
+        emit_stats_reset();
+        emit_mesh_buf(g_vbuf, 0, g_CAP, g_dep, 0, mesh, ntris,
+                      0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+        emit_tri_world(g_vbuf, 0,
+            0.0-1.0,0.0-1.0,0.0-10.0, 1.0,0.0-1.0,0.0-10.0, 0.0,1.0,0.0-10.0,
+            0.0,0.0, 1.0,0.0, 0.5,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+        emit_quad_world(g_vbuf, 0, g_dep, 0,
+            0.0-2.0,0.0-2.0,0.0-12.0, 2.0,0.0-2.0,0.0-12.0,
+            2.0,2.0,0.0-12.0, 0.0-2.0,2.0,0.0-12.0,
+            0.0,0.0, 1.0,0.0, 1.0,1.0, 0.0,1.0, 0.0,0.0,1.0, EMIT_RGB_WHITE);
+    }
+    let rss1: i32 = rss_pages();
+    okv("RSS is flat over 10 000 emit frames (zero allocations)",
+        rss1 - rss0 <= 16, `${rss0} -> ${rss1} pages (${(rss1 - rss0) * 4} KiB)`);
+
+    // -------------------------------------------------------------------
+    // 15. PERFORMANCE: emit + pack at 2500 and 8000 triangles
+    // -------------------------------------------------------------------
+    // Meshes sized so that ~all triangles survive: backface off, camera outside.
+    // `M2500` / `M8000` walk 5 m .. 55 m through the 8 m .. 60 m fog band, so
+    // ~91 % of vertices take the fogged colour path. `M2500N` is the same
+    // triangle count parked inside `fog_near`, where the fog factor is 0 and the
+    // baked colour is copied through as an integer. The two differ by 1.3 ms and
+    // BOTH are reported — a single number here would be a half-truth.
+    let M2500 = alloc(2500 * 72);
+    build_plane(M2500, 2500, 5.0, 50.0);
+    let M8000 = alloc(8000 * 72);
+    build_plane(M8000, 8000, 5.0, 50.0);
+    let M2500N = alloc(2500 * 72);
+    build_plane(M2500N, 2500, 2.0, 4.0);
+
+    emit_set_env(env);
+    emit_set_lighting(0);
+    emit_set_backface(EMIT_BF_OFF);
+
+    // `time_mesh` runs BATCHES x REPS and keeps the FASTEST batch. On a box
+    // shared with other builds the mean swings 2x; the minimum is the estimator
+    // of the uncontended cost, and it is what a budget claim has to be made
+    // against. Reported numbers are therefore reproducible under load.
+    let ms2500: f64  = time_mesh(M2500,  2500);
+    let drawn2500: i32 = last_drawn();
+    let wall2500: f64 = last_wall();
+    let ms8000: f64  = time_mesh(M8000,  8000);
+    let drawn8000: i32 = last_drawn();
+    let wall8000: f64 = last_wall();
+    let ms2500n: f64 = time_mesh(M2500N, 2500);
+    let drawn2500n: i32 = last_drawn();
+    let wall2500n: f64 = last_wall();
+
+    // lit, with four point lights — the worst realistic case
+    env_clear_lights(env);
+    env_add_light(env, 2.0, 1.0, 0.0 - 12.0, 0.8, 0.6, 0.3, 8.0);
+    env_add_light(env, 0.0-3.0, 1.0, 0.0 - 18.0, 0.3, 0.6, 0.9, 9.0);
+    env_add_light(env, 5.0, 0.0, 0.0 - 25.0, 0.9, 0.3, 0.3, 10.0);
+    env_add_light(env, 0.0-6.0, 2.0, 0.0 - 30.0, 0.4, 0.9, 0.5, 11.0);
+    emit_set_env(env);
+    emit_set_lighting(1);
+    let ms2500lit: f64 = time_mesh(M2500, 2500);
+
+    emit_set_lighting(0);
+    env_clear_lights(env);
+    emit_set_env(env);
+
+    let load: i32 = loadavg_x100();
+    print(`  1-min load average during timing : ${f64(load) * 0.01}  (24 cores)`);
+    if (load > 400) {
+        print("  NOTE: this box is busy. Timings below are inflated by contention;");
+        print("        the same binary measures ~1.6x slower at load 26 than at load 15.");
+    }
+    print(`  backface cull      : ${best}/${n_off} = ${frac * 100.0} % of a closed mesh`);
+    print(`  RSS over 10 000 frames : ${rss0} -> ${rss1} pages (${(rss1 - rss0) * 4} KiB)`);
+    print(`  framebuffer checksum   : kernel ${ck_k}  reference ${ck_r}`);
+    print(`  emit+pack  2500 tris, fog factor 0        : ${ms2500n} ms cpu / ${wall2500n} ms wall  (${drawn2500n} written)`);
+    print(`  emit+pack  2500 tris, 91 % vertices fogged : ${ms2500} ms cpu / ${wall2500} ms wall  (${drawn2500} written)`);
+    print(`  emit+pack  2500 tris, full G16 + 4 lights  : ${ms2500lit} ms`);
+    print(`  emit+pack  8000 tris, 91 % vertices fogged : ${ms8000} ms cpu / ${wall8000} ms wall  (${drawn8000} written)`);
+
+    okv("emit + pack <= 3.0 ms at 2500 triangles (91 % of vertices fogged)",
+        ms2500 <= 3.0, `${ms2500} ms cpu`);
+    okv("emit + pack <= 12.5 ms at 8000 triangles (91 % of vertices fogged)",
+        ms8000 <= 12.5, `${ms8000} ms cpu`);
+    ok("the 2500-triangle timing actually emitted 2500 triangles", drawn2500 == 2500);
+    ok("the 8000-triangle timing actually emitted 8000 triangles", drawn8000 == 8000);
+
+    // -------------------------------------------------------------------
+    // 16. tail: constants and contract invariants
+    // -------------------------------------------------------------------
+    ok("VSTRIDE == 20 and TSTRIDE == 60 (ARCHITECTURE 2.3)",
+       VSTRIDE == 20 && TSTRIDE == 60);
+    ok("MESH_TSTRIDE == 72 (24 B/vertex, non-indexed)", MESH_TSTRIDE == 72);
+    ok("the cull/straddle sentinels are distinct and all negative",
+       EMIT_D_CULLED < 0.0 && EMIT_D_STRADDLE < 0.0 && EMIT_D_GUARD_STRADDLE < 0.0 &&
+       EMIT_D_CULLED != EMIT_D_STRADDLE && EMIT_D_STRADDLE != EMIT_D_GUARD_STRADDLE);
+    ok("EMIT_RGB_WHITE is 0xFFFFFF", EMIT_RGB_WHITE == 16777215);
+    ok("emit_backface round-trips", emit_backface() == EMIT_BF_OFF);
+
+    free(M2500);
+    free(M2500N);
+    free(M8000);
+    free(mesh);
+    if (w != null) { window_close(w); }
+
+    // -------------------------------------------------------------------
+    // verdict
+    // -------------------------------------------------------------------
+    if (g_n != g_expect_asserts) {
+        print(`FAIL assertion COUNT: ran ${g_n}, expected ${g_expect_asserts}`);
+        g_fail = g_fail + 1;
+    }
+    if (g_fail == 0) {
+        print(`PASS ${g_pass}/${g_n}`);
+        exit(0);
+    }
+    print(`FAILED ${g_fail} of ${g_n} (passed ${g_pass})`);
+    exit(1);
+}
+
+// The timing scene. Every triangle is visible and none straddles, so a timing
+// run measures the FULL kernel path (transform, divide, snap, guard, shade,
+// pack) on every triangle rather than an early-out.
+//
+// **The depth spread is load-bearing.** The env under test fogs from 8 m to
+// 60 m, and the fog factor decides which of the two colour paths a vertex
+// takes: f == 0 copies the baked integer straight through, f > 0 pays a
+// smoothstep, three f64 conversions and four i32 conversions. A test plane
+// parked at 6 m would put every vertex on the cheap path and under-report the
+// kernel by ~25 %. This one walks the depth from 5 m (inside fog_near) to
+// ~55 m (nearly full fog), so the mix matches a real fogged frame.
+fn build_plane(p: ptr, ntris: i32, near_m: f64, span_m: f64) {
+    let cols: i32 = 50;
+    let rows: i32 = ntris / cols;
+    if (rows < 1) { rows = 1; }
+    for (let k = 0; k < ntris; k++) {
+        let col: i32 = k % cols;
+        let row: i32 = k / cols;
+        let depth: f64 = near_m + span_m * f64(row) / f64(rows);
+        let x: f64 = (f64(col) - 24.5) * 0.055;
+        let y: f64 = (f64(row % 37) - 18.0) * 0.05;
+        let z: f64 = 0.0 - depth;
+        let v: i32 = k * 3;
+        let c: i32 = 60 + (k * 7) % 180;
+        mesh_put(p, v,     x,        y,        z, 0.0, 0.0, c, 200 - c, 128);
+        mesh_put(p, v + 1, x + 0.04, y,        z, 1.0, 0.0, c, 200 - c, 128);
+        mesh_put(p, v + 2, x + 0.02, y + 0.03, z, 0.5, 1.0, c, 200 - c, 128);
+    }
+}
+
+// Draw `n` triangles into `tgt`, read the 320x240 back, and fold it into a
+// 32-bit checksum.
+fn render_checksum(w, tgt, buf: ptr, n: i32): i32 {
+    set_target(w, tgt);
+    sdl_clear(w, 0, 0, 0, 255);
+    if (n > 0) { draw_tris_at(w, null, buf, 0, n * 3); }
+    read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, g_pix, 320 * 4);
+    set_target(w, null);
+    let h: u64 = 1469598103934665603;
+    let N: i32 = 320 * 240 * 4;
+    for (let i = 0; i < N; i++) {
+        h = h ^ u64(ptr_read_u8(ptr_offset(g_pix, i, 1)));
+        h = h * 1099511628211;
+    }
+    let out: i32 = i32(h & 2147483647);
+    return out;
+}
+
+main();

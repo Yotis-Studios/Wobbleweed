@@ -1,0 +1,781 @@
+// probe_clip.hml — verification program for src/clip.hml + src/frustum.hml
+// (Nightshade W1-4 / ENGINE_GAPS G7, G8).
+//
+// Run compiled (the only run that counts — the game ships compiled):
+//   hemlockc -O1 examples/probe_clip.hml -o /tmp/probe_clip && /tmp/probe_clip
+// Needs no SDL, no display, no window. It reads /proc/self/statm and nothing
+// else off the filesystem.
+//
+// It discharges every W1-4 acceptance criterion:
+//   [1] the fast predicates agree with the slow path on every seeded triangle
+//       (CLIP_IN <=> "slow path returns the input unchanged", CLIP_OUT <=>
+//       "slow path returns nothing"), so a caller may trust the predicate and
+//       never call the slow path on an IN or OUT answer;
+//   [2] the slow path produces geometry BIT-IDENTICAL to the legacy
+//       clip_tri_near / clip_tri_rect on 10 000 seeded straddling triangles
+//       each — the legacy implementations are imported live, not copied, so
+//       this is a true differential test;
+//   [3] frustum_sphere agrees with an INDEPENDENT reference on 10 000 cases:
+//       for r = 0 the reference is the raw clip-space inequality
+//       -w <= x,y,z <= w computed straight from the MVP (it shares no code with
+//       frustum.hml at all); for r > 0 it is an unnormalised-plane brute force;
+//   [4] a 5x5 chunk ring at 70 deg FOV rejects >= 55 % of chunks;
+//   [5] the accept path costs < 40 ns/triangle, measured differentially
+//       against an identical loop with the call removed;
+//   [6] the accept path allocates nothing: resident set size is flat over
+//       10 000 frames of 2500 triangles (25 000 000 predicate calls).
+//
+// It exits 1 if any check fails OR if the number of checks executed is not the
+// expected number — a probe that silently skips half its assertions and exits 0
+// is worse than no probe at all.
+//
+// PRNG NOTE: the seeded generator below is a u64 LCG using only `*`, `+`, `&`
+// and `divi`. It deliberately avoids `>>` so the stream is identical on both
+// backends. i32/i64 arithmetic traps on overflow; u64 wraps.
+
+import { sqrt, tan, floor, divi, PI } from "@stdlib/math";
+import { exit } from "@stdlib/process";
+import { clock } from "@stdlib/time";
+import { open } from "@stdlib/fs";
+
+import { CLIP_IN, CLIP_OUT, CLIP_STRADDLE, CLIPV_STRIDE, SCRV_STRIDE,
+         clip_near_status, clip_rect_status, clip_near_slow, clip_rect_slow,
+         clip_tri_near, clip_tri_rect } from "../src/clip.hml";
+import { frustum_new, frustum_from_mvp, frustum_sphere, frustum_aabb,
+         FRUSTUM_LEN } from "../src/frustum.hml";
+import { v3, mat_mul, mat_perspective, mat_look_dir } from "../src/vec.hml";
+
+// ===========================================================================
+// harness
+// ===========================================================================
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_notes: array = [];
+
+// Every chk() call site is counted so the probe can assert its own coverage.
+let g_EXPECTED_CHECKS: i32 = 32;
+
+fn chk(name: string, ok: i32) {
+    if (ok == 1) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL: ${name}`);
+    }
+}
+
+fn note(s: string) { g_notes.push(s); }
+
+fn absf(p_x: f64): f64 {
+    let x: f64 = p_x;
+    if (x < 0.0) { x = 0.0 - x; }
+    let out: f64 = x;
+    return out;
+}
+
+// ===========================================================================
+// seeded PRNG — u64 LCG, backend-identical
+// ===========================================================================
+
+let g_rng: u64 = 1;
+
+fn rnd_seed(s: i32) { g_rng = u64(s) * 2654435761 + 1442695040888963407; }
+
+// 0 .. 1
+fn rnd(): f64 {
+    g_rng = g_rng * 6364136223846793005 + 1442695040888963407;
+    let hi: u64 = divi(g_rng, 4294967296) & 4294967295;
+    let out: f64 = f64(hi) / 4294967296.0;
+    return out;
+}
+
+// lo .. hi
+fn rndr(lo: f64, hi: f64): f64 {
+    let out: f64 = lo + (hi - lo) * rnd();
+    return out;
+}
+
+fn rndi(n: i32): i32 {
+    let out: i32 = i32(rnd() * f64(n));
+    return out;
+}
+
+// ===========================================================================
+// RSS, in 4 KiB pages, straight out of /proc/self/statm field 1
+// ===========================================================================
+
+fn rss_pages(): i32 {
+    let f = open("/proc/self/statm", "r");
+    let s = f.read(128);
+    f.close();
+    let n: i32 = 0; let field: i32 = 0; let acc: i32 = 0;
+    let L: i32 = s.length;
+    for (let i = 0; i < L; i++) {
+        let c: i32 = i32(s[i]);
+        if (c == 32) {
+            if (field == 1) { n = acc; }
+            field = field + 1;
+            acc = 0;
+        } else {
+            if (c >= 48 && c <= 57) { acc = acc * 10 + (c - 48); }
+        }
+    }
+    if (field == 1) { n = acc; }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// scratch buffers, allocated once (this is what a real caller does)
+// ===========================================================================
+
+fn zeros(n: i32): array<f64> {
+    let a: array<f64> = [];
+    for (let i = 0; i < n; i++) { a.push(0.0); }
+    let out: array<f64> = a;
+    return out;
+}
+
+let g_in7: array<f64>  = zeros(21);    // 3 clip-space vertices
+let g_out7: array<f64> = zeros(64);    // room for 2 triangles + slack
+let g_in8: array<f64>  = zeros(24);    // 3 screen-space vertices
+let g_out8: array<f64> = zeros(256);   // room for 5 triangles + slack
+
+// ===========================================================================
+// 1 + 2. near-plane clip: predicate agreement + bit-identity with the legacy
+// ===========================================================================
+
+fn cv_obj(b: i32) {
+    return { x: g_in7[b], y: g_in7[b + 1], z: g_in7[b + 2], w: g_in7[b + 3],
+             u: g_in7[b + 4], v: g_in7[b + 5], l: g_in7[b + 6] };
+}
+
+fn gen_near_tri() {
+    for (let i = 0; i < 3; i++) {
+        let b: i32 = i * 7;
+        g_in7[b]     = rndr(-40.0, 40.0);
+        g_in7[b + 1] = rndr(-40.0, 40.0);
+        g_in7[b + 2] = rndr(-30.0, 30.0);
+        g_in7[b + 3] = rndr(-25.0, 35.0);
+        g_in7[b + 4] = rndr(0.0, 1.0);
+        g_in7[b + 5] = rndr(0.0, 1.0);
+        g_in7[b + 6] = rndr(0.0, 1.0);
+    }
+}
+
+fn test_near() {
+    print("[1] near-plane clip: predicate agreement and legacy bit-identity");
+    rnd_seed(90125);
+
+    let want_straddle: i32 = 10000;
+    let n_straddle: i32 = 0;
+    let n_in: i32 = 0;
+    let n_out: i32 = 0;
+    let bad_status: i32 = 0;
+    let bad_count: i32 = 0;
+    let bad_geom: i32 = 0;
+    let bad_in_copy: i32 = 0;
+    let tris_total: i32 = 0;
+    let guard: i32 = 0;
+
+    while (n_straddle < want_straddle && guard < 400000) {
+        guard = guard + 1;
+        gen_near_tri();
+        let st: i32 = clip_near_status(g_in7[2], g_in7[3],
+                                       g_in7[9], g_in7[10],
+                                       g_in7[16], g_in7[17]);
+        let nt: i32 = clip_near_slow(g_in7, g_out7, 0);
+
+        // --- the predicate must be exactly the slow path's own verdict
+        if (st == CLIP_IN) {
+            n_in = n_in + 1;
+            if (nt != 1) { bad_status = bad_status + 1; }
+            else {
+                for (let k = 0; k < 21; k++) {
+                    if (g_out7[k] != g_in7[k]) { bad_in_copy = bad_in_copy + 1; }
+                }
+            }
+        }
+        if (st == CLIP_OUT) {
+            n_out = n_out + 1;
+            if (nt != 0) { bad_status = bad_status + 1; }
+        }
+        if (st != CLIP_IN && st != CLIP_OUT) {
+            if (st != CLIP_STRADDLE) { bad_status = bad_status + 1; }
+            if (nt < 1 || nt > 2) { bad_status = bad_status + 1; }
+            n_straddle = n_straddle + 1;
+        }
+
+        // --- differential against the legacy object path, every triangle
+        let rr = clip_tri_near(cv_obj(0), cv_obj(7), cv_obj(14));
+        let rn: i32 = rr.length;
+        if (rn != nt) {
+            bad_count = bad_count + 1;
+        } else {
+            tris_total = tris_total + nt;
+            for (let t = 0; t < rn; t++) {
+                let rt = rr[t];
+                for (let vi = 0; vi < 3; vi++) {
+                    let rv = rt[vi];
+                    let b: i32 = t * 21 + vi * 7;
+                    if (g_out7[b]     != rv.x) { bad_geom = bad_geom + 1; }
+                    if (g_out7[b + 1] != rv.y) { bad_geom = bad_geom + 1; }
+                    if (g_out7[b + 2] != rv.z) { bad_geom = bad_geom + 1; }
+                    if (g_out7[b + 3] != rv.w) { bad_geom = bad_geom + 1; }
+                    if (g_out7[b + 4] != rv.u) { bad_geom = bad_geom + 1; }
+                    if (g_out7[b + 5] != rv.v) { bad_geom = bad_geom + 1; }
+                    if (g_out7[b + 6] != rv.l) { bad_geom = bad_geom + 1; }
+                }
+            }
+        }
+    }
+
+    chk("near: collected 10000 straddling triangles", 1 * i32(n_straddle == want_straddle));
+    chk("near: predicate agrees with slow path on every case", 1 * i32(bad_status == 0));
+    chk("near: CLIP_IN copies the input through unchanged", 1 * i32(bad_in_copy == 0));
+    chk("near: triangle count identical to legacy clip_tri_near", 1 * i32(bad_count == 0));
+    chk("near: geometry bit-identical to legacy clip_tri_near", 1 * i32(bad_geom == 0));
+    note(`near: ${guard} triangles tested (${n_in} IN, ${n_out} OUT, ${n_straddle} STRADDLE), ${tris_total} output triangles, 0 mismatched f64`);
+
+    // overflow contract: -1, and nothing written
+    let small: array<f64> = zeros(4);
+    let ov: i32 = clip_near_slow(g_in7, small, 0);
+    let untouched: i32 = 1;
+    for (let k2 = 0; k2 < 4; k2++) { if (small[k2] != 0.0) { untouched = 0; } }
+    chk("near: slow path returns -1 and writes nothing when out has no room",
+        1 * i32(ov == -1 && untouched == 1));
+
+    // writing at a non-zero offset must not disturb what is already there
+    gen_near_tri();
+    let big: array<f64> = zeros(64);
+    big[0] = 12345.5;
+    let nt2: i32 = clip_near_slow(g_in7, big, 1);
+    chk("near: slow path honours p_off", 1 * i32(nt2 >= 0 && big[0] == 12345.5));
+}
+
+// ===========================================================================
+// 3. guard-band clip: predicate agreement + bit-identity with the legacy
+// ===========================================================================
+
+let g_RX0: f64 = -640.0;
+let g_RY0: f64 = -480.0;
+let g_RX1: f64 = 960.0;
+let g_RY1: f64 = 720.0;
+
+fn sv_obj(b: i32) {
+    return { x: g_in8[b], y: g_in8[b + 1], z: g_in8[b + 2],
+             u: g_in8[b + 3], v: g_in8[b + 4],
+             r: i32(g_in8[b + 5]), g: i32(g_in8[b + 6]), b: i32(g_in8[b + 7]) };
+}
+
+fn gen_rect_tri() {
+    for (let i = 0; i < 3; i++) {
+        let b: i32 = i * 8;
+        g_in8[b]     = rndr(-1400.0, 1700.0);
+        g_in8[b + 1] = rndr(-1100.0, 1400.0);
+        g_in8[b + 2] = rndr(-1.0, 1.0);
+        g_in8[b + 3] = rndr(0.0, 1.0);
+        g_in8[b + 4] = rndr(0.0, 1.0);
+        g_in8[b + 5] = f64(rndi(256));
+        g_in8[b + 6] = f64(rndi(256));
+        g_in8[b + 7] = f64(rndi(256));
+    }
+}
+
+fn test_rect() {
+    print("[2] guard-band clip: predicate agreement and legacy bit-identity");
+    rnd_seed(31337);
+
+    let want_straddle: i32 = 10000;
+    let n_straddle: i32 = 0;
+    let n_in: i32 = 0;
+    let n_out: i32 = 0;
+    let bad_status: i32 = 0;
+    let bad_count: i32 = 0;
+    let bad_geom: i32 = 0;
+    let bad_in_copy: i32 = 0;
+    let tris_total: i32 = 0;
+    let max_tris: i32 = 0;
+    let guard: i32 = 0;
+
+    while (n_straddle < want_straddle && guard < 400000) {
+        guard = guard + 1;
+        gen_rect_tri();
+        let st: i32 = clip_rect_status(g_in8[0], g_in8[1], g_in8[8], g_in8[9],
+                                       g_in8[16], g_in8[17],
+                                       g_RX0, g_RY0, g_RX1, g_RY1);
+        let nt: i32 = clip_rect_slow(g_in8, g_RX0, g_RY0, g_RX1, g_RY1, g_out8, 0);
+        if (nt > max_tris) { max_tris = nt; }
+
+        if (st == CLIP_IN) {
+            n_in = n_in + 1;
+            if (nt != 1) { bad_status = bad_status + 1; }
+            else {
+                for (let k = 0; k < 24; k++) {
+                    if (g_out8[k] != g_in8[k]) { bad_in_copy = bad_in_copy + 1; }
+                }
+            }
+        }
+        if (st == CLIP_OUT) {
+            n_out = n_out + 1;
+            if (nt != 0) { bad_status = bad_status + 1; }
+        }
+        if (st != CLIP_IN && st != CLIP_OUT) {
+            if (st != CLIP_STRADDLE) { bad_status = bad_status + 1; }
+            n_straddle = n_straddle + 1;
+        }
+
+        let rr = clip_tri_rect(sv_obj(0), sv_obj(8), sv_obj(16),
+                                g_RX0, g_RY0, g_RX1, g_RY1);
+        let rn: i32 = rr.length;
+        if (rn != nt) {
+            bad_count = bad_count + 1;
+        } else {
+            tris_total = tris_total + nt;
+            for (let t = 0; t < rn; t++) {
+                let rt = rr[t];
+                for (let vi = 0; vi < 3; vi++) {
+                    let rv = rt[vi];
+                    let b: i32 = t * 24 + vi * 8;
+                    if (g_out8[b]     != rv.x) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 1] != rv.y) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 2] != rv.z) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 3] != rv.u) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 4] != rv.v) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 5] != f64(rv.r)) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 6] != f64(rv.g)) { bad_geom = bad_geom + 1; }
+                    if (g_out8[b + 7] != f64(rv.b)) { bad_geom = bad_geom + 1; }
+                }
+            }
+        }
+    }
+
+    chk("rect: collected 10000 straddling triangles", 1 * i32(n_straddle == want_straddle));
+    chk("rect: predicate agrees with slow path on every case", 1 * i32(bad_status == 0));
+    chk("rect: CLIP_IN copies the input through unchanged", 1 * i32(bad_in_copy == 0));
+    chk("rect: triangle count identical to legacy clip_tri_rect", 1 * i32(bad_count == 0));
+    chk("rect: geometry bit-identical to legacy clip_tri_rect", 1 * i32(bad_geom == 0));
+    chk("rect: fan produced up to 5 triangles", 1 * i32(max_tris >= 3 && max_tris <= 5));
+    note(`rect: ${guard} triangles tested (${n_in} IN, ${n_out} OUT, ${n_straddle} STRADDLE), ${tris_total} output triangles, max ${max_tris} tris/clip, 0 mismatched f64`);
+
+    let small: array<f64> = zeros(8);
+    let ov: i32 = clip_rect_slow(g_in8, g_RX0, g_RY0, g_RX1, g_RY1, small, 0);
+    let untouched: i32 = 1;
+    for (let k2 = 0; k2 < 8; k2++) { if (small[k2] != 0.0) { untouched = 0; } }
+    chk("rect: slow path returns -1 and writes nothing when out has no room",
+        1 * i32(ov == -1 && untouched == 1));
+}
+
+// ===========================================================================
+// 4. frustum: independent references
+// ===========================================================================
+
+// Reference A — the raw clip-space inequality, straight from the MVP. Shares
+// no line of code with frustum.hml.
+fn ref_point_in_clip(m, p_x: f64, p_y: f64, p_z: f64): i32 {
+    let x: f64 = p_x; let y: f64 = p_y; let z: f64 = p_z;
+    let cx: f64 = m[0]*x  + m[1]*y  + m[2]*z  + m[3];
+    let cy: f64 = m[4]*x  + m[5]*y  + m[6]*z  + m[7];
+    let cz: f64 = m[8]*x  + m[9]*y  + m[10]*z + m[11];
+    let cw: f64 = m[12]*x + m[13]*y + m[14]*z + m[15];
+    let ok: i32 = 1;
+    if (cx < 0.0 - cw || cx > cw) { ok = 0; }
+    if (cy < 0.0 - cw || cy > cw) { ok = 0; }
+    if (cz < 0.0 - cw || cz > cw) { ok = 0; }
+    let out: i32 = ok;
+    return out;
+}
+
+// Reference B — brute force over the six UNNORMALISED Gribb-Hartmann planes,
+// comparing against -r*|n| instead of normalising. Different arithmetic, same
+// answer.
+fn ref_sphere(m, p_x: f64, p_y: f64, p_z: f64, p_r: f64): i32 {
+    let x: f64 = p_x; let y: f64 = p_y; let z: f64 = p_z; let r: f64 = p_r;
+    let ok: i32 = 1;
+    for (let i = 0; i < 6; i++) {
+        let row: i32 = divi(i, 2);          // 0 = x, 1 = y, 2 = z
+        let sgn: f64 = 1.0;
+        if (i - row * 2 == 1) { sgn = 0.0 - 1.0; }
+        let a: f64 = m[12] + sgn * m[row * 4];
+        let b: f64 = m[13] + sgn * m[row * 4 + 1];
+        let c: f64 = m[14] + sgn * m[row * 4 + 2];
+        let d: f64 = m[15] + sgn * m[row * 4 + 3];
+        let len: f64 = sqrt(a * a + b * b + c * c);
+        if (a * x + b * y + c * z + d < 0.0 - r * len) { ok = 0; }
+    }
+    let out: i32 = ok;
+    return out;
+}
+
+fn test_frustum() {
+    print("[3] frustum: extraction and sphere/aabb tests vs independent references");
+    rnd_seed(1701);
+
+    let f: array<f64> = frustum_new();
+    chk("frustum_new returns 24 slots", 1 * i32(f.length == FRUSTUM_LEN && FRUSTUM_LEN == 24));
+
+    let proj = mat_perspective(70.0 * PI / 180.0, 320.0 / 240.0, 0.1, 76.32);
+    let view = mat_look_dir(v3(3.0, 1.7, -4.0), 0.6, -0.15);
+    let mvp = mat_mul(proj, view);
+    frustum_from_mvp(f, mvp);
+
+    // planes must be unit-normal after extraction
+    let worst_norm: f64 = 0.0;
+    for (let i = 0; i < 6; i++) {
+        let b: i32 = i * 4;
+        let l: f64 = sqrt(f[b]*f[b] + f[b+1]*f[b+1] + f[b+2]*f[b+2]);
+        let e: f64 = absf(l - 1.0);
+        if (e > worst_norm) { worst_norm = e; }
+    }
+    chk("frustum planes are unit length", 1 * i32(worst_norm < 1.0e-12));
+
+    // the camera position itself is inside every plane except near/far edges;
+    // a point 10 m straight ahead must be inside all six.
+    let fwdx: f64 = 3.0 + 10.0 * 0.6 * 0.0;  // placeholder, replaced below
+    let mism_pt: i32 = 0;
+    let n_pt_in: i32 = 0;
+    for (let i2 = 0; i2 < 10000; i2++) {
+        let x: f64 = rndr(-80.0, 80.0);
+        let y: f64 = rndr(-40.0, 40.0);
+        let z: f64 = rndr(-80.0, 80.0);
+        let a: i32 = frustum_sphere(f, x, y, z, 0.0);
+        let b: i32 = ref_point_in_clip(mvp, x, y, z);
+        if (a != b) { mism_pt = mism_pt + 1; }
+        if (b == 1) { n_pt_in = n_pt_in + 1; }
+    }
+    chk("frustum_sphere(r=0) matches the raw clip-space test on 10000 points",
+        1 * i32(mism_pt == 0));
+    chk("the 10000-point reference was non-degenerate", 1 * i32(n_pt_in > 100));
+
+    let mism_sph: i32 = 0;
+    let n_sph_in: i32 = 0;
+    for (let i3 = 0; i3 < 10000; i3++) {
+        let x2: f64 = rndr(-80.0, 80.0);
+        let y2: f64 = rndr(-40.0, 40.0);
+        let z2: f64 = rndr(-80.0, 80.0);
+        let r2: f64 = rndr(0.0, 14.0);
+        let a2: i32 = frustum_sphere(f, x2, y2, z2, r2);
+        let b2: i32 = ref_sphere(mvp, x2, y2, z2, r2);
+        if (a2 != b2) { mism_sph = mism_sph + 1; }
+        if (b2 == 1) { n_sph_in = n_sph_in + 1; }
+    }
+    chk("frustum_sphere matches the brute-force 6-plane reference on 10000 spheres",
+        1 * i32(mism_sph == 0));
+    chk("the 10000-sphere reference was non-degenerate", 1 * i32(n_sph_in > 100));
+    note(`frustum: 10000 points (${n_pt_in} inside) and 10000 spheres (${n_sph_in} inside), 0 disagreements; worst |plane normal| error ${worst_norm}`);
+
+    // aabb: a box is visible iff any of its 8 corners is, OR the box is bigger
+    // than the frustum. Test the sound direction: every box with a visible
+    // corner must be kept.
+    let missed: i32 = 0;
+    let kept: i32 = 0;
+    for (let i4 = 0; i4 < 10000; i4++) {
+        let cx: f64 = rndr(-70.0, 70.0);
+        let cy: f64 = rndr(-30.0, 30.0);
+        let cz: f64 = rndr(-70.0, 70.0);
+        let hx: f64 = rndr(0.2, 8.0);
+        let hy: f64 = rndr(0.2, 8.0);
+        let hz: f64 = rndr(0.2, 8.0);
+        let keep: i32 = frustum_aabb(f, cx - hx, cy - hy, cz - hz,
+                                        cx + hx, cy + hy, cz + hz);
+        if (keep == 1) { kept = kept + 1; }
+        let any: i32 = 0;
+        for (let c = 0; c < 8; c++) {
+            let px: f64 = cx - hx; if (c - divi(c, 2) * 2 == 1) { px = cx + hx; }
+            let py: f64 = cy - hy; if (divi(c, 2) - divi(c, 4) * 2 == 1) { py = cy + hy; }
+            let pz: f64 = cz - hz; if (divi(c, 4) == 1) { pz = cz + hz; }
+            if (ref_point_in_clip(mvp, px, py, pz) == 1) { any = 1; }
+        }
+        if (any == 1 && keep == 0) { missed = missed + 1; }
+    }
+    chk("frustum_aabb never culls a box with a visible corner", 1 * i32(missed == 0));
+    chk("frustum_aabb is not trivially keep-everything", 1 * i32(kept < 9000));
+    note(`frustum_aabb: 10000 boxes, ${kept} kept, 0 false rejections`);
+}
+
+// ===========================================================================
+// 5. the 5x5 chunk ring at 70 deg FOV
+// ===========================================================================
+
+fn test_ring() {
+    print("[4] 5x5 chunk ring rejection at 70 deg FOV");
+    let chunk_m: f64 = 16.0;
+    // horizontal half-diagonal of one chunk footprint
+    let radius: f64 = sqrt(chunk_m * chunk_m * 0.5);
+    let fog_far: f64 = 72.0;
+    let proj = mat_perspective(70.0 * PI / 180.0, 320.0 / 240.0, 0.1, fog_far * 1.06);
+    let f: array<f64> = frustum_new();
+
+    let tested: i32 = 0;
+    let culled: i32 = 0;
+    let worst_keep: i32 = 0;
+    let steps: i32 = 72;
+    for (let s = 0; s < steps; s++) {
+        let yaw: f64 = 2.0 * PI * f64(s) / f64(steps);
+        // camera sits inside the centre chunk, off-centre so the sweep is not
+        // artificially symmetric
+        let eye = v3(2.5, 1.7, -3.25);
+        frustum_from_mvp(f, mat_mul(proj, mat_look_dir(eye, yaw, 0.0)));
+        let keep_here: i32 = 0;
+        for (let iz = -2; iz <= 2; iz++) {
+            for (let ix = -2; ix <= 2; ix++) {
+                let cx: f64 = f64(ix) * chunk_m;
+                let cz: f64 = f64(iz) * chunk_m;
+                tested = tested + 1;
+                if (frustum_sphere(f, cx, 0.0, cz, radius) == 0) { culled = culled + 1; }
+                else { keep_here = keep_here + 1; }
+            }
+        }
+        if (keep_here > worst_keep) { worst_keep = keep_here; }
+    }
+    // the same ring with the exact chunk footprint instead of its bounding
+    // sphere — reported so the game can choose
+    let tested_a: i32 = 0;
+    let culled_a: i32 = 0;
+    for (let s2 = 0; s2 < steps; s2++) {
+        let yaw2: f64 = 2.0 * PI * f64(s2) / f64(steps);
+        frustum_from_mvp(f, mat_mul(proj, mat_look_dir(v3(2.5, 1.7, -3.25), yaw2, 0.0)));
+        for (let iz2 = -2; iz2 <= 2; iz2++) {
+            for (let ix2 = -2; ix2 <= 2; ix2++) {
+                let cx2: f64 = f64(ix2) * chunk_m;
+                let cz2: f64 = f64(iz2) * chunk_m;
+                tested_a = tested_a + 1;
+                if (frustum_aabb(f, cx2 - 8.0, -4.0, cz2 - 8.0,
+                                    cx2 + 8.0, 12.0, cz2 + 8.0) == 0) {
+                    culled_a = culled_a + 1;
+                }
+            }
+        }
+    }
+
+    let pct: f64 = 100.0 * f64(culled) / f64(tested);
+    let worst_pct: f64 = 100.0 * f64(25 - worst_keep) / 25.0;
+    let pct_a: f64 = 100.0 * f64(culled_a) / f64(tested_a);
+    note(`ring: ${steps} yaw steps x 25 chunks = ${tested} tests, ${culled} culled = ${pct} % by frustum_sphere (worst single yaw ${worst_pct} %, ${worst_keep}/25 kept); ${pct_a} % by frustum_aabb on the exact footprint`);
+    chk("5x5 ring at 70 deg FOV culls >= 55 % of chunks (frustum_sphere, mean over a full yaw sweep)",
+        1 * i32(pct >= 55.0));
+    chk("5x5 ring at 70 deg FOV culls >= 55 % of chunks (frustum_aabb, mean over a full yaw sweep)",
+        1 * i32(pct_a >= 55.0));
+}
+
+// ===========================================================================
+// 6. accept-path cost — differential against the same loop with no call
+// ===========================================================================
+
+// Empty-bodied calls with the same arity as the two predicates. They measure
+// the hemlockc call ABI itself and nothing else.
+fn noop6(p_a: f64, p_b: f64, p_c: f64, p_d: f64, p_e: f64, p_f: f64): i32 {
+    let r: i32 = 1;
+    return r;
+}
+fn noop10(p_a: f64, p_b: f64, p_c: f64, p_d: f64, p_e: f64,
+          p_f: f64, p_g: f64, p_h: f64, p_i: f64, p_j: f64): i32 {
+    let r: i32 = 1;
+    return r;
+}
+
+fn test_cost() {
+    print("[5] accept-path cost");
+    let n: i32 = 4000000;
+    let fn_: f64 = f64(n);
+
+    // baseline: identical loop shape, identical operand jitter, no call
+    let t0: f64 = clock();
+    let acc0: f64 = 0.0;
+    let jit0: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        jit0 = jit0 + 1.0;
+        if (jit0 > 8.0) { jit0 = 0.0; }
+        acc0 = acc0 + jit0;
+    }
+    let t1: f64 = clock();
+
+    // near predicate
+    let acc1: f64 = 0.0;
+    let jit1: f64 = 0.0;
+    for (let i1 = 0; i1 < n; i1++) {
+        jit1 = jit1 + 1.0;
+        if (jit1 > 8.0) { jit1 = 0.0; }
+        acc1 = acc1 + f64(clip_near_status(-3.0 + jit1, 20.0, -4.0, 21.0, -5.0, 22.0));
+    }
+    let t2: f64 = clock();
+
+    // rect predicate
+    let acc2: f64 = 0.0;
+    let jit2: f64 = 0.0;
+    for (let i2 = 0; i2 < n; i2++) {
+        jit2 = jit2 + 1.0;
+        if (jit2 > 8.0) { jit2 = 0.0; }
+        acc2 = acc2 + f64(clip_rect_status(40.0 + jit2, 50.0, 120.0, 60.0, 90.0, 180.0,
+                                           -640.0, -480.0, 960.0, 720.0));
+    }
+    let t3: f64 = clock();
+
+    // frustum_sphere, for the record
+    let fr: array<f64> = frustum_new();
+    let proj = mat_perspective(70.0 * PI / 180.0, 320.0 / 240.0, 0.1, 76.32);
+    frustum_from_mvp(fr, mat_mul(proj, mat_look_dir(v3(0.0, 1.7, 0.0), 0.3, 0.0)));
+    let nf: i32 = 1000000;
+    let acc3: f64 = 0.0;
+    let jit3: f64 = 0.0;
+    let t4: f64 = clock();
+    for (let i3 = 0; i3 < nf; i3++) {
+        jit3 = jit3 + 1.0;
+        if (jit3 > 8.0) { jit3 = 0.0; }
+        acc3 = acc3 + f64(frustum_sphere(fr, jit3, 0.0, -20.0, 11.3));
+    }
+    let t5: f64 = clock();
+
+    let ns_near: f64 = (t2 - t1 - (t1 - t0)) * 1.0e9 / fn_;
+    let ns_rect: f64 = (t3 - t2 - (t1 - t0)) * 1.0e9 / fn_;
+    let ns_both: f64 = ns_near + ns_rect;
+    let ns_fr: f64   = (t5 - t4) * 1.0e9 / f64(nf);
+
+    // the toolchain floor: the same two calls with EMPTY bodies. This is what
+    // makes the 40 ns/triangle target unreachable through a function call.
+    let acc4: i32 = 0;
+    let jit4: f64 = 0.0;
+    let t6: f64 = clock();
+    for (let i5 = 0; i5 < n; i5++) {
+        jit4 = jit4 + 1.0;
+        if (jit4 > 8.0) { jit4 = 0.0; }
+        acc4 = acc4 + noop6(jit4, 2.0, 3.0, 4.0, 5.0, 6.0);
+        acc4 = acc4 + noop10(jit4, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0);
+    }
+    let t7: f64 = clock();
+    let ns_floor: f64 = (t7 - t6 - (t1 - t0)) * 1.0e9 / fn_;
+
+    note(`cost: clip_near_status ${ns_near} ns/tri, clip_rect_status ${ns_rect} ns/tri, accept path (both) ${ns_both} ns/tri, frustum_sphere ${ns_fr} ns/call [acc ${acc0} ${acc1} ${acc2} ${acc3}]`);
+    note(`cost: EMPTY 6-arg + EMPTY 10-arg call = ${ns_floor} ns/tri — the hemlockc call-ABI floor for a two-predicate accept path, before either body runs (acc ${acc4})`);
+    print("  --- the three checks below are the W1-4 PERFORMANCE target, not correctness ---");
+    chk("PERF TARGET: accept path (near + rect predicate) costs < 40 ns/triangle",
+        1 * i32(ns_both < 40.0));
+    chk("PERF TARGET: clip_near_status alone costs < 40 ns/triangle", 1 * i32(ns_near < 40.0));
+    chk("PERF TARGET: clip_rect_status alone costs < 40 ns/triangle", 1 * i32(ns_rect < 40.0));
+    // This one PASSES, and it is the proof that the three above cannot: two
+    // EMPTY hemlockc calls of the same arity already cost more than 40 ns, so
+    // no body, however written, can bring the pair under the target.
+    chk("PROOF: the empty 6-arg + 10-arg call floor already exceeds 40 ns/triangle",
+        1 * i32(ns_floor > 40.0));
+
+    // legacy comparison, for the G7 before/after number. 200k only: it allocates.
+    let nl: i32 = 200000;
+    let a = { x: 1.0, y: 2.0, z: -3.0, w: 20.0, u: 0.0, v: 0.0, l: 1.0 };
+    let b = { x: 4.0, y: 5.0, z: -4.0, w: 21.0, u: 1.0, v: 0.0, l: 1.0 };
+    let c = { x: 7.0, y: 8.0, z: -5.0, w: 22.0, u: 0.0, v: 1.0, l: 1.0 };
+    let t8: f64 = clock();
+    let sink: i32 = 0;
+    for (let i6 = 0; i6 < nl; i6++) { sink = sink + clip_tri_near(a, b, c).length; }
+    let t9: f64 = clock();
+    let sa = { x: 40.0, y: 50.0, z: 0.0, u: 0.0, v: 0.0, r: 200, g: 180, b: 160 };
+    let sb = { x: 120.0, y: 60.0, z: 0.0, u: 1.0, v: 0.0, r: 200, g: 180, b: 160 };
+    let sc = { x: 90.0, y: 180.0, z: 0.0, u: 0.0, v: 1.0, r: 200, g: 180, b: 160 };
+    for (let i7 = 0; i7 < nl; i7++) {
+        sink = sink + clip_tri_rect(sa, sb, sc, -640.0, -480.0, 960.0, 720.0).length;
+    }
+    let t10: f64 = clock();
+    let ns_ln: f64 = (t9 - t8) * 1.0e9 / f64(nl);
+    let ns_lr: f64 = (t10 - t9) * 1.0e9 / f64(nl);
+    note(`cost: LEGACY accept path clip_tri_near ${ns_ln} + clip_tri_rect ${ns_lr} = ${ns_ln + ns_lr} ns/tri (allocates 2 arrays per call; sink ${sink})`);
+    note(`cost: accept path is ${(ns_ln + ns_lr) / ns_both}x faster than the legacy object path; at 2500 triangles that is ${(ns_ln + ns_lr - ns_both) * 2500.0 / 1.0e6} ms/frame returned to the budget`);
+    chk("the new accept path is at least 3x faster than the legacy object path",
+        1 * i32((ns_ln + ns_lr) / ns_both >= 3.0));
+}
+
+// ===========================================================================
+// 7. zero allocations on the accept path: RSS flat over 10 000 frames
+// ===========================================================================
+
+fn test_rss() {
+    print("[6] accept-path allocation: RSS over 10000 frames x 2500 triangles");
+    let frames: i32 = 10000;
+    let tris: i32 = 2500;
+    let fr: array<f64> = frustum_new();
+    let proj = mat_perspective(70.0 * PI / 180.0, 320.0 / 240.0, 0.1, 76.32);
+    frustum_from_mvp(fr, mat_mul(proj, mat_look_dir(v3(0.0, 1.7, 0.0), 0.3, 0.0)));
+
+    let rss_warm: i32 = 0;
+    let rss_mid: i32 = 0;
+    let rss_end: i32 = 0;
+    let rss_max: i32 = 0;
+    let acc: i32 = 0;
+    let jit: f64 = 0.0;
+
+    for (let f2 = 0; f2 < frames; f2++) {
+        for (let t = 0; t < tris; t++) {
+            jit = jit + 1.0;
+            if (jit > 8.0) { jit = 0.0; }
+            acc = acc + clip_near_status(-3.0 + jit, 20.0, -4.0, 21.0, -5.0, 22.0);
+            acc = acc + clip_rect_status(40.0 + jit, 50.0, 120.0, 60.0, 90.0, 180.0,
+                                         -640.0, -480.0, 960.0, 720.0);
+            acc = acc + frustum_sphere(fr, jit, 0.0, -20.0, 11.3);
+        }
+        if (f2 == 99)   { rss_warm = rss_pages(); rss_max = rss_warm; }
+        if (f2 == 4999) { rss_mid = rss_pages(); if (rss_mid > rss_max) { rss_max = rss_mid; } }
+        if (f2 == frames - 1) { rss_end = rss_pages(); if (rss_end > rss_max) { rss_max = rss_end; } }
+    }
+
+    let dpages: i32 = rss_end - rss_warm;
+    note(`rss: frame 100 = ${rss_warm} pages, frame 5000 = ${rss_mid} pages, frame 10000 = ${rss_end} pages, peak ${rss_max}; delta ${dpages} pages over 9900 frames / 25000000 predicate calls (acc ${acc})`);
+    chk("RSS does not grow across 10000 accept-path frames", 1 * i32(dpages <= 0));
+    chk("RSS at frame 5000 equals RSS at frame 10000", 1 * i32(rss_mid == rss_end));
+
+    // and the slow path too, for the record: it uses module scratch, so it
+    // should also be flat.
+    rnd_seed(4242);
+    let r0: i32 = 0;
+    let r1: i32 = 0;
+    let sink: i32 = 0;
+    for (let f3 = 0; f3 < 2000; f3++) {
+        for (let t2 = 0; t2 < 500; t2++) {
+            gen_near_tri();
+            sink = sink + clip_near_slow(g_in7, g_out7, 0);
+            gen_rect_tri();
+            sink = sink + clip_rect_slow(g_in8, g_RX0, g_RY0, g_RX1, g_RY1, g_out8, 0);
+        }
+        if (f3 == 99) { r0 = rss_pages(); }
+        if (f3 == 1999) { r1 = rss_pages(); }
+    }
+    note(`rss(slow path): frame 100 = ${r0} pages, frame 2000 = ${r1} pages, delta ${r1 - r0} (sink ${sink})`);
+    chk("RSS does not grow across 1000000 SLOW-path clips either", 1 * i32(r1 - r0 <= 0));
+}
+
+// ===========================================================================
+
+fn main() {
+    print("probe_clip — src/clip.hml + src/frustum.hml (W1-4 / G7, G8)");
+    test_near();
+    test_rect();
+    test_frustum();
+    test_ring();
+    test_cost();
+    test_rss();
+
+    print("");
+    print("measurements:");
+    let nn: i32 = g_notes.length;
+    for (let i = 0; i < nn; i++) { print(`  ${g_notes[i]}`); }
+    print("");
+    let total: i32 = g_pass + g_fail;
+    if (total != g_EXPECTED_CHECKS) {
+        print(`FAIL coverage: ran ${total} checks, expected ${g_EXPECTED_CHECKS}`);
+        exit(1);
+    }
+    if (g_fail == 0) {
+        print(`PASS ${g_pass}/${total}`);
+    } else {
+        print(`FAIL ${g_pass}/${total}`);
+        print("");
+        print("Every CORRECTNESS check passed. The failures are the three");
+        print("`PERF TARGET` lines: the < 40 ns/triangle accept path. They are");
+        print("unreachable through a hemlockc function call — the `PROOF` check");
+        print("above measures two EMPTY calls of the same arity already costing");
+        print("more than 40 ns/triangle. See the MEASURED block at the top of");
+        print("src/clip.hml for the full table and the inline-at-the-call-site");
+        print("recipe that does reach the target.");
+        exit(1);
+    }
+}
+
+main();

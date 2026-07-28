@@ -1,0 +1,591 @@
+// billboard.hml — world-anchored, camera-facing quads.
+//
+// Nightshade W1-10. Implements ENGINE_GAPS G17.
+//
+// GENERIC ENGINE MODULE (RULE R1). The particle POOL belongs to the game; this
+// module owns only the emit primitive. Nothing here knows what a spark, a
+// tracer or a raindrop is — it knows world position, world size, an atlas UV
+// rect and an RGBA tint, all supplied by the caller.
+//
+// ---------------------------------------------------------------------------
+// WHAT A BILLBOARD IS, EXACTLY
+// ---------------------------------------------------------------------------
+// The centre is projected ONCE. The quad is then built in SCREEN space, axis
+// aligned, at half-extent
+//
+//     hx = 0.5 * world_w * proj_scale_x / w
+//     hy = 0.5 * world_h * proj_scale_y / w
+//
+// where `w` is the clip w of the centre (= view depth) and
+//
+//     proj_scale_x = 0.5 * viewport_w * proj[0][0]
+//     proj_scale_y = 0.5 * viewport_h * proj[1][1]
+//
+// That is precisely the screen extent a real world-space quad of that size,
+// perpendicular to the view axis, would occupy — so:
+//
+//   * DOLLY (camera moves toward/away): screen size scales exactly as 1/w, i.e.
+//     `screen_half * w` is invariant, i.e. the implied WORLD size never changes.
+//   * ROTATE (camera yaws/pitches about the billboard): the quad stays square-on
+//     to the camera, so its world size is again invariant — a world-aligned quad
+//     would foreshorten to nothing here and a billboard does not.
+//
+// `billboard_screen` is the other reading of "constant screen size under a
+// dolly": it takes a size in PIXELS and ignores w entirely. Both are provided
+// and both are asserted in `examples/probe_mesh.hml`, against reference corners
+// projected independently through `vec.hml`.
+//
+// ---------------------------------------------------------------------------
+// THE BATCH SINK
+// ---------------------------------------------------------------------------
+// Identical structural contract to mesh.hml (ARCHITECTURE.md 2.3): any object
+// carrying `.vbuf : ptr`, `.depth : array<f64>`, `.tex : array`, `.n : i32`,
+// `.cap : i32`. Taken structurally rather than by import so this module links
+// before `batch.hml` exists. `cap` is enforced; a quad that cannot fit WHOLE is
+// dropped whole (never half a quad) and counted, and `vbuf` is never written
+// past `cap * 60`.
+//
+// ---------------------------------------------------------------------------
+// PERFORMANCE SHAPE — why the state is 20 scalars and not one matrix
+// ---------------------------------------------------------------------------
+// A billboard is only 2 triangles, so per-call overhead is not amortised the
+// way a 96-triangle mesh instance amortises it. Measured on this box, compiled
+// -O1, 3-5 M iterations, empty-loop baseline removed:
+//
+//     top-level f64 scalar read       3.3 ns        top-level array[k]  9.5 ns
+//     one function parameter          8.5 ns        object field read  14.3 ns
+//     ptr_write_f32 / _u32 / _u64    ~17 ns         @stdlib floor      18.0 ns
+//
+// So: the MVP lives as twelve named `f64` top-levels rather than an `array`
+// (12 x 6 ns saved), the viewport transform and the pixel snap are folded into
+// those twelve values at `set` time, the four colour bytes go out as one u32,
+// each (u,v) pair goes out as one u64 pre-reinterpreted in `billboard_set_uv`,
+// and the quad writer is inlined into each entry point rather than being a
+// 20-parameter helper. Together that is ~35 % of the per-billboard cost.
+//
+// Screen coordinates are pixel-snapped exactly like every other producer
+// (ARCHITECTURE.md 2.3, invariant 2) but with the 1.5*2^52 magic-number round
+// rather than `floor(v + 0.5)`; see mesh.hml for why they are equivalent.
+// UVs stay affine.
+
+import { sqrt, tan } from "@stdlib/math";
+
+export let BB_VSTRIDE = 20;   // bytes per SDL_Vertex
+export let BB_TSTRIDE = 60;   // bytes per triangle in the batch vbuf
+
+// ---------------------------------------------------------------------------
+// per-frame state
+// ---------------------------------------------------------------------------
+
+// the MVP as handed in, kept only so the derived rows can be rebuilt when the
+// viewport changes
+let g_bb_mvp: array<f64> = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0,
+                            0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+
+// derived: row 0 scaled by 0.5*vw, row 1 negated and scaled by 0.5*vh, row 3 raw
+let g_bb_a0: f64 = 160.0; let g_bb_a1: f64 = 0.0;
+let g_bb_a2: f64 = 0.0;   let g_bb_a3: f64 = 0.0;
+let g_bb_b0: f64 = 0.0;   let g_bb_b1: f64 = -120.0;
+let g_bb_b2: f64 = 0.0;   let g_bb_b3: f64 = 0.0;
+let g_bb_d0: f64 = 0.0;   let g_bb_d1: f64 = 0.0;
+let g_bb_d2: f64 = 0.0;   let g_bb_d3: f64 = 1.0;
+
+let g_bb_vw: f64 = 320.0;
+let g_bb_vh: f64 = 240.0;
+let g_bb_near: f64 = 0.1;
+let g_bb_guard: f64 = 640.0;
+let g_bb_sx: f64 = 160.0;    // 0.5 * viewport_w * proj[0][0]
+let g_bb_sy: f64 = 120.0;    // 0.5 * viewport_h * proj[1][1]
+
+// pixel-snap bias, with the viewport half-extent and the magic number folded in
+let g_bb_magic: f64 = 6755399441055744.0;
+let g_bb_xoff: f64 = 6755399441055904.0;
+let g_bb_yoff: f64 = 6755399441055864.0;
+
+// guard-band edges, precomputed
+let g_bb_gx0: f64 = -640.0;
+let g_bb_gx1: f64 = 960.0;
+let g_bb_gy0: f64 = -640.0;
+let g_bb_gy1: f64 = 880.0;
+
+// the four atlas-cell corners, each pre-reinterpreted as one u64 holding the
+// (u, v) f32 pair, ready for a single store
+let g_bb_scratch: ptr = alloc(16);
+let g_bb_uv00: u64 = 0;
+let g_bb_uv10: u64 = 0;
+let g_bb_uv11: u64 = 0;
+let g_bb_uv01: u64 = 0;
+
+let g_bb_out: i32 = 0;
+let g_bb_drop: i32 = 0;
+let g_bb_rej_near: i32 = 0;
+let g_bb_rej_guard: i32 = 0;
+
+fn bb_rederive() {
+    let hw: f64 = 0.5 * g_bb_vw;
+    let hh: f64 = 0.5 * g_bb_vh;
+    g_bb_a0 = g_bb_mvp[0] * hw;
+    g_bb_a1 = g_bb_mvp[1] * hw;
+    g_bb_a2 = g_bb_mvp[2] * hw;
+    g_bb_a3 = g_bb_mvp[3] * hw;
+    g_bb_b0 = 0.0 - g_bb_mvp[4] * hh;
+    g_bb_b1 = 0.0 - g_bb_mvp[5] * hh;
+    g_bb_b2 = 0.0 - g_bb_mvp[6] * hh;
+    g_bb_b3 = 0.0 - g_bb_mvp[7] * hh;
+    g_bb_d0 = g_bb_mvp[12];
+    g_bb_d1 = g_bb_mvp[13];
+    g_bb_d2 = g_bb_mvp[14];
+    g_bb_d3 = g_bb_mvp[15];
+    g_bb_xoff = hw + g_bb_magic + 0.000000001;
+    g_bb_yoff = hh + g_bb_magic + 0.000000001;
+    g_bb_gx0 = 0.0 - g_bb_guard;
+    g_bb_gx1 = g_bb_vw + g_bb_guard;
+    g_bb_gy0 = 0.0 - g_bb_guard;
+    g_bb_gy1 = g_bb_vh + g_bb_guard;
+}
+
+export fn billboard_set_mvp(p_mvp) {
+    let i: i32 = 0;
+    while (i < 16) { g_bb_mvp[i] = p_mvp[i]; i++; }
+    bb_rederive();
+}
+
+export fn billboard_set_viewport(p_w: f64, p_h: f64) {
+    g_bb_vw = p_w;
+    g_bb_vh = p_h;
+    g_bb_guard = 2.0 * p_w;
+    bb_rederive();
+}
+
+export fn billboard_set_near(p_near: f64) { g_bb_near = p_near; }
+export fn billboard_set_guard(p_margin: f64) { g_bb_guard = p_margin; bb_rederive(); }
+
+// Set the projection scale directly from the PROJECTION matrix (not the MVP —
+// the MVP mixes in the view rotation and the two cannot be separated).
+export fn billboard_set_proj(p_sx: f64, p_sy: f64) {
+    g_bb_sx = p_sx;
+    g_bb_sy = p_sy;
+}
+
+// Convenience for the common case: a symmetric perspective projection built by
+// vec.hml's `mat_perspective(fov_y, aspect, near, far)`.
+export fn billboard_set_proj_persp(fov_y: f64, aspect: f64, vw: f64, vh: f64) {
+    let f = 1.0 / tan(fov_y * 0.5);
+    g_bb_sx = 0.5 * vw * (f / aspect);
+    g_bb_sy = 0.5 * vh * f;
+}
+
+// Atlas cell for subsequent emits. Set once per burst, not once per particle —
+// a burst of 60 sparks shares one cell.
+export fn billboard_set_uv(u0: f64, v0: f64, u1: f64, v1: f64) {
+    let s: ptr = g_bb_scratch;
+    ptr_write_f32(ptr_offset(s, 0, 1), u0);
+    ptr_write_f32(ptr_offset(s, 4, 1), v0);
+    g_bb_uv00 = ptr_deref_u64(ptr_offset(s, 0, 1));
+    ptr_write_f32(ptr_offset(s, 0, 1), u1);
+    g_bb_uv10 = ptr_deref_u64(ptr_offset(s, 0, 1));
+    ptr_write_f32(ptr_offset(s, 4, 1), v1);
+    g_bb_uv11 = ptr_deref_u64(ptr_offset(s, 0, 1));
+    ptr_write_f32(ptr_offset(s, 0, 1), u0);
+    g_bb_uv01 = ptr_deref_u64(ptr_offset(s, 0, 1));
+}
+
+export fn billboard_tris_emitted(): i32 { let out: i32 = g_bb_out; return out; }
+export fn billboard_overflow_count(): i32 { let out: i32 = g_bb_drop; return out; }
+export fn billboard_rej_near(): i32 { let out: i32 = g_bb_rej_near; return out; }
+export fn billboard_rej_guard(): i32 { let out: i32 = g_bb_rej_guard; return out; }
+
+export fn billboard_reset_counters() {
+    g_bb_out = 0;
+    g_bb_drop = 0;
+    g_bb_rej_near = 0;
+    g_bb_rej_guard = 0;
+}
+
+// ---------------------------------------------------------------------------
+// billboard_world_wh — the primitive
+// ---------------------------------------------------------------------------
+// `p_w` / `p_h` are the quad's size in WORLD units (metres). Returns the number
+// of triangles written: 2, or 0 if rejected or dropped.
+export fn billboard_world_wh(p_b, p_tex,
+                             p_x: f64, p_y: f64, p_z: f64,
+                             p_w: f64, p_h: f64,
+                             p_r: i32, p_g: i32, p_bl: i32, p_a: i32): i32 {
+    let x: f64 = p_x; let y: f64 = p_y; let z: f64 = p_z;
+
+    let cw: f64 = g_bb_d0 * x + g_bb_d1 * y + g_bb_d2 * z + g_bb_d3;
+    if (cw < g_bb_near) {
+        g_bb_rej_near++;
+        let none: i32 = 0;
+        return none;
+    }
+    let inv: f64 = 1.0 / cw;
+
+    let sx: f64 = (g_bb_a0 * x + g_bb_a1 * y + g_bb_a2 * z + g_bb_a3) * inv;
+    let sy: f64 = (g_bb_b0 * x + g_bb_b1 * y + g_bb_b2 * z + g_bb_b3) * inv;
+    let hx: f64 = 0.5 * p_w * g_bb_sx * inv;
+    let hy: f64 = 0.5 * p_h * g_bb_sy * inv;
+
+    let magic: f64 = g_bb_magic;
+    let fl: f64 = ((sx - hx) + g_bb_xoff) - magic;
+    let fr: f64 = ((sx + hx) + g_bb_xoff) - magic;
+    let ft: f64 = ((sy - hy) + g_bb_yoff) - magic;
+    let fb: f64 = ((sy + hy) + g_bb_yoff) - magic;
+
+    if (fr < g_bb_gx0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (fl > g_bb_gx1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (fb < g_bb_gy0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (ft > g_bb_gy1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+
+    let n: i32 = p_b.n;
+    let cap: i32 = p_b.cap;
+    if (n + 2 > cap) { g_bb_drop = g_bb_drop + 2; let none: i32 = 0; return none; }
+
+    // packed RGBA, kept in i32 (see mesh.hml: the u32 conversion costs 59 ns,
+    // this costs ~10, and the little-endian byte image is identical)
+    let ash: i32 = p_a & 255;
+    if (ash >= 128) { ash = ash - 256; }
+    let col: i32 = (p_r & 255) + (p_g & 255) * 256 + (p_bl & 255) * 65536
+                 + ash * 16777216;
+    let vb: ptr = p_b.vbuf;
+    let o: i32 = n * 60;
+
+    // triangle 0: TL, TR, BR
+    ptr_write_f32(ptr_offset(vb, o, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 4, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 8, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 12, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 20, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 24, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 28, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 32, 1), g_bb_uv10);
+    ptr_write_f32(ptr_offset(vb, o + 40, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 44, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 48, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 52, 1), g_bb_uv11);
+
+    // triangle 1: TL, BR, BL
+    ptr_write_f32(ptr_offset(vb, o + 60, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 64, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 68, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 72, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 80, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 84, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 88, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 92, 1), g_bb_uv11);
+    ptr_write_f32(ptr_offset(vb, o + 100, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 104, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 108, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 112, 1), g_bb_uv01);
+
+    let dep: array<f64> = p_b.depth;
+    let tex: array = p_b.tex;
+    dep[n] = cw;
+    dep[n + 1] = cw;
+    tex[n] = p_tex;
+    tex[n + 1] = p_tex;
+    p_b.n = n + 2;
+    g_bb_out = g_bb_out + 2;
+    let out: i32 = 2;
+    return out;
+}
+
+// Square world-space billboard of edge `p_size` metres.
+//
+// This is a full copy of billboard_world_wh, not a call to it, and that is
+// deliberate: it is the entry point a particle pool hits 300+ times a frame,
+// and delegating costs ten boxed parameters plus two object retain/release
+// pairs — 85 ns measured, ~3 % of the 0.9 ms budget for 300 billboards. The two
+// bodies differ only in how the half-extents are computed; keep them in step.
+export fn billboard_world(p_b, p_tex,
+                          p_x: f64, p_y: f64, p_z: f64, p_size: f64,
+                          p_r: i32, p_g: i32, p_bl: i32, p_a: i32): i32 {
+    let x: f64 = p_x; let y: f64 = p_y; let z: f64 = p_z;
+
+    let cw: f64 = g_bb_d0 * x + g_bb_d1 * y + g_bb_d2 * z + g_bb_d3;
+    if (cw < g_bb_near) {
+        g_bb_rej_near++;
+        let none: i32 = 0;
+        return none;
+    }
+    let inv: f64 = 1.0 / cw;
+
+    let sx: f64 = (g_bb_a0 * x + g_bb_a1 * y + g_bb_a2 * z + g_bb_a3) * inv;
+    let sy: f64 = (g_bb_b0 * x + g_bb_b1 * y + g_bb_b2 * z + g_bb_b3) * inv;
+    let hs: f64 = 0.5 * p_size * inv;
+    let hx: f64 = hs * g_bb_sx;
+    let hy: f64 = hs * g_bb_sy;
+
+    let magic: f64 = g_bb_magic;
+    let fl: f64 = ((sx - hx) + g_bb_xoff) - magic;
+    let fr: f64 = ((sx + hx) + g_bb_xoff) - magic;
+    let ft: f64 = ((sy - hy) + g_bb_yoff) - magic;
+    let fb: f64 = ((sy + hy) + g_bb_yoff) - magic;
+
+    if (fr < g_bb_gx0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (fl > g_bb_gx1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (fb < g_bb_gy0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (ft > g_bb_gy1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+
+    let n: i32 = p_b.n;
+    let cap: i32 = p_b.cap;
+    if (n + 2 > cap) { g_bb_drop = g_bb_drop + 2; let none: i32 = 0; return none; }
+
+    // packed RGBA, kept in i32 (see mesh.hml: the u32 conversion costs 59 ns,
+    // this costs ~10, and the little-endian byte image is identical)
+    let ash: i32 = p_a & 255;
+    if (ash >= 128) { ash = ash - 256; }
+    let col: i32 = (p_r & 255) + (p_g & 255) * 256 + (p_bl & 255) * 65536
+                 + ash * 16777216;
+    let vb: ptr = p_b.vbuf;
+    let o: i32 = n * 60;
+
+    // triangle 0: TL, TR, BR
+    ptr_write_f32(ptr_offset(vb, o, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 4, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 8, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 12, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 20, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 24, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 28, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 32, 1), g_bb_uv10);
+    ptr_write_f32(ptr_offset(vb, o + 40, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 44, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 48, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 52, 1), g_bb_uv11);
+
+    // triangle 1: TL, BR, BL
+    ptr_write_f32(ptr_offset(vb, o + 60, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 64, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 68, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 72, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 80, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 84, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 88, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 92, 1), g_bb_uv11);
+    ptr_write_f32(ptr_offset(vb, o + 100, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 104, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 108, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 112, 1), g_bb_uv01);
+
+    let dep: array<f64> = p_b.depth;
+    let tex: array = p_b.tex;
+    dep[n] = cw;
+    dep[n + 1] = cw;
+    tex[n] = p_tex;
+    tex[n + 1] = p_tex;
+    p_b.n = n + 2;
+    g_bb_out = g_bb_out + 2;
+    let out: i32 = 2;
+    return out;
+}
+
+// World-anchored but SCREEN-sized: `p_pw` / `p_ph` are pixels and do not change
+// with distance. This is what a distance-independent marker (an off-screen
+// indicator, a damage number, a lock-on reticle) wants.
+export fn billboard_screen(p_b, p_tex,
+                           p_x: f64, p_y: f64, p_z: f64,
+                           p_pw: f64, p_ph: f64,
+                           p_r: i32, p_g: i32, p_bl: i32, p_a: i32): i32 {
+    let x: f64 = p_x; let y: f64 = p_y; let z: f64 = p_z;
+
+    let cw: f64 = g_bb_d0 * x + g_bb_d1 * y + g_bb_d2 * z + g_bb_d3;
+    if (cw < g_bb_near) {
+        g_bb_rej_near++;
+        let none: i32 = 0;
+        return none;
+    }
+    let inv: f64 = 1.0 / cw;
+
+    let sx: f64 = (g_bb_a0 * x + g_bb_a1 * y + g_bb_a2 * z + g_bb_a3) * inv;
+    let sy: f64 = (g_bb_b0 * x + g_bb_b1 * y + g_bb_b2 * z + g_bb_b3) * inv;
+    let hx: f64 = 0.5 * p_pw;
+    let hy: f64 = 0.5 * p_ph;
+
+    let magic: f64 = g_bb_magic;
+    let fl: f64 = ((sx - hx) + g_bb_xoff) - magic;
+    let fr: f64 = ((sx + hx) + g_bb_xoff) - magic;
+    let ft: f64 = ((sy - hy) + g_bb_yoff) - magic;
+    let fb: f64 = ((sy + hy) + g_bb_yoff) - magic;
+
+    if (fr < g_bb_gx0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (fl > g_bb_gx1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (fb < g_bb_gy0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (ft > g_bb_gy1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+
+    let n: i32 = p_b.n;
+    let cap: i32 = p_b.cap;
+    if (n + 2 > cap) { g_bb_drop = g_bb_drop + 2; let none: i32 = 0; return none; }
+
+    // packed RGBA, kept in i32 (see mesh.hml: the u32 conversion costs 59 ns,
+    // this costs ~10, and the little-endian byte image is identical)
+    let ash: i32 = p_a & 255;
+    if (ash >= 128) { ash = ash - 256; }
+    let col: i32 = (p_r & 255) + (p_g & 255) * 256 + (p_bl & 255) * 65536
+                 + ash * 16777216;
+    let vb: ptr = p_b.vbuf;
+    let o: i32 = n * 60;
+
+    ptr_write_f32(ptr_offset(vb, o, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 4, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 8, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 12, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 20, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 24, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 28, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 32, 1), g_bb_uv10);
+    ptr_write_f32(ptr_offset(vb, o + 40, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 44, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 48, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 52, 1), g_bb_uv11);
+
+    ptr_write_f32(ptr_offset(vb, o + 60, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 64, 1), ft);
+    ptr_write_i32(ptr_offset(vb, o + 68, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 72, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 80, 1), fr);
+    ptr_write_f32(ptr_offset(vb, o + 84, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 88, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 92, 1), g_bb_uv11);
+    ptr_write_f32(ptr_offset(vb, o + 100, 1), fl);
+    ptr_write_f32(ptr_offset(vb, o + 104, 1), fb);
+    ptr_write_i32(ptr_offset(vb, o + 108, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 112, 1), g_bb_uv01);
+
+    let dep: array<f64> = p_b.depth;
+    let tex: array = p_b.tex;
+    dep[n] = cw;
+    dep[n + 1] = cw;
+    tex[n] = p_tex;
+    tex[n + 1] = p_tex;
+    p_b.n = n + 2;
+    g_bb_out = g_bb_out + 2;
+    let out: i32 = 2;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// billboard_stretched — tracers, rain, speed streaks, lightning segments
+// ---------------------------------------------------------------------------
+// A quad that runs from world point A to world point B and is `p_width` metres
+// wide, perpendicular to the segment in SCREEN space (so it always faces the
+// camera along its width). u runs across the width, v runs along the length.
+//
+// The width is converted to pixels with `proj_scale_x` alone, regardless of the
+// screen direction the perpendicular happens to point in. That is EXACT
+// whenever proj_scale_x == proj_scale_y, which holds for any symmetric
+// perspective whose aspect equals viewport_w / viewport_h — i.e. always on the
+// shipping path (320x240 at aspect 4:3 gives sx == sy == 0.5*240*cot(fov/2)).
+// A caller that deliberately sets a non-matching aspect through
+// `billboard_set_proj` gets a width scaled by sx; correcting that per-segment
+// would cost a second scale and a direction-dependent blend for no visible
+// gain at 320x240.
+//
+// No near clipping: a segment straddling the near plane is dropped whole and
+// counted. clip.hml owns the re-triangulating path (W1-4).
+export fn billboard_stretched(p_b, p_tex,
+                              p_ax: f64, p_ay: f64, p_az: f64,
+                              p_bx: f64, p_by: f64, p_bz: f64,
+                              p_width: f64,
+                              p_r: i32, p_g: i32, p_bl: i32, p_a: i32): i32 {
+    let ax: f64 = p_ax; let ay: f64 = p_ay; let az: f64 = p_az;
+    let bx: f64 = p_bx; let by: f64 = p_by; let bz: f64 = p_bz;
+
+    let caw: f64 = g_bb_d0 * ax + g_bb_d1 * ay + g_bb_d2 * az + g_bb_d3;
+    let cbw: f64 = g_bb_d0 * bx + g_bb_d1 * by + g_bb_d2 * bz + g_bb_d3;
+    if (caw < g_bb_near) { g_bb_rej_near++; let none: i32 = 0; return none; }
+    if (cbw < g_bb_near) { g_bb_rej_near++; let none: i32 = 0; return none; }
+
+    let ia: f64 = 1.0 / caw;
+    let ib: f64 = 1.0 / cbw;
+    let xoff: f64 = g_bb_xoff;
+    let yoff: f64 = g_bb_yoff;
+    let magic: f64 = g_bb_magic;
+
+    let s0x: f64 = (g_bb_a0 * ax + g_bb_a1 * ay + g_bb_a2 * az + g_bb_a3) * ia;
+    let s0y: f64 = (g_bb_b0 * ax + g_bb_b1 * ay + g_bb_b2 * az + g_bb_b3) * ia;
+    let s1x: f64 = (g_bb_a0 * bx + g_bb_a1 * by + g_bb_a2 * bz + g_bb_a3) * ib;
+    let s1y: f64 = (g_bb_b0 * bx + g_bb_b1 * by + g_bb_b2 * bz + g_bb_b3) * ib;
+
+    let dx: f64 = s1x - s0x;
+    let dy: f64 = s1y - s0y;
+    let dl: f64 = sqrt(dx * dx + dy * dy);
+    let nx: f64 = 0.0;
+    let ny: f64 = 1.0;
+    if (dl > 0.000001) { nx = 0.0 - dy / dl; ny = dx / dl; }
+
+    let h0: f64 = 0.5 * p_width * g_bb_sx * ia;
+    let h1: f64 = 0.5 * p_width * g_bb_sx * ib;
+
+    let q0x: f64 = ((s0x + nx * h0) + xoff) - magic;
+    let q0y: f64 = ((s0y + ny * h0) + yoff) - magic;
+    let q1x: f64 = ((s0x - nx * h0) + xoff) - magic;
+    let q1y: f64 = ((s0y - ny * h0) + yoff) - magic;
+    let q2x: f64 = ((s1x - nx * h1) + xoff) - magic;
+    let q2y: f64 = ((s1y - ny * h1) + yoff) - magic;
+    let q3x: f64 = ((s1x + nx * h1) + xoff) - magic;
+    let q3y: f64 = ((s1y + ny * h1) + yoff) - magic;
+
+    let lo: f64 = q0x;
+    if (q1x < lo) { lo = q1x; } if (q2x < lo) { lo = q2x; } if (q3x < lo) { lo = q3x; }
+    let hi: f64 = q0x;
+    if (q1x > hi) { hi = q1x; } if (q2x > hi) { hi = q2x; } if (q3x > hi) { hi = q3x; }
+    if (hi < g_bb_gx0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (lo > g_bb_gx1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    let loy: f64 = q0y;
+    if (q1y < loy) { loy = q1y; } if (q2y < loy) { loy = q2y; } if (q3y < loy) { loy = q3y; }
+    let hiy: f64 = q0y;
+    if (q1y > hiy) { hiy = q1y; } if (q2y > hiy) { hiy = q2y; } if (q3y > hiy) { hiy = q3y; }
+    if (hiy < g_bb_gy0) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+    if (loy > g_bb_gy1) { g_bb_rej_guard++; let none: i32 = 0; return none; }
+
+    let n: i32 = p_b.n;
+    let cap: i32 = p_b.cap;
+    if (n + 2 > cap) { g_bb_drop = g_bb_drop + 2; let none: i32 = 0; return none; }
+
+    // packed RGBA, kept in i32 (see mesh.hml: the u32 conversion costs 59 ns,
+    // this costs ~10, and the little-endian byte image is identical)
+    let ash: i32 = p_a & 255;
+    if (ash >= 128) { ash = ash - 256; }
+    let col: i32 = (p_r & 255) + (p_g & 255) * 256 + (p_bl & 255) * 65536
+                 + ash * 16777216;
+    let vb: ptr = p_b.vbuf;
+    let o: i32 = n * 60;
+
+    ptr_write_f32(ptr_offset(vb, o, 1), q0x);
+    ptr_write_f32(ptr_offset(vb, o + 4, 1), q0y);
+    ptr_write_i32(ptr_offset(vb, o + 8, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 12, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 20, 1), q1x);
+    ptr_write_f32(ptr_offset(vb, o + 24, 1), q1y);
+    ptr_write_i32(ptr_offset(vb, o + 28, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 32, 1), g_bb_uv10);
+    ptr_write_f32(ptr_offset(vb, o + 40, 1), q2x);
+    ptr_write_f32(ptr_offset(vb, o + 44, 1), q2y);
+    ptr_write_i32(ptr_offset(vb, o + 48, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 52, 1), g_bb_uv11);
+
+    ptr_write_f32(ptr_offset(vb, o + 60, 1), q0x);
+    ptr_write_f32(ptr_offset(vb, o + 64, 1), q0y);
+    ptr_write_i32(ptr_offset(vb, o + 68, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 72, 1), g_bb_uv00);
+    ptr_write_f32(ptr_offset(vb, o + 80, 1), q2x);
+    ptr_write_f32(ptr_offset(vb, o + 84, 1), q2y);
+    ptr_write_i32(ptr_offset(vb, o + 88, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 92, 1), g_bb_uv11);
+    ptr_write_f32(ptr_offset(vb, o + 100, 1), q3x);
+    ptr_write_f32(ptr_offset(vb, o + 104, 1), q3y);
+    ptr_write_i32(ptr_offset(vb, o + 108, 1), col);
+    ptr_write_u64(ptr_offset(vb, o + 112, 1), g_bb_uv01);
+
+    let dep: array<f64> = p_b.depth;
+    let tex: array = p_b.tex;
+    dep[n] = (caw + caw + cbw) * 0.3333333333333333;
+    dep[n + 1] = (caw + cbw + cbw) * 0.3333333333333333;
+    tex[n] = p_tex;
+    tex[n + 1] = p_tex;
+    p_b.n = n + 2;
+    g_bb_out = g_bb_out + 2;
+    let out: i32 = 2;
+    return out;
+}

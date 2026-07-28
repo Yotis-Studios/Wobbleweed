@@ -1,3 +1,4 @@
+// LEGACY — not on the shipping path. See ENGINE_GAPS.md.
 // scene_gpu.hml — the demo world emitted as GPU triangles (SDL_RenderGeometry).
 //
 // Same world as scene.hml, but instead of filling pixels on the CPU we project

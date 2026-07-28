@@ -1,0 +1,701 @@
+// probe_target.hml — the acceptance probe for src/target.hml (ENGINE_GAPS G12).
+//
+// It proves, with numbers rather than adjectives:
+//
+//   1. SDL_RenderGeometry draws into a 320x240 ARGB8888 TEXTUREACCESS_TARGET and
+//      reads back exactly what was drawn.
+//   2. The integer upscale turns every target texel into a hard `scale x scale`
+//      block of identical window pixels — checked over all 76 800 texels, not by
+//      eye — and a diagonal edge stays a staircase of whole blocks with no
+//      intermediate colour anywhere in the image.
+//   3. The shake offset displaces the image by exactly `shake * scale` window
+//      pixels, quantized to whole target pixels, and what it uncovers is the
+//      border colour rather than last frame.
+//   4. The full chain geometry -> target -> shake upscale -> additive quad ->
+//      alpha HUD quad, run twice in one process (SDL_RENDER_DRIVER=software,
+//      then =opengl) and compared pixel by pixel.
+//   5. The final image matches a committed checksum (the golden), so a silent
+//      change to any stage of the chain fails this probe.
+//
+// ---------------------------------------------------------------------------
+// WHAT (4) ACTUALLY MEASURED — read this before trusting "byte-identical"
+// ---------------------------------------------------------------------------
+// The opaque part of the chain IS byte-identical: target readback 0 differing
+// px of 76 800, upscale-with-shake 0 of 691 200, and 0 differing px anywhere
+// outside the two blended overlay rects. That is the whole of what target.hml
+// does, and it is exact on both backends.
+//
+// The two BLENDED overlays are not, and the cause is SDL, not this module:
+//
+//   * SDL 2.0.18's SOFTWARE renderer collapses SDL_BLENDMODE_ADD and
+//     SDL_BLENDMODE_MOD to SDL_BLENDMODE_BLEND inside SDL_RenderGeometry. An
+//     "additive" quad therefore REPLACES on the software path (measured: 86 400
+//     of 86 400 px differ from the OpenGL result, and 0 px are un-darkened where
+//     a true ADD can darken none). This holds for both the renderer draw blend
+//     mode and the per-texture blend mode. SDL_RenderFillRect with ADD is
+//     unaffected and is correct on both backends.
+//   * SDL_BLENDMODE_BLEND agrees only to within 2/255 per channel: the software
+//     path is integer, the GL path is float (measured max channel delta 2).
+//
+// Both are asserted here as CHARACTERIZATIONS with exact expected numbers, so
+// the day SDL is fixed or upgraded this probe fails and someone reads this.
+// Consequence for anything building on this engine: an ADD-blended layer looks
+// completely different on the software fallback renderer.
+//
+// Run it compiled. Headless and on the real display:
+//   HC=/home/nbeerbower/Projects/hemlock/hemlockc
+//   $HC -O1 examples/probe_target.hml -o /tmp/probe_target
+//   SDL_VIDEODRIVER=dummy /tmp/probe_target        # software only
+//   DISPLAY=:0            /tmp/probe_target        # software vs OpenGL
+//
+// Under SDL_VIDEODRIVER=dummy only the software renderer exists, so pass B
+// falls back to software and the cross-renderer comparison is a tautology; the
+// probe says so in its notes and the real comparison happens on DISPLAY=:0.
+// The assertion COUNT is identical either way, on purpose: a probe whose
+// denominator moves cannot be trusted by a gate script.
+//
+// Exit status is the contract: 0 iff every assertion passed AND the expected
+// number of assertions ran.
+
+import "libSDL2-2.0.so.0";
+// Not bound in sdl.hml, and this probe is the only thing that needs it: which
+// renderer did SDL actually give us? SDL_RendererInfo { const char *name @0;
+// Uint32 flags @8; ... } — flags bit 0 = SOFTWARE, bit 1 = ACCELERATED.
+extern fn SDL_GetRendererInfo(ren: ptr, info: ptr): i32;
+
+import { exit } from "@stdlib/process";
+import { window_open_ex, window_close, sdl_clear, sdl_present, set_hint,
+         set_draw_blend, draw_tris_at, read_pixels_rect, delay,
+         FMT_ARGB8888, BLEND_NONE, BLEND_ADD, BLEND_BLEND } from "../src/sdl.hml";
+import { target_new, target_free, target_begin, target_end, target_present,
+         target_set_shake, target_set_border, target_set_scale, target_layout,
+         target_shake_x, target_shake_y } from "../src/target.hml";
+import { write_png } from "../src/png.hml";
+
+// --- the shipping shape ----------------------------------------------------
+let TW = 320;
+let TH = 240;
+let SCALE = 3;
+let WW = 960;          // TW * SCALE
+let WH = 720;          // TH * SCALE
+
+// Test colours. Deliberately not round numbers: a channel that happens to be
+// 0, 128 or 255 hides a channel-order bug.
+let C_CLEAR = 1186338;      // (18, 26, 34)  packed 0xRRGGBB
+let C_TRI   = 13339961;     // (203, 141, 57)
+
+// Committed golden: FNV-1a/32 over the RGB bytes of the final 960x720 window
+// image of the full chain. Regenerated only when the chain deliberately changes.
+let GOLDEN_FULL: u64 = 3236176537;
+
+// The probe runs exactly this many assertions. The denominator is asserted too,
+// so a skipped branch cannot shrink numerator and denominator together and
+// still print a green PASS n/n.
+let EXPECTED_ASSERTIONS = 40;
+
+let g_n = 0;
+let g_pass = 0;
+let g_notes = [];
+
+fn ok(name: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}`); }
+}
+fn eq(name: string, got, want) {
+    g_n = g_n + 1;
+    if (got == want) { g_pass = g_pass + 1; }
+    else { print(`  FAIL #${g_n}  ${name}: got ${got}, want ${want}`); }
+}
+fn note(s: string) { g_notes.push(s); }
+
+// ---------------------------------------------------------------------------
+// vertex plumbing — the 20-byte SDL_Vertex of ARCHITECTURE.md 2.3
+// ---------------------------------------------------------------------------
+let VS = 20;
+
+fn vput(p_buf: ptr, p_i: i32, p_x: f64, p_y: f64,
+        p_r: i32, p_g: i32, p_b: i32, p_a: i32, p_u: f64, p_v: f64) {
+    let o: i32 = p_i * VS;
+    ptr_write_f32(ptr_offset(p_buf, o, 1), p_x);
+    ptr_write_f32(ptr_offset(p_buf, o + 4, 1), p_y);
+    ptr_write_u8(ptr_offset(p_buf, o + 8, 1), p_r & 255);
+    ptr_write_u8(ptr_offset(p_buf, o + 9, 1), p_g & 255);
+    ptr_write_u8(ptr_offset(p_buf, o + 10, 1), p_b & 255);
+    ptr_write_u8(ptr_offset(p_buf, o + 11, 1), p_a & 255);
+    ptr_write_f32(ptr_offset(p_buf, o + 12, 1), p_u);
+    ptr_write_f32(ptr_offset(p_buf, o + 16, 1), p_v);
+}
+
+// Two triangles covering an axis-aligned rect, flat colour, no texture.
+fn vquad(p_buf: ptr, p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64,
+         p_r: i32, p_g: i32, p_b: i32, p_a: i32) {
+    vput(p_buf, 0, p_x0, p_y0, p_r, p_g, p_b, p_a, 0.0, 0.0);
+    vput(p_buf, 1, p_x1, p_y0, p_r, p_g, p_b, p_a, 1.0, 0.0);
+    vput(p_buf, 2, p_x1, p_y1, p_r, p_g, p_b, p_a, 1.0, 1.0);
+    vput(p_buf, 3, p_x0, p_y0, p_r, p_g, p_b, p_a, 0.0, 0.0);
+    vput(p_buf, 4, p_x1, p_y1, p_r, p_g, p_b, p_a, 1.0, 1.0);
+    vput(p_buf, 5, p_x0, p_y1, p_r, p_g, p_b, p_a, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// pixel helpers. Readback format is FMT_ARGB8888, whose MEMORY order is
+// B,G,R,A — so a little-endian u32 read yields 0xAARRGGBB and masking off the
+// top byte gives 0xRRGGBB regardless of whether the backbuffer carries alpha.
+// ---------------------------------------------------------------------------
+
+fn rgb_at(p_px: ptr, p_stride: i32, p_x: i32, p_y: i32): i32 {
+    let idx: i32 = (p_y * p_stride + p_x) * 4;
+    let out: i32 = i32(ptr_deref_u32(ptr_offset(p_px, idx, 1)) & 16777215);
+    return out;
+}
+
+// Pixels whose RGB is neither `a` nor `b`. Zero means the image is hard-edged:
+// nothing was antialiased, filtered or blended into an in-between colour.
+fn count_other(p_px: ptr, p_n: i32, p_a: i32, p_b: i32): i32 {
+    let px: ptr = p_px;
+    let n: i32 = p_n;
+    let a: i32 = p_a;
+    let b: i32 = p_b;
+    let bad: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let v: i32 = i32(ptr_deref_u32(ptr_offset(px, i * 4, 1)) & 16777215);
+        if (v != a && v != b) { bad++; }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+fn count_rgb(p_px: ptr, p_n: i32, p_want: i32): i32 {
+    let px: ptr = p_px;
+    let n: i32 = p_n;
+    let want: i32 = p_want;
+    let hit: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let v: i32 = i32(ptr_deref_u32(ptr_offset(px, i * 4, 1)) & 16777215);
+        if (v == want) { hit++; }
+    }
+    let out: i32 = hit;
+    return out;
+}
+
+// THE block test. For every target texel, all scale*scale window pixels that
+// texel owns must be bit-identical. Returns the number that are not.
+fn block_violations(p_px: ptr, p_ww: i32, p_tw: i32, p_th: i32, p_s: i32): i32 {
+    let px: ptr = p_px;
+    let ww: i32 = p_ww;
+    let tw: i32 = p_tw;
+    let th: i32 = p_th;
+    let s: i32 = p_s;
+    let bad: i32 = 0;
+    for (let ty = 0; ty < th; ty++) {
+        for (let tx = 0; tx < tw; tx++) {
+            let base = ptr_deref_u32(ptr_offset(px, ((ty * s) * ww + tx * s) * 4, 1));
+            for (let j = 0; j < s; j++) {
+                let row: i32 = (ty * s + j) * ww + tx * s;
+                for (let i = 0; i < s; i++) {
+                    let v = ptr_deref_u32(ptr_offset(px, (row + i) * 4, 1));
+                    if (v != base) { bad++; }
+                }
+            }
+        }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Every block's colour must be its source texel's colour: the magnification is
+// a pure nearest-neighbour replication, not a resample.
+fn upscale_mismatches(p_win: ptr, p_tgt: ptr, p_ww: i32,
+                      p_tw: i32, p_th: i32, p_s: i32): i32 {
+    let win: ptr = p_win;
+    let tgt: ptr = p_tgt;
+    let ww: i32 = p_ww;
+    let tw: i32 = p_tw;
+    let th: i32 = p_th;
+    let s: i32 = p_s;
+    let bad: i32 = 0;
+    for (let ty = 0; ty < th; ty++) {
+        for (let tx = 0; tx < tw; tx++) {
+            let a: i32 = i32(ptr_deref_u32(ptr_offset(tgt, (ty * tw + tx) * 4, 1)) & 16777215);
+            let b: i32 = i32(ptr_deref_u32(ptr_offset(win, ((ty * s) * ww + tx * s) * 4, 1)) & 16777215);
+            if (a != b) { bad++; }
+        }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// x of the first pixel of colour `want` on row `y`, or -1.
+fn first_x(p_px: ptr, p_stride: i32, p_y: i32, p_w: i32, p_want: i32): i32 {
+    let px: ptr = p_px;
+    let stride: i32 = p_stride;
+    let y: i32 = p_y;
+    let w: i32 = p_w;
+    let want: i32 = p_want;
+    for (let x = 0; x < w; x++) {
+        let v: i32 = i32(ptr_deref_u32(ptr_offset(px, (y * stride + x) * 4, 1)) & 16777215);
+        if (v == want) { let hit: i32 = x; return hit; }
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// Whole-image byte comparison. `mask` 16777215 ignores alpha, 4294967295 does not.
+fn diff_count(p_a: ptr, p_b: ptr, p_n: i32, p_mask: u32): i32 {
+    let a: ptr = p_a;
+    let b: ptr = p_b;
+    let n: i32 = p_n;
+    let m: u32 = p_mask;
+    let bad: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let va = ptr_deref_u32(ptr_offset(a, i * 4, 1)) & m;
+        let vb = ptr_deref_u32(ptr_offset(b, i * 4, 1)) & m;
+        if (va != vb) { bad++; }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Displacement check: does `b` equal `a` shifted by (dx, dy) window pixels?
+fn shift_mismatches(p_a: ptr, p_b: ptr, p_w: i32, p_h: i32,
+                    p_dx: i32, p_dy: i32): i32 {
+    let a: ptr = p_a;
+    let b: ptr = p_b;
+    let w: i32 = p_w;
+    let h: i32 = p_h;
+    let dx: i32 = p_dx;
+    let dy: i32 = p_dy;
+    let bad: i32 = 0;
+    let x0: i32 = 0; if (dx > 0) { x0 = dx; }
+    let y0: i32 = 0; if (dy > 0) { y0 = dy; }
+    let x1: i32 = w; if (dx < 0) { x1 = w + dx; }
+    let y1: i32 = h; if (dy < 0) { y1 = h + dy; }
+    for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+            let vb: i32 = i32(ptr_deref_u32(ptr_offset(b, (y * w + x) * 4, 1)) & 16777215);
+            let va: i32 = i32(ptr_deref_u32(ptr_offset(a, ((y - dy) * w + (x - dx)) * 4, 1)) & 16777215);
+            if (va != vb) { bad++; }
+        }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Pixels in an axis-aligned window rect that are NOT `want`.
+fn rect_not(p_px: ptr, p_w: i32, p_x0: i32, p_y0: i32, p_x1: i32, p_y1: i32,
+            p_want: i32): i32 {
+    let px: ptr = p_px;
+    let w: i32 = p_w;
+    let want: i32 = p_want;
+    let bad: i32 = 0;
+    for (let y = p_y0; y < p_y1; y++) {
+        for (let x = p_x0; x < p_x1; x++) {
+            let v: i32 = i32(ptr_deref_u32(ptr_offset(px, (y * w + x) * 4, 1)) & 16777215);
+            if (v != want) { bad++; }
+        }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Pixels differing between two images, restricted to outside two rects.
+fn diff_outside(p_a: ptr, p_b: ptr, p_w: i32, p_h: i32,
+                p_ax0: i32, p_ay0: i32, p_ax1: i32, p_ay1: i32,
+                p_bx0: i32, p_by0: i32, p_bx1: i32, p_by1: i32): i32 {
+    let a: ptr = p_a;
+    let b: ptr = p_b;
+    let w: i32 = p_w;
+    let h: i32 = p_h;
+    let bad: i32 = 0;
+    for (let y = 0; y < h; y++) {
+        let in_ay: bool = y >= p_ay0 && y < p_ay1;
+        let in_by: bool = y >= p_by0 && y < p_by1;
+        for (let x = 0; x < w; x++) {
+            if (in_ay && x >= p_ax0 && x < p_ax1) { continue; }
+            if (in_by && x >= p_bx0 && x < p_bx1) { continue; }
+            let va: i32 = i32(ptr_deref_u32(ptr_offset(a, (y * w + x) * 4, 1)) & 16777215);
+            let vb: i32 = i32(ptr_deref_u32(ptr_offset(b, (y * w + x) * 4, 1)) & 16777215);
+            if (va != vb) { bad++; }
+        }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Inside a rect: how many pixels of `b` are >= `a` in EVERY channel. A true
+// additive composite can never darken, so on a correct renderer this equals the
+// area of the rect.
+fn count_never_darker(p_a: ptr, p_b: ptr, p_w: i32,
+                      p_x0: i32, p_y0: i32, p_x1: i32, p_y1: i32): i32 {
+    let a: ptr = p_a;
+    let b: ptr = p_b;
+    let w: i32 = p_w;
+    let nd: i32 = 0;
+    for (let y = p_y0; y < p_y1; y++) {
+        for (let x = p_x0; x < p_x1; x++) {
+            let va: i32 = i32(ptr_deref_u32(ptr_offset(a, (y * w + x) * 4, 1)) & 16777215);
+            let vb: i32 = i32(ptr_deref_u32(ptr_offset(b, (y * w + x) * 4, 1)) & 16777215);
+            let ar: i32 = (va >> 16) & 255; let ag: i32 = (va >> 8) & 255; let ab: i32 = va & 255;
+            let br: i32 = (vb >> 16) & 255; let bg: i32 = (vb >> 8) & 255; let bb: i32 = vb & 255;
+            if (br >= ar && bg >= ag && bb >= ab) { nd++; }
+        }
+    }
+    let out: i32 = nd;
+    return out;
+}
+
+// Pixels differing between two images inside a rect.
+fn rect_diff(p_a: ptr, p_b: ptr, p_w: i32,
+             p_x0: i32, p_y0: i32, p_x1: i32, p_y1: i32): i32 {
+    let a: ptr = p_a;
+    let b: ptr = p_b;
+    let w: i32 = p_w;
+    let bad: i32 = 0;
+    for (let y = p_y0; y < p_y1; y++) {
+        for (let x = p_x0; x < p_x1; x++) {
+            let va: i32 = i32(ptr_deref_u32(ptr_offset(a, (y * w + x) * 4, 1)) & 16777215);
+            let vb: i32 = i32(ptr_deref_u32(ptr_offset(b, (y * w + x) * 4, 1)) & 16777215);
+            if (va != vb) { bad++; }
+        }
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Largest absolute per-channel difference between two images inside a rect.
+fn rect_max_delta(p_a: ptr, p_b: ptr, p_w: i32,
+                  p_x0: i32, p_y0: i32, p_x1: i32, p_y1: i32): i32 {
+    let a: ptr = p_a;
+    let b: ptr = p_b;
+    let w: i32 = p_w;
+    let worst: i32 = 0;
+    for (let y = p_y0; y < p_y1; y++) {
+        for (let x = p_x0; x < p_x1; x++) {
+            let va: i32 = i32(ptr_deref_u32(ptr_offset(a, (y * w + x) * 4, 1)) & 16777215);
+            let vb: i32 = i32(ptr_deref_u32(ptr_offset(b, (y * w + x) * 4, 1)) & 16777215);
+            let d0: i32 = ((va >> 16) & 255) - ((vb >> 16) & 255); if (d0 < 0) { d0 = 0 - d0; }
+            let d1: i32 = ((va >> 8) & 255) - ((vb >> 8) & 255);   if (d1 < 0) { d1 = 0 - d1; }
+            let d2: i32 = (va & 255) - (vb & 255);                 if (d2 < 0) { d2 = 0 - d2; }
+            if (d0 > worst) { worst = d0; }
+            if (d1 > worst) { worst = d1; }
+            if (d2 > worst) { worst = d2; }
+        }
+    }
+    let out: i32 = worst;
+    return out;
+}
+
+// FNV-1a/32 over the RGB bytes. Done in u64 with an explicit 32-bit mask:
+// i32/i64 `*` throw on overflow (CLAUDE.md A13).
+fn fnv_rgb(p_px: ptr, p_n: i32): u64 {
+    let px: ptr = p_px;
+    let n: i32 = p_n;
+    let h: u64 = 2166136261;
+    for (let i = 0; i < n; i++) {
+        let v = ptr_deref_u32(ptr_offset(px, i * 4, 1));
+        h = ((h ^ ((v >> 16) & 255)) * 16777619) & 4294967295;
+        h = ((h ^ ((v >> 8) & 255)) * 16777619) & 4294967295;
+        h = ((h ^ (v & 255)) * 16777619) & 4294967295;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+fn argb_to_rgb24(p_src: ptr, p_dst: buffer, p_n: i32) {
+    let src: ptr = p_src;
+    let dst: ptr = buffer_ptr(p_dst);
+    let n: i32 = p_n;
+    for (let i = 0; i < n; i++) {
+        let v = ptr_deref_u32(ptr_offset(src, i * 4, 1));
+        ptr_write_u8(ptr_offset(dst, i * 3, 1), (v >> 16) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 1, 1), (v >> 8) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 2, 1), v & 255);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ONE FULL PASS OF THE CHAIN, on one renderer backend.
+//
+// Returns every readback plus the status codes; every assertion is made outside
+// so that running the pass twice does not double the assertion count.
+// ---------------------------------------------------------------------------
+fn run_pass(p_driver: string) {
+    set_hint("SDL_RENDER_DRIVER", p_driver);
+    // logical = 0. Logical size would rescale the rasterizer under us and the
+    // target would be magnified twice; the chunkiness is only real without it.
+    let w = window_open_ex(`probe_target ${p_driver}`, TW, TH, SCALE, 0);
+    if (w == null) { return null; }
+
+    let info = alloc(128);
+    let flags = -1;
+    if (SDL_GetRendererInfo(w.ren, info) == 0) {
+        flags = ptr_deref_u32(ptr_offset(info, 8, 1));
+    }
+
+    let t = target_new(w, TW, TH, SCALE);
+    if (t == null) { window_close(w); return null; }
+    target_set_border(t, 0, 0, 0);
+
+    let tgt = buffer(TW * TH * 4);
+    let geom = buffer(WW * WH * 4);
+    let shake = buffer(WW * WH * 4);
+    let full = buffer(WW * WH * 4);
+    let tgtp = buffer_ptr(tgt);
+    let geomp = buffer_ptr(geom);
+    let shakep = buffer_ptr(shake);
+    let fullp = buffer_ptr(full);
+
+    let vb = alloc(6 * VS);
+
+    // -- stage 1: geometry into the 320x240 target -------------------------
+    let rc_begin = target_begin(t);
+    set_draw_blend(w, BLEND_NONE);
+    sdl_clear(w, 18, 26, 34, 255);
+    // A right triangle whose hypotenuse runs from (300,20) to (20,220): a
+    // 1.4-px-per-row diagonal, which is what has to come out as a staircase of
+    // whole 3x3 blocks rather than a smooth line.
+    vput(vb, 0, 300.0, 20.0, 203, 141, 57, 255, 0.0, 0.0);
+    vput(vb, 1, 20.0, 220.0, 203, 141, 57, 255, 0.0, 1.0);
+    vput(vb, 2, 300.0, 220.0, 203, 141, 57, 255, 1.0, 1.0);
+    let rc_geom = draw_tris_at(w, null, vb, 0, 3);
+    let rc_read_tgt = read_pixels_rect(w, 0, 0, TW, TH, FMT_ARGB8888, tgtp, TW * 4);
+    let rc_end = target_end(t);
+
+    // -- stage 2: upscale, no shake ----------------------------------------
+    target_set_shake(t, 0.0, 0.0);
+    let rc_present = target_present(t);
+    read_pixels_rect(w, 0, 0, WW, WH, FMT_ARGB8888, geomp, WW * 4);
+
+    // -- stage 3: upscale with shake ---------------------------------------
+    target_set_shake(t, 4.0, -2.0);
+    target_present(t);
+    read_pixels_rect(w, 0, 0, WW, WH, FMT_ARGB8888, shakep, WW * 4);
+
+    // -- stage 4: the full chain: + additive quad + alpha HUD quad ----------
+    target_present(t);
+    set_draw_blend(w, BLEND_ADD);
+    vquad(vb, 120.0, 90.0, 480.0, 330.0, 52, 34, 18, 255);
+    draw_tris_at(w, null, vb, 0, 6);
+    set_draw_blend(w, BLEND_BLEND);
+    vquad(vb, 540.0, 420.0, 870.0, 660.0, 214, 219, 226, 128);
+    draw_tris_at(w, null, vb, 0, 6);
+    read_pixels_rect(w, 0, 0, WW, WH, FMT_ARGB8888, fullp, WW * 4);
+    sdl_present(w);
+
+    // -- shake quantization (rule 4), pure, no rendering --------------------
+    target_set_shake(t, 0.4, 0.6);
+    let q0x = target_shake_x(t);
+    let q0y = target_shake_y(t);
+    target_set_shake(t, -0.6, -0.4);
+    let q1x = target_shake_x(t);
+    let q1y = target_shake_y(t);
+
+    // -- auto scale ---------------------------------------------------------
+    let auto_scale = target_set_scale(t, 0);
+    target_set_scale(t, SCALE);
+    target_layout(t);
+
+    let res = { flags: flags, tex_null: w.tex == ptr_null(),
+                tw: t.w, th: t.h, scale: t.scale, ox: t.ox, oy: t.oy,
+                rc_begin: rc_begin, rc_geom: rc_geom, rc_read_tgt: rc_read_tgt,
+                rc_end: rc_end, rc_present: rc_present,
+                q0x: q0x, q0y: q0y, q1x: q1x, q1y: q1y, auto_scale: auto_scale,
+                tgt: tgt, geom: geom, shake: shake, full: full,
+                tgtp: tgtp, geomp: geomp, shakep: shakep, fullp: fullp };
+
+    target_free(t);
+    window_close(w);
+    return res;
+}
+
+fn main() {
+    print("probe_target — G12 render target and upscale present");
+    print("");
+
+    let a = run_pass("software");
+    if (a == null) {
+        print("FAIL  the software pass could not open a window/target");
+        exit(1);
+    }
+    let b = run_pass("opengl");
+    if (b == null) {
+        print("FAIL  the second pass could not open a window/target");
+        exit(1);
+    }
+
+    let npx_t = TW * TH;
+    let npx_w = WW * WH;
+
+    // -- A. shape and lifecycle --------------------------------------------
+    ok("window_open_ex(logical=0) creates no framebuffer texture", a.tex_null);
+    eq("target width", a.tw, TW);
+    eq("target height", a.th, TH);
+    eq("target scale", a.scale, SCALE);
+    eq("image origin x (960 window, 320x3 image)", a.ox, 0);
+    eq("image origin y (720 window, 240x3 image)", a.oy, 0);
+    eq("target_begin returns 0", a.rc_begin, 0);
+    eq("target_end returns 0", a.rc_end, 0);
+    eq("target_present returns 0", a.rc_present, 0);
+
+    // -- B. SDL_RenderGeometry into the target ------------------------------
+    eq("SDL_RenderGeometry into the target returns 0", a.rc_geom, 0);
+    eq("reading the target back returns 0", a.rc_read_tgt, 0);
+    eq("target pixel outside the triangle is the clear colour",
+       rgb_at(a.tgtp, TW, 4, 4), C_CLEAR);
+    eq("target pixel inside the triangle is the vertex colour",
+       rgb_at(a.tgtp, TW, 240, 160), C_TRI);
+    let tgt_other = count_other(a.tgtp, npx_t, C_CLEAR, C_TRI);
+    eq("no third colour anywhere in the target (nothing was antialiased)",
+       tgt_other, 0);
+    let tri_px = count_rgb(a.tgtp, npx_t, C_TRI);
+    // Analytic area of (300,20)-(20,220)-(300,220) is 0.5*280*200 = 28000.
+    let tri_err = tri_px - 28000;
+    if (tri_err < 0) { tri_err = 0 - tri_err; }
+    ok(`rasterized triangle area ${tri_px} px is within 3% of the analytic 28000`,
+       tri_err <= 840);
+    note(`target: ${tri_px} triangle px vs 28000 analytic (delta ${tri_err})`);
+
+    // -- C. hard 3x3 blocks -------------------------------------------------
+    let bviol = block_violations(a.geomp, WW, TW, TH, SCALE);
+    eq(`every one of the ${npx_t} texels is a constant ${SCALE}x${SCALE} block`,
+       bviol, 0);
+    let win_other = count_other(a.geomp, npx_w, C_CLEAR, C_TRI);
+    eq("no third colour anywhere in the upscaled image (the edge is hard)",
+       win_other, 0);
+    let up_bad = upscale_mismatches(a.geomp, a.tgtp, WW, TW, TH, SCALE);
+    eq("every block carries its own source texel's colour", up_bad, 0);
+
+    // The diagonal edge specifically: the window edge must land on the block
+    // grid, at exactly 3x the target edge, on every row that has an edge.
+    let edge_bad = 0;
+    let edge_rows = 0;
+    let edge_distinct = 0;
+    let prev_edge = -999;
+    for (let ty = 0; ty < TH; ty++) {
+        let tx = first_x(a.tgtp, TW, ty, TW, C_TRI);
+        if (tx > 0) {
+            edge_rows++;
+            if (tx != prev_edge) { edge_distinct++; prev_edge = tx; }
+            let wx = first_x(a.geomp, WW, ty * SCALE, WW, C_TRI);
+            if (wx != tx * SCALE) { edge_bad++; }
+        }
+    }
+    eq(`the diagonal edge lands on the block grid on all ${edge_rows} edge rows`,
+       edge_bad, 0);
+    ok(`the edge is genuinely diagonal (${edge_distinct} distinct edge columns)`,
+       edge_distinct >= 100);
+    note(`diagonal edge: ${edge_rows} rows, ${edge_distinct} distinct columns`);
+
+    // -- D. shake -----------------------------------------------------------
+    let sh_bad = shift_mismatches(a.geomp, a.shakep, WW, WH, 4 * SCALE, -2 * SCALE);
+    eq("shake(4,-2) target px displaces the image by exactly (+12,-6) window px",
+       sh_bad, 0);
+    let vac_left = rect_not(a.shakep, WW, 0, 0, 4 * SCALE, WH, 0);
+    eq("the 12 columns the shake uncovers are the border colour", vac_left, 0);
+    let vac_bot = rect_not(a.shakep, WW, 4 * SCALE, WH - 2 * SCALE, WW, WH, 0);
+    eq("the 6 rows the shake uncovers are the border colour", vac_bot, 0);
+    eq("shake(0.4, 0.6) quantizes x to 0 whole target px", a.q0x, 0);
+    eq("shake(0.4, 0.6) quantizes y to 1 whole target px", a.q0y, 1);
+    eq("shake(-0.6, -0.4) quantizes x to -1 whole target px", a.q1x, -1);
+    eq("shake(-0.6, -0.4) quantizes y to 0 whole target px", a.q1y, 0);
+
+    // -- E. auto scale ------------------------------------------------------
+    eq("target_set_scale(t, 0) picks the largest integer factor that fits",
+       a.auto_scale, SCALE);
+
+    // -- F. the composited chain, on the software renderer -------------------
+    let add_area = (480 - 120) * (330 - 90);
+    let alpha_area = (870 - 540) * (660 - 420);
+    let outside = diff_outside(a.shakep, a.fullp, WW, WH,
+                               120, 90, 480, 330, 540, 420, 870, 660);
+    eq("the overlay quads change nothing outside their own rects", outside, 0);
+    let add_changed = rect_diff(a.shakep, a.fullp, WW, 120, 90, 480, 330);
+    eq("the additive quad composited over every pixel of its rect",
+       add_changed, add_area);
+    let alpha_changed = rect_diff(a.shakep, a.fullp, WW, 540, 420, 870, 660);
+    eq("the alpha HUD quad composited over every pixel of its rect",
+       alpha_changed, alpha_area);
+    // CHARACTERIZATION, not a wish. SDL 2.0.18's SOFTWARE renderer collapses
+    // SDL_BLENDMODE_ADD (and MOD) to BLEND inside SDL_RenderGeometry, so an
+    // "additive" quad on the software path REPLACES instead of adding and
+    // brightens nothing. Verified for both the render draw blend mode and the
+    // per-texture blend mode; SDL_RenderFillRect with ADD is unaffected, and the
+    // OpenGL renderer is correct. If SDL is ever fixed or upgraded this
+    // assertion fails loudly, which is the point. See the notes.
+    let nd = count_never_darker(a.shakep, a.fullp, WW, 120, 90, 480, 330);
+    eq("KNOWN SDL DIVERGENCE: software RenderGeometry ignores BLENDMODE_ADD (it darkens instead)",
+       nd, 0);
+    note(`software ADD overlay: ${add_changed}/${add_area} px changed, ${nd}/${add_area} px not darkened — ADD behaved as BLEND (a true ADD would be ${add_area})`);
+
+    // -- G. software vs accelerated ------------------------------------------
+    let a_soft = (a.flags & 1) != 0;
+    let b_accel = (b.flags & 2) != 0;
+    ok(`pass A is the software renderer (flags ${a.flags})`, a_soft);
+    ok(`pass B got a renderer (flags ${b.flags})`, b.flags > 0);
+    if (b_accel) {
+        note(`pass B is ACCELERATED (flags ${b.flags}) — a real software-vs-OpenGL comparison`);
+    } else {
+        note(`pass B fell back to SOFTWARE (flags ${b.flags}) — no accelerated driver available, so the cross-renderer comparison is a tautology here. Re-run on DISPLAY=:0 for the real thing.`);
+    }
+    // The part of the chain target.hml is responsible for: opaque geometry into
+    // the target, and the integer upscale with shake. This must be identical.
+    let d_tgt = diff_count(a.tgtp, b.tgtp, npx_t, 16777215);
+    let d_geom = diff_count(a.geomp, b.geomp, npx_w, 16777215);
+    let d_out = diff_outside(a.fullp, b.fullp, WW, WH,
+                             120, 90, 480, 330, 540, 420, 870, 660);
+    eq("target readback identical on both renderers", d_tgt, 0);
+    eq("upscaled + shaken image identical on both renderers", d_geom, 0);
+    eq("full chain identical on both renderers outside the blended overlays",
+       d_out, 0);
+    // The blended overlays are SDL's arithmetic, not this module's. Measured,
+    // not assumed: ADD is missing in software (every pixel of the rect differs),
+    // and BLEND rounds differently between the integer and the float path.
+    let d_add = rect_diff(a.fullp, b.fullp, WW, 120, 90, 480, 330);
+    let d_alpha = rect_diff(a.fullp, b.fullp, WW, 540, 420, 870, 660);
+    let m_alpha = rect_max_delta(a.fullp, b.fullp, WW, 540, 420, 870, 660);
+    let want_add = 0;
+    let want_alpha_max = 0;
+    if (b_accel) { want_add = add_area; want_alpha_max = 4; }
+    eq(`cross-renderer ADD rect diff (${d_add}/${add_area} px)`, d_add, want_add);
+    ok(`cross-renderer BLEND rect max channel delta ${m_alpha} <= ${want_alpha_max}`,
+       m_alpha <= want_alpha_max);
+    note(`cross-renderer: target ${d_tgt}, upscale ${d_geom}, outside-overlays ${d_out}, ADD rect ${d_add}/${add_area}, BLEND rect ${d_alpha}/${alpha_area} px (max channel delta ${m_alpha})`);
+
+    // -- H. the golden --------------------------------------------------------
+    let hsh = fnv_rgb(a.fullp, npx_w);
+    eq("the full chain matches the committed golden checksum", hsh, GOLDEN_FULL);
+    note(`golden FNV-1a/32 of the final image = ${hsh}`);
+
+    // -- artifacts for the eye ------------------------------------------------
+    let png_w = buffer(npx_w * 3);
+    argb_to_rgb24(a.geomp, png_w, npx_w);
+    write_png("/tmp/probe_target_upscale.png", png_w, WW, WH);
+    let png_f = buffer(npx_w * 3);
+    argb_to_rgb24(a.fullp, png_f, npx_w);
+    write_png("/tmp/probe_target_full.png", png_f, WW, WH);
+    let png_t = buffer(npx_t * 3);
+    argb_to_rgb24(a.tgtp, png_t, npx_t);
+    write_png("/tmp/probe_target_320.png", png_t, TW, TH);
+    note("wrote /tmp/probe_target_320.png, /tmp/probe_target_upscale.png, /tmp/probe_target_full.png");
+
+    delay(120);
+
+    print("");
+    print("--- notes ---");
+    let ni = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    if (g_n != EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) {
+        print(`PASS ${g_pass}/${g_n}`);
+    } else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+main();

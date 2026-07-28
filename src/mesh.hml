@@ -1,0 +1,795 @@
+// mesh.hml — runtime mesh format, build-time light bake, and instanced emit.
+//
+// Nightshade W1-10. Implements ENGINE_GAPS G19 (and the mesh half of G17's
+// "juice" pipeline; billboard.hml is the other half).
+//
+// GENERIC ENGINE MODULE (RULE R1). Nothing here knows a game word. Every colour,
+// every light direction, every size is a parameter supplied by the caller.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS FILE EXISTS
+// ---------------------------------------------------------------------------
+// The legacy path (`scene_gpu.hml : render_mesh_gpu`) did three
+// `v_norm(mat_apply_dir(model, n))` per FACE per FRAME — 50 trees is ~4800
+// normalizes and ~10000 object allocations every frame, for lighting that never
+// changes. It also threw the OBJ loader's UVs away, so nothing could be
+// textured.
+//
+// The fix is one idea: **lighting is a build-time property of the vertex.**
+//   * `mesh_bake_light` runs once, at asset build, and folds
+//     `ambient + sun*max(0,N.L) + bounce*max(0,-N.y)`, times the authored
+//     albedo, times the per-vertex AO, into three bytes of vertex colour.
+//   * Per frame, `mesh_emit` / `mesh_emit_yaw` do TRANSFORM AND PACK ONLY.
+//     No normal is read, no normal is transformed, no normal is normalized,
+//     nothing is allocated.
+//
+// `mesh_normal_xform_count()` is the proof: it counts every normal this module
+// ever transforms. It moves during a bake and is provably frozen during a
+// frame. `examples/probe_mesh.hml` asserts exactly that.
+//
+// ---------------------------------------------------------------------------
+// THE MESH ARENA — 24 BYTES PER VERTEX, NON-INDEXED
+// ---------------------------------------------------------------------------
+//   offset  type  field
+//        0  f32   pos.x        model space
+//        4  f32   pos.y
+//        8  f32   pos.z
+//       12  f32   uv.u         atlas coordinates, authored at build time
+//       16  f32   uv.v
+//       20  u8    r            BAKED colour = albedo * light * ao
+//       21  u8    g
+//       22  u8    b
+//       23  u8    pad          reserved; always 0
+//
+// Non-indexed: triangle `t` owns vertices `3t`, `3t+1`, `3t+2`. The painter
+// sort is per-triangle anyway, so an index buffer would only add indirection to
+// the hot loop (ARCHITECTURE.md 2.2 / ENGINE_GAPS G19).
+//
+// Build-time-only side tables (`nrm`, `alb`, `ao`) are retained after
+// `mesh_end` so a mesh can be RE-baked when the time of day moves. They are
+// never read by the emit path. `mesh_shrink` drops them if a caller wants the
+// memory back.
+//
+// ---------------------------------------------------------------------------
+// THE READ CACHE — why the arena is not what the hot loop reads
+// ---------------------------------------------------------------------------
+// The 24 B arena above is the FORMAT: it is what `mesh_buf` returns, what
+// `mesh_bake_light` writes, and what the byte-layout table documents. It is not
+// what the emit loop reads, because on this toolchain reading it is three times
+// slower than reading a Hemlock array. Measured on this box, compiled -O1,
+// 5 M iterations, empty-loop baseline subtracted:
+//
+//     ptr_deref_f32(ptr_offset(p, k, 1))   25.3 ns      <- ptr_offset alone is 11 ns
+//     ptr_deref_f32(p)  (pre-offset ptr)   14.0 ns
+//     array<f64>[i]                         7.6 ns
+//     array<i32>[i]                         6.6 ns
+//
+// That is CLAUDE.md A5 ("array / array<f64> for hot random-access float data —
+// faster than raw ptr") measured again on exactly this access pattern. So
+// `mesh_end` also leaves behind a parallel SoA read cache:
+//
+//     m.ax, m.ay, m.az : array<f64>   position
+//     m.auv            : array (u64)  the (u,v) f32 PAIR, pre-reinterpreted so
+//                                     the emit loop stores 8 bytes in one write
+//     m.ac             : array<i32>   BAKED colour, packed r | g<<8 | b<<16
+//
+// It is derived, never authoritative: the arena and the cache are written
+// together by `push_arena_vert`, `mesh_bake_light` and `mesh_unbake`, and there
+// is no path that updates one without the other. Cost is ~88 extra bytes per
+// vertex — 32 KB for a 288-vertex tree, ~1.3 MB for a whole 40-mesh library,
+// against a 96 MB budget.
+//
+// The packed colour is not only a smaller read, it is a smaller WRITE: the
+// three colour bytes plus the alpha byte go out as one `ptr_write_u32` instead
+// of four `ptr_write_u8`, which removes 9 of the 24 stores per triangle.
+//
+// ---------------------------------------------------------------------------
+// THE BATCH SINK
+// ---------------------------------------------------------------------------
+// `mesh_emit*` writes SDL_Vertex bytes straight into a caller-owned batch. To
+// keep this module linkable before `batch.hml` exists, the batch is taken
+// structurally, not by import. Any object with these five fields — which is
+// exactly the `Batch` of ARCHITECTURE.md 2.3 — is a valid sink:
+//
+//     .vbuf  : ptr           cap * 60 bytes (3 x SDL_Vertex, 20 B each)
+//     .depth : array<f64>    cap entries, VIEW-SPACE depth (clip w). Bigger = farther.
+//     .tex   : array         cap entries, SDL_Texture* or ptr_null()
+//     .n     : i32           triangles pushed so far; this module advances it
+//     .cap   : i32           HARD LIMIT. Overflow drops and counts. Never smashes.
+//
+// `b.cap` is enforced on every single triangle. On overflow the triangle is
+// dropped, `mesh_overflow_count()` is incremented, and `b.vbuf` is never
+// written past `cap * 60`.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS MODULE DELIBERATELY DOES NOT DO
+// ---------------------------------------------------------------------------
+//   * No per-vertex fog and no per-vertex lighting at emit time. BUILD_PLAN
+//     W1-10 says "transform-and-pack only". Per-instance fog is applied by
+//     folding the fog factor into the instance tint, which is exact for props
+//     whose extent is small next to the fog gradient. Per-vertex fog belongs to
+//     `emit.hml` / `shade.hml` (W1-2 / W1-3).
+//   * No near-plane CLIPPING. A triangle with any vertex closer than the near
+//     limit is dropped whole and counted in `mesh_rej_near()`. The slow
+//     re-triangulating path is `clip.hml`'s (W1-4).
+//   * No frustum culling. Call `mesh_radius(m)` against `frustum_sphere` first.
+
+import { sqrt, sin, cos } from "@stdlib/math";
+
+// ---------------------------------------------------------------------------
+// constants
+// ---------------------------------------------------------------------------
+
+export let MESH_VSTRIDE = 24;   // bytes per mesh vertex in the arena
+export let MESH_TSTRIDE = 72;   // bytes per mesh triangle in the arena
+export let SDLV_STRIDE  = 20;   // bytes per SDL_Vertex in the batch vbuf
+export let SDLT_STRIDE  = 60;   // bytes per triangle in the batch vbuf
+
+export let MESH_CULL_OFF  = 0;  // emit every triangle
+export let MESH_CULL_NEG  = 1;  // drop triangles whose screen signed area <= 0
+export let MESH_CULL_POS  = -1; // drop triangles whose screen signed area >= 0
+
+// ---------------------------------------------------------------------------
+// per-frame emit state (set once per frame — A4: the matrix rows are hoisted)
+// ---------------------------------------------------------------------------
+
+let g_mesh_mvp: array<f64> = [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0,
+                              0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+let g_mesh_vw: f64 = 320.0;      // viewport width  in pixels
+let g_mesh_vh: f64 = 240.0;      // viewport height in pixels
+let g_mesh_near: f64 = 0.1;      // minimum clip w; anything nearer is dropped
+let g_mesh_guard: f64 = 640.0;   // guard-band margin in pixels
+let g_mesh_cull: i32 = 0;        // MESH_CULL_*
+
+// Scratch used only at build time, to reinterpret an (f32, f32) uv pair as the
+// single u64 the emit loop stores with one write.
+let g_mesh_scratch: ptr = alloc(16);
+
+// Round-to-nearest via the classic 1.5 * 2^52 magic number. `(v + M) - M`
+// forces the mantissa to drop every fractional bit, which is ~17x cheaper than
+// @stdlib/math floor on this toolchain (1.1 ns vs 18.0 ns, measured over 3 M
+// calls). Bare magic rounding is round-half-to-EVEN, which differs from
+// floor(v + 0.5) at exact .5 ties, so a 1e-9 nudge is added first: screen
+// coordinates live in +/-1e6 where a double resolves ~1e-10, so the nudge
+// changes nothing except the tie. probe_mesh.hml asserts the equivalence over
+// 200 000 values, ties included.
+let g_mesh_magic: f64 = 6755399441055744.0;
+
+// counters — plain i32, no stats.hml import (that would drag SDL into a module
+// that must stay usable headless and SDL-free). The frame orchestrator copies
+// these into stats.hml once per frame, not once per triangle.
+let g_mesh_norm_xf: i32 = 0;     // normals transformed, EVER. Bake only.
+let g_mesh_tris_out: i32 = 0;
+let g_mesh_drop: i32 = 0;
+let g_mesh_rej_near: i32 = 0;
+let g_mesh_rej_guard: i32 = 0;
+let g_mesh_rej_back: i32 = 0;
+let g_mesh_instances: i32 = 0;
+
+export fn mesh_set_mvp(p_mvp) {
+    let i: i32 = 0;
+    while (i < 16) { g_mesh_mvp[i] = p_mvp[i]; i++; }
+}
+
+export fn mesh_set_viewport(p_w: f64, p_h: f64) {
+    g_mesh_vw = p_w;
+    g_mesh_vh = p_h;
+    g_mesh_guard = 2.0 * p_w;
+}
+
+export fn mesh_set_near(p_near: f64) { g_mesh_near = p_near; }
+export fn mesh_set_guard(p_margin: f64) { g_mesh_guard = p_margin; }
+export fn mesh_set_cull(p_mode: i32) { g_mesh_cull = p_mode; }
+
+export fn mesh_normal_xform_count(): i32 { let out: i32 = g_mesh_norm_xf; return out; }
+export fn mesh_tris_emitted(): i32 { let out: i32 = g_mesh_tris_out; return out; }
+export fn mesh_overflow_count(): i32 { let out: i32 = g_mesh_drop; return out; }
+export fn mesh_rej_near(): i32 { let out: i32 = g_mesh_rej_near; return out; }
+export fn mesh_rej_guard(): i32 { let out: i32 = g_mesh_rej_guard; return out; }
+export fn mesh_rej_backface(): i32 { let out: i32 = g_mesh_rej_back; return out; }
+export fn mesh_instance_count(): i32 { let out: i32 = g_mesh_instances; return out; }
+
+// Reset the per-frame counters. Does NOT reset the normal-transform counter:
+// that one is a lifetime total, because its whole purpose is to prove a frame
+// added nothing to it.
+export fn mesh_reset_counters() {
+    g_mesh_tris_out = 0;
+    g_mesh_drop = 0;
+    g_mesh_rej_near = 0;
+    g_mesh_rej_guard = 0;
+    g_mesh_rej_back = 0;
+    g_mesh_instances = 0;
+}
+
+export fn mesh_reset_normal_counter() { g_mesh_norm_xf = 0; }
+
+// ---------------------------------------------------------------------------
+// construction
+// ---------------------------------------------------------------------------
+
+// Allocate a mesh that can hold `max_tris` triangles (3 * max_tris vertices).
+// The arena is allocated ONCE and never reallocated (A8/N6).
+export fn mesh_new(max_tris: i32) {
+    let cap_v = max_tris * 3;
+    let m = { vbuf: alloc(cap_v * 24),
+              cap_tris: max_tris, cap_v: cap_v,
+              ntri: 0, nv: 0,
+              nrm: [], alb: [], ao: [],
+              ax: [], ay: [], az: [], auv: [], ac: [],
+              px: [], py: [], pz: [], pu: [], pv: [],
+              pr: [], pg: [], pb: [],
+              pnx: [], pny: [], pnz: [], pao: [],
+              np: 0, building: 0, baked: 0,
+              x0: 0.0, y0: 0.0, z0: 0.0, x1: 0.0, y1: 0.0, z1: 0.0,
+              radius: 0.0 };
+    return m;
+}
+
+// Release the arena. `buffer`/`array`/`object` fields are refcounted and must
+// NOT be freed while the mesh object is still reachable — only the raw `alloc`
+// needs an explicit release (CLAUDE.md 4, "API corrections").
+export fn mesh_free(m) {
+    if (m.vbuf != ptr_null()) { free(m.vbuf); }
+    m.vbuf = ptr_null();
+    m.ntri = 0;
+    m.nv = 0;
+}
+
+// Begin a build. Clears the indexed input pool and the arena cursor.
+export fn mesh_begin(m) {
+    m.building = 1;
+    m.baked = 0;
+    m.ntri = 0;
+    m.nv = 0;
+    m.np = 0;
+    m.px = []; m.py = []; m.pz = []; m.pu = []; m.pv = [];
+    m.pr = []; m.pg = []; m.pb = [];
+    m.pnx = []; m.pny = []; m.pnz = []; m.pao = [];
+    m.nrm = []; m.alb = []; m.ao = [];
+    m.ax = []; m.ay = []; m.az = []; m.auv = []; m.ac = [];
+    m.x0 = 0.0; m.y0 = 0.0; m.z0 = 0.0;
+    m.x1 = 0.0; m.y1 = 0.0; m.z1 = 0.0;
+    m.radius = 0.0;
+}
+
+// Add one vertex to the indexed input pool. Returns its pool index.
+// The normal is left unset, which means "use the face normal of whatever
+// triangle uses me" — flat shading, which is what a PS1-era hard-edged prop
+// wants. `r`,`g`,`b` are the authored ALBEDO (0..255), not the final colour.
+export fn mesh_vert(m, x: f64, y: f64, z: f64, u: f64, v: f64,
+                    r: i32, g: i32, b: i32): i32 {
+    let i = m.np;
+    m.px.push(x); m.py.push(y); m.pz.push(z);
+    m.pu.push(u); m.pv.push(v);
+    m.pr.push(r); m.pg.push(g); m.pb.push(b);
+    m.pnx.push(0.0); m.pny.push(0.0); m.pnz.push(0.0);
+    m.pao.push(1.0);
+    m.np = i + 1;
+    let out: i32 = i;
+    return out;
+}
+
+// Same, with an explicit (smooth) normal — for lathes, canopy discs and
+// anything that should read as curved. Need not be unit length; it is
+// normalized at bake time.
+export fn mesh_vert_n(m, x: f64, y: f64, z: f64, u: f64, v: f64,
+                      r: i32, g: i32, b: i32,
+                      nx: f64, ny: f64, nz: f64): i32 {
+    let i = mesh_vert(m, x, y, z, u, v, r, g, b);
+    m.pnx[i] = nx; m.pny[i] = ny; m.pnz[i] = nz;
+    let out: i32 = i;
+    return out;
+}
+
+// Per-vertex ambient occlusion multiplier, 0..1, applied by mesh_bake_light.
+// This is how creased AO gets into the vertex colour without the engine
+// knowing what a crease is.
+//
+// ORDERING: the pool vertex is copied into the arena by `mesh_tri`, so set the
+// AO BEFORE the first triangle that references the vertex. Setting it after has
+// no effect on triangles already emitted.
+export fn mesh_vert_ao(m, idx: i32, ao: f64) { m.pao[idx] = ao; }
+
+fn push_arena_vert(m, pi: i32, nx: f64, ny: f64, nz: f64) {
+    let vi = m.nv;
+    let o = vi * 24;
+    let vb = m.vbuf;
+    let ar = m.pr[pi] & 255;
+    let ag = m.pg[pi] & 255;
+    let ab = m.pb[pi] & 255;
+    let x = m.px[pi]; let y = m.py[pi]; let z = m.pz[pi];
+    let u = m.pu[pi]; let v = m.pv[pi];
+    // the format of record
+    ptr_write_f32(ptr_offset(vb, o, 1), x);
+    ptr_write_f32(ptr_offset(vb, o + 4, 1), y);
+    ptr_write_f32(ptr_offset(vb, o + 8, 1), z);
+    ptr_write_f32(ptr_offset(vb, o + 12, 1), u);
+    ptr_write_f32(ptr_offset(vb, o + 16, 1), v);
+    // Until mesh_bake_light runs, the vertex colour IS the authored albedo, so
+    // an unbaked mesh renders unlit rather than black.
+    ptr_write_u8(ptr_offset(vb, o + 20, 1), ar);
+    ptr_write_u8(ptr_offset(vb, o + 21, 1), ag);
+    ptr_write_u8(ptr_offset(vb, o + 22, 1), ab);
+    ptr_write_u8(ptr_offset(vb, o + 23, 1), 0);
+    // the read cache — same data, laid out for the emit loop
+    m.ax.push(x); m.ay.push(y); m.az.push(z);
+    ptr_write_f32(ptr_offset(g_mesh_scratch, 0, 1), u);
+    ptr_write_f32(ptr_offset(g_mesh_scratch, 4, 1), v);
+    m.auv.push(ptr_deref_u64(ptr_offset(g_mesh_scratch, 0, 1)));
+    m.ac.push(ar + ag * 256 + ab * 65536);
+    // bake side tables
+    m.nrm.push(nx); m.nrm.push(ny); m.nrm.push(nz);
+    m.alb.push(ar); m.alb.push(ag); m.alb.push(ab);
+    m.ao.push(m.pao[pi]);
+    m.nv = vi + 1;
+}
+
+// Emit one triangle from three pool indices. Returns the triangle index, or -1
+// if the mesh arena is full (never writes past the arena).
+export fn mesh_tri(m, ia: i32, ib: i32, ic: i32): i32 {
+    if (m.ntri >= m.cap_tris) { let bad: i32 = -1; return bad; }
+
+    // Face normal, computed once here at BUILD time. This is the only place in
+    // the module where a cross product happens.
+    let ax = m.px[ia]; let ay = m.py[ia]; let az = m.pz[ia];
+    let ux = m.px[ib] - ax; let uy = m.py[ib] - ay; let uz = m.pz[ib] - az;
+    let wx = m.px[ic] - ax; let wy = m.py[ic] - ay; let wz = m.pz[ic] - az;
+    let fx = uy * wz - uz * wy;
+    let fy = uz * wx - ux * wz;
+    let fz = ux * wy - uy * wx;
+    let fl = sqrt(fx * fx + fy * fy + fz * fz);
+    if (fl > 0.0) { fx = fx / fl; fy = fy / fl; fz = fz / fl; }
+
+    push_arena_vert(m, ia, pick_n(m, ia, fx), pick_n2(m, ia, fy), pick_n3(m, ia, fz));
+    push_arena_vert(m, ib, pick_n(m, ib, fx), pick_n2(m, ib, fy), pick_n3(m, ib, fz));
+    push_arena_vert(m, ic, pick_n(m, ic, fx), pick_n2(m, ic, fy), pick_n3(m, ic, fz));
+
+    let t = m.ntri;
+    m.ntri = t + 1;
+    let out: i32 = t;
+    return out;
+}
+
+// A pool vertex with an all-zero normal inherits the face normal.
+fn has_n(m, i: i32): i32 {
+    let nx = m.pnx[i]; let ny = m.pny[i]; let nz = m.pnz[i];
+    if (nx != 0.0) { let a: i32 = 1; return a; }
+    if (ny != 0.0) { let a: i32 = 1; return a; }
+    if (nz != 0.0) { let a: i32 = 1; return a; }
+    let a: i32 = 0;
+    return a;
+}
+fn pick_n(m, i: i32, fx: f64): f64 {
+    if (has_n(m, i) == 1) { let a: f64 = m.pnx[i]; return a; }
+    let a: f64 = fx; return a;
+}
+fn pick_n2(m, i: i32, fy: f64): f64 {
+    if (has_n(m, i) == 1) { let a: f64 = m.pny[i]; return a; }
+    let a: f64 = fy; return a;
+}
+fn pick_n3(m, i: i32, fz: f64): f64 {
+    if (has_n(m, i) == 1) { let a: f64 = m.pnz[i]; return a; }
+    let a: f64 = fz; return a;
+}
+
+// Convenience: a planar quad a-b-c-d becomes triangles (a,b,c) and (a,c,d).
+export fn mesh_quad(m, ia: i32, ib: i32, ic: i32, id: i32): i32 {
+    let t = mesh_tri(m, ia, ib, ic);
+    mesh_tri(m, ia, ic, id);
+    let out: i32 = t;
+    return out;
+}
+
+// Finish the build: compute the model-space AABB and bounding radius (for the
+// caller's frustum-sphere test) and drop the indexed input pool.
+export fn mesh_end(m) {
+    let n = m.nv;
+    let minx: f64 = 0.0; let miny: f64 = 0.0; let minz: f64 = 0.0;
+    let maxx: f64 = 0.0; let maxy: f64 = 0.0; let maxz: f64 = 0.0;
+    let r2: f64 = 0.0;
+    let vb = m.vbuf;
+    let i: i32 = 0;
+    while (i < n) {
+        let o = i * 24;
+        let x: f64 = ptr_deref_f32(ptr_offset(vb, o, 1));
+        let y: f64 = ptr_deref_f32(ptr_offset(vb, o + 4, 1));
+        let z: f64 = ptr_deref_f32(ptr_offset(vb, o + 8, 1));
+        if (i == 0) {
+            minx = x; miny = y; minz = z; maxx = x; maxy = y; maxz = z;
+        } else {
+            if (x < minx) { minx = x; } if (x > maxx) { maxx = x; }
+            if (y < miny) { miny = y; } if (y > maxy) { maxy = y; }
+            if (z < minz) { minz = z; } if (z > maxz) { maxz = z; }
+        }
+        let d2: f64 = x * x + y * y + z * z;
+        if (d2 > r2) { r2 = d2; }
+        i++;
+    }
+    m.x0 = minx; m.y0 = miny; m.z0 = minz;
+    m.x1 = maxx; m.y1 = maxy; m.z1 = maxz;
+    m.radius = sqrt(r2);
+    m.building = 0;
+    m.px = []; m.py = []; m.pz = []; m.pu = []; m.pv = [];
+    m.pr = []; m.pg = []; m.pb = [];
+    m.pnx = []; m.pny = []; m.pnz = []; m.pao = [];
+    m.np = 0;
+}
+
+// Drop the bake side tables. The mesh can still be emitted but no longer
+// re-baked. Only worth calling if a caller is memory-bound.
+export fn mesh_shrink(m) { m.nrm = []; m.alb = []; m.ao = []; }
+
+export fn mesh_tri_count(m): i32 { let out: i32 = m.ntri; return out; }
+export fn mesh_vert_count(m): i32 { let out: i32 = m.nv; return out; }
+export fn mesh_capacity(m): i32 { let out: i32 = m.cap_tris; return out; }
+export fn mesh_radius(m): f64 { let out: f64 = m.radius; return out; }
+export fn mesh_buf(m): ptr { let out: ptr = m.vbuf; return out; }
+export fn mesh_is_baked(m): i32 { let out: i32 = m.baked; return out; }
+
+// Read one packed vertex colour byte back (testing / verification).
+export fn mesh_vert_rgb(m, vi: i32, chan: i32): i32 {
+    let out: i32 = ptr_deref_u8(ptr_offset(m.vbuf, vi * 24 + 20 + chan, 1));
+    return out;
+}
+export fn mesh_vert_pos(m, vi: i32, chan: i32): f64 {
+    let out: f64 = ptr_deref_f32(ptr_offset(m.vbuf, vi * 24 + chan * 4, 1));
+    return out;
+}
+export fn mesh_vert_uv(m, vi: i32, chan: i32): f64 {
+    let out: f64 = ptr_deref_f32(ptr_offset(m.vbuf, vi * 24 + 12 + chan * 4, 1));
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mesh_bake_light — THE POINT OF THE WHOLE FILE
+// ---------------------------------------------------------------------------
+// Runs ONCE, at asset build time (or again when the time of day moves enough to
+// matter). Folds the lighting model of ENGINE_GAPS G16 into the vertex colour:
+//
+//     light = ambient + sun * max(0, N.L) + bounce * max(0, -N.y)
+//     rgb   = clamp(albedo * light * ao, 0, 255)
+//
+// per channel. `ambient + sun` summing to (1,1,1) with N.L == 1 reproduces the
+// authored albedo exactly, which is the invariant the atlas is authored against
+// (ARCHITECTURE 6 / CLAUDE.md 8: vertex colour can only darken).
+//
+// The light direction is in MODEL space and points TOWARD the light. For a
+// yaw-rotated instance the caller rotates the light by -yaw once, here, instead
+// of rotating every normal into world space every frame — that substitution is
+// the entire performance argument of G19.
+//
+// Returns the number of vertices baked. Increments the lifetime
+// normal-transform counter by that amount: this is the ONLY function in the
+// module that touches a normal.
+export fn mesh_bake_light(m,
+                          lx: f64, ly: f64, lz: f64,
+                          sun_r: f64, sun_g: f64, sun_b: f64,
+                          amb_r: f64, amb_g: f64, amb_b: f64,
+                          bnc_r: f64, bnc_g: f64, bnc_b: f64): i32 {
+    let n: i32 = m.nv;
+    if (m.nrm.length < n * 3) { let bad: i32 = -1; return bad; }
+
+    // normalize the light once
+    let ll: f64 = sqrt(lx * lx + ly * ly + lz * lz);
+    let dx: f64 = lx; let dy: f64 = ly; let dz: f64 = lz;
+    if (ll > 0.0) { dx = lx / ll; dy = ly / ll; dz = lz / ll; }
+
+    let nrm: array<f64> = m.nrm;
+    let alb: array<i32> = m.alb;
+    let aoa: array<f64> = m.ao;
+    let cache: array<i32> = m.ac;
+    let vb: ptr = m.vbuf;
+
+    let i: i32 = 0;
+    while (i < n) {
+        let k = i * 3;
+        let nx: f64 = nrm[k];
+        let ny: f64 = nrm[k + 1];
+        let nz: f64 = nrm[k + 2];
+        let nl: f64 = sqrt(nx * nx + ny * ny + nz * nz);
+        if (nl > 0.0) { nx = nx / nl; ny = ny / nl; nz = nz / nl; }
+
+        let ndl: f64 = nx * dx + ny * dy + nz * dz;
+        if (ndl < 0.0) { ndl = 0.0; }
+        let up: f64 = 0.0 - ny;
+        if (up < 0.0) { up = 0.0; }
+
+        let ao: f64 = aoa[i];
+        let cr: f64 = f64(alb[k]) * (amb_r + sun_r * ndl + bnc_r * up) * ao;
+        let cg: f64 = f64(alb[k + 1]) * (amb_g + sun_g * ndl + bnc_g * up) * ao;
+        let cb: f64 = f64(alb[k + 2]) * (amb_b + sun_b * ndl + bnc_b * up) * ao;
+
+        let ir: i32 = i32(cr + 0.5);
+        let ig: i32 = i32(cg + 0.5);
+        let ib: i32 = i32(cb + 0.5);
+        if (ir > 255) { ir = 255; } if (ir < 0) { ir = 0; }
+        if (ig > 255) { ig = 255; } if (ig < 0) { ig = 0; }
+        if (ib > 255) { ib = 255; } if (ib < 0) { ib = 0; }
+
+        let o = i * 24;
+        ptr_write_u8(ptr_offset(vb, o + 20, 1), ir);
+        ptr_write_u8(ptr_offset(vb, o + 21, 1), ig);
+        ptr_write_u8(ptr_offset(vb, o + 22, 1), ib);
+        cache[i] = ir + ig * 256 + ib * 65536;
+        i++;
+    }
+
+    g_mesh_norm_xf = g_mesh_norm_xf + n;
+    m.baked = 1;
+    let out: i32 = n;
+    return out;
+}
+
+// Restore every vertex colour to its authored albedo (undo a bake).
+export fn mesh_unbake(m): i32 {
+    let n: i32 = m.nv;
+    if (m.alb.length < n * 3) { let bad: i32 = -1; return bad; }
+    let alb: array<i32> = m.alb;
+    let cache: array<i32> = m.ac;
+    let vb: ptr = m.vbuf;
+    let i: i32 = 0;
+    while (i < n) {
+        let k = i * 3;
+        let o = i * 24;
+        let ir = alb[k] & 255;
+        let ig = alb[k + 1] & 255;
+        let ib = alb[k + 2] & 255;
+        ptr_write_u8(ptr_offset(vb, o + 20, 1), ir);
+        ptr_write_u8(ptr_offset(vb, o + 21, 1), ig);
+        ptr_write_u8(ptr_offset(vb, o + 22, 1), ib);
+        cache[i] = ir + ig * 256 + ib * 65536;
+        i++;
+    }
+    m.baked = 0;
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// the hot kernel — transform and pack, nothing else
+// ---------------------------------------------------------------------------
+// Takes rows 0, 1 and 3 of the already-concatenated MVP*model matrix as twelve
+// f64 scalars. Row 2 (clip z) is never computed: SDL_Vertex is 2D and the
+// painter key is clip w, so a quarter of the matrix multiply is pure waste
+// (ARCHITECTURE 2.3, invariant 1).
+//
+// Every parameter is copied into a typed local (A1). Nothing in the loop
+// allocates, calls, or closes over anything.
+fn emit_xf(p_m, p_b, p_tex,
+           p_a0: f64, p_a1: f64, p_a2: f64, p_a3: f64,
+           p_b0: f64, p_b1: f64, p_b2: f64, p_b3: f64,
+           p_d0: f64, p_d1: f64, p_d2: f64, p_d3: f64,
+           p_tr: i32, p_tg: i32, p_tb: i32, p_ta: i32): i32 {
+
+    let vw: f64 = g_mesh_vw;
+    let vh: f64 = g_mesh_vh;
+    let hw: f64 = 0.5 * vw;
+    let hh: f64 = 0.5 * vh;
+    // The viewport transform is folded into the matrix rows ONCE per instance:
+    //     sx = floor(((A.v) * inv * 0.5 + 0.5) * vw + 0.5)
+    //        = floor(((A * 0.5vw) . v) * inv + (0.5vw + 0.5))
+    //     sy = floor((1 - ((B.v) * inv * 0.5 + 0.5)) * vh + 0.5)
+    //        = floor(((-B * 0.5vh) . v) * inv + (0.5vh + 0.5))
+    // which turns 3 multiplies + 3 adds per vertex per axis into 1 and 1.
+    let a0: f64 = p_a0 * hw; let a1: f64 = p_a1 * hw;
+    let a2: f64 = p_a2 * hw; let a3: f64 = p_a3 * hw;
+    let b0: f64 = 0.0 - p_b0 * hh; let b1: f64 = 0.0 - p_b1 * hh;
+    let b2: f64 = 0.0 - p_b2 * hh; let b3: f64 = 0.0 - p_b3 * hh;
+    let d0: f64 = p_d0; let d1: f64 = p_d1; let d2: f64 = p_d2; let d3: f64 = p_d3;
+    let magic: f64 = g_mesh_magic;
+    let xoff: f64 = hw + magic + 0.000000001;
+    let yoff: f64 = hh + magic + 0.000000001;
+
+    let mx: array<f64> = p_m.ax;
+    let my: array<f64> = p_m.ay;
+    let mz: array<f64> = p_m.az;
+    let muv: array = p_m.auv;
+    let mc: array<i32> = p_m.ac;
+    let ntri: i32 = p_m.ntri;
+
+    let vb: ptr = p_b.vbuf;
+    let dep: array<f64> = p_b.depth;
+    let tex: array = p_b.tex;
+    let n: i32 = p_b.n;
+    let cap: i32 = p_b.cap;
+    let texv = p_tex;
+
+    let near: f64 = g_mesh_near;
+    let gmar: f64 = g_mesh_guard;
+    let gx1: f64 = vw + gmar;
+    let gy1: f64 = vh + gmar;
+    let gx0: f64 = 0.0 - gmar;
+    let gy0: f64 = 0.0 - gmar;
+    let cull: i32 = g_mesh_cull;
+
+    // 8.8 fixed point: (c * (tint+1)) >> 8 maps tint 255 -> identity and tint 0
+    // -> 0 exactly, which a plain (c*tint)>>8 does not (it loses 1/255).
+    let tr: i32 = p_tr + 1; let tg: i32 = p_tg + 1; let tb: i32 = p_tb + 1;
+    let plain: i32 = 0;
+    if (p_tr == 255) { if (p_tg == 255) { if (p_tb == 255) { plain = 1; } } }
+    // The alpha byte pre-shifted into the packed RGBA word. Kept in i32 with
+    // the top byte expressed as a NEGATIVE offset for a >= 128, so the store is
+    // ptr_write_i32 and no u32 conversion is needed: two `u32()` casts plus the
+    // multiply measured 59 ns, this measures ~10. The little-endian byte image
+    // of the i32 two's complement is identical to the u32's, which is all
+    // SDL_Vertex.color cares about. No overflow is possible: the maximum is
+    // 0xFFFFFF + 127*2^24 == i32 max, the minimum is -128*2^24 == i32 min.
+    let ash: i32 = p_ta & 255;
+    if (ash >= 128) { ash = ash - 256; }
+    let abase: i32 = ash * 16777216;
+
+    let written: i32 = 0;
+    let rnear: i32 = 0;
+    let rguard: i32 = 0;
+    let rback: i32 = 0;
+    let dropped: i32 = 0;
+
+    let t: i32 = 0;
+    let vi: i32 = 0;
+    while (t < ntri) {
+        let j0: i32 = vi;
+        let j1: i32 = vi + 1;
+        let j2: i32 = vi + 2;
+        vi = vi + 3;
+
+        let x0: f64 = mx[j0]; let y0: f64 = my[j0]; let z0: f64 = mz[j0];
+        let x1: f64 = mx[j1]; let y1: f64 = my[j1]; let z1: f64 = mz[j1];
+        let x2: f64 = mx[j2]; let y2: f64 = my[j2]; let z2: f64 = mz[j2];
+
+        let w0: f64 = d0 * x0 + d1 * y0 + d2 * z0 + d3;
+        let w1: f64 = d0 * x1 + d1 * y1 + d2 * z1 + d3;
+        let w2: f64 = d0 * x2 + d1 * y2 + d2 * z2 + d3;
+
+        if (w0 < near) { rnear++; t++; continue; }
+        if (w1 < near) { rnear++; t++; continue; }
+        if (w2 < near) { rnear++; t++; continue; }
+
+        let i0: f64 = 1.0 / w0;
+        let i1: f64 = 1.0 / w1;
+        let i2: f64 = 1.0 / w2;
+
+        let sx0: f64 = ((a0 * x0 + a1 * y0 + a2 * z0 + a3) * i0 + xoff) - magic;
+        let sy0: f64 = ((b0 * x0 + b1 * y0 + b2 * z0 + b3) * i0 + yoff) - magic;
+        let sx1: f64 = ((a0 * x1 + a1 * y1 + a2 * z1 + a3) * i1 + xoff) - magic;
+        let sy1: f64 = ((b0 * x1 + b1 * y1 + b2 * z1 + b3) * i1 + yoff) - magic;
+        let sx2: f64 = ((a0 * x2 + a1 * y2 + a2 * z2 + a3) * i2 + xoff) - magic;
+        let sy2: f64 = ((b0 * x2 + b1 * y2 + b2 * z2 + b3) * i2 + yoff) - magic;
+
+        // guard band: reject only when the whole triangle is outside one edge
+        if (sx0 < gx0) { if (sx1 < gx0) { if (sx2 < gx0) { rguard++; t++; continue; } } }
+        if (sx0 > gx1) { if (sx1 > gx1) { if (sx2 > gx1) { rguard++; t++; continue; } } }
+        if (sy0 < gy0) { if (sy1 < gy0) { if (sy2 < gy0) { rguard++; t++; continue; } } }
+        if (sy0 > gy1) { if (sy1 > gy1) { if (sy2 > gy1) { rguard++; t++; continue; } } }
+
+        if (cull != 0) {
+            let ar: f64 = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+            if (cull == 1) { if (ar <= 0.0) { rback++; t++; continue; } }
+            if (cull == -1) { if (ar >= 0.0) { rback++; t++; continue; } }
+        }
+
+        if (n >= cap) { dropped++; t++; continue; }
+
+        let k0: i32 = mc[j0];
+        let k1: i32 = mc[j1];
+        let k2: i32 = mc[j2];
+        if (plain == 0) {
+            k0 = (((k0 & 255) * tr) >> 8)
+               + ((((k0 >> 8) & 255) * tg) >> 8) * 256
+               + ((((k0 >> 16) & 255) * tb) >> 8) * 65536;
+            k1 = (((k1 & 255) * tr) >> 8)
+               + ((((k1 >> 8) & 255) * tg) >> 8) * 256
+               + ((((k1 >> 16) & 255) * tb) >> 8) * 65536;
+            k2 = (((k2 & 255) * tr) >> 8)
+               + ((((k2 >> 8) & 255) * tg) >> 8) * 256
+               + ((((k2 >> 16) & 255) * tb) >> 8) * 65536;
+        }
+
+        let ob: i32 = n * 60;
+        ptr_write_f32(ptr_offset(vb, ob, 1), sx0);
+        ptr_write_f32(ptr_offset(vb, ob + 4, 1), sy0);
+        ptr_write_i32(ptr_offset(vb, ob + 8, 1), k0 + abase);
+        ptr_write_u64(ptr_offset(vb, ob + 12, 1), muv[j0]);
+
+        ptr_write_f32(ptr_offset(vb, ob + 20, 1), sx1);
+        ptr_write_f32(ptr_offset(vb, ob + 24, 1), sy1);
+        ptr_write_i32(ptr_offset(vb, ob + 28, 1), k1 + abase);
+        ptr_write_u64(ptr_offset(vb, ob + 32, 1), muv[j1]);
+
+        ptr_write_f32(ptr_offset(vb, ob + 40, 1), sx2);
+        ptr_write_f32(ptr_offset(vb, ob + 44, 1), sy2);
+        ptr_write_i32(ptr_offset(vb, ob + 48, 1), k2 + abase);
+        ptr_write_u64(ptr_offset(vb, ob + 52, 1), muv[j2]);
+
+        dep[n] = (w0 + w1 + w2) * 0.3333333333333333;
+        tex[n] = texv;
+        n++;
+        written++;
+        t++;
+    }
+
+    p_b.n = n;
+    g_mesh_tris_out = g_mesh_tris_out + written;
+    g_mesh_rej_near = g_mesh_rej_near + rnear;
+    g_mesh_rej_guard = g_mesh_rej_guard + rguard;
+    g_mesh_rej_back = g_mesh_rej_back + rback;
+    g_mesh_drop = g_mesh_drop + dropped;
+    g_mesh_instances = g_mesh_instances + 1;
+    let out: i32 = written;
+    return out;
+}
+
+// Emit one instance under an arbitrary row-major 4x4 model matrix (vec.hml
+// layout). The MVP*model concatenation is done in f64 locals — no matrix object
+// is allocated. Returns the number of triangles written.
+export fn mesh_emit(p_m, p_b, p_tex, p_model,
+                    p_tr: i32, p_tg: i32, p_tb: i32, p_ta: i32): i32 {
+    let n0 = p_model[0];  let n1 = p_model[1];  let n2 = p_model[2];  let n3 = p_model[3];
+    let n4 = p_model[4];  let n5 = p_model[5];  let n6 = p_model[6];  let n7 = p_model[7];
+    let n8 = p_model[8];  let n9 = p_model[9];  let na = p_model[10]; let nb = p_model[11];
+    let nc = p_model[12]; let nd = p_model[13]; let ne = p_model[14]; let nf = p_model[15];
+
+    let p0 = g_mesh_mvp[0];  let p1 = g_mesh_mvp[1];  let p2 = g_mesh_mvp[2];  let p3 = g_mesh_mvp[3];
+    let p4 = g_mesh_mvp[4];  let p5 = g_mesh_mvp[5];  let p6 = g_mesh_mvp[6];  let p7 = g_mesh_mvp[7];
+    let pc = g_mesh_mvp[12]; let pd = g_mesh_mvp[13]; let pe = g_mesh_mvp[14]; let pf = g_mesh_mvp[15];
+
+    let a0 = p0*n0 + p1*n4 + p2*n8 + p3*nc;
+    let a1 = p0*n1 + p1*n5 + p2*n9 + p3*nd;
+    let a2 = p0*n2 + p1*n6 + p2*na + p3*ne;
+    let a3 = p0*n3 + p1*n7 + p2*nb + p3*nf;
+
+    let b0 = p4*n0 + p5*n4 + p6*n8 + p7*nc;
+    let b1 = p4*n1 + p5*n5 + p6*n9 + p7*nd;
+    let b2 = p4*n2 + p5*n6 + p6*na + p7*ne;
+    let b3 = p4*n3 + p5*n7 + p6*nb + p7*nf;
+
+    let d0 = pc*n0 + pd*n4 + pe*n8 + pf*nc;
+    let d1 = pc*n1 + pd*n5 + pe*n9 + pf*nd;
+    let d2 = pc*n2 + pd*n6 + pe*na + pf*ne;
+    let d3 = pc*n3 + pd*n7 + pe*nb + pf*nf;
+
+    let out: i32 = emit_xf(p_m, p_b, p_tex, a0, a1, a2, a3, b0, b1, b2, b3,
+                           d0, d1, d2, d3, p_tr, p_tg, p_tb, p_ta);
+    return out;
+}
+
+// The hot instancing path: uniform scale, yaw about +Y, translate. This is the
+// shape 95% of props and entities use, and it lets the whole model matrix be
+// folded into the MVP with 24 multiplies instead of 64 — and with no object.
+//
+// Model matrix M = T(x,y,z) . Ry(yaw) . S(s), i.e.
+//     [ s*c   0   s*sn   x ]
+//     [   0   s      0   y ]
+//     [-s*sn  0   s*c    z ]
+//     [   0   0      0   1 ]
+export fn mesh_emit_yaw(p_m, p_b, p_tex,
+                        p_x: f64, p_y: f64, p_z: f64,
+                        p_yaw: f64, p_scale: f64,
+                        p_tr: i32, p_tg: i32, p_tb: i32, p_ta: i32): i32 {
+    let sc: f64 = p_scale * cos(p_yaw);
+    let ss: f64 = p_scale * sin(p_yaw);
+    let sy: f64 = p_scale;
+    let tx: f64 = p_x; let ty: f64 = p_y; let tz: f64 = p_z;
+
+    let p0 = g_mesh_mvp[0];  let p1 = g_mesh_mvp[1];  let p2 = g_mesh_mvp[2];  let p3 = g_mesh_mvp[3];
+    let p4 = g_mesh_mvp[4];  let p5 = g_mesh_mvp[5];  let p6 = g_mesh_mvp[6];  let p7 = g_mesh_mvp[7];
+    let pc = g_mesh_mvp[12]; let pd = g_mesh_mvp[13]; let pe = g_mesh_mvp[14]; let pf = g_mesh_mvp[15];
+
+    let a0 = p0 * sc - p2 * ss;
+    let a1 = p1 * sy;
+    let a2 = p0 * ss + p2 * sc;
+    let a3 = p0 * tx + p1 * ty + p2 * tz + p3;
+
+    let b0 = p4 * sc - p6 * ss;
+    let b1 = p5 * sy;
+    let b2 = p4 * ss + p6 * sc;
+    let b3 = p4 * tx + p5 * ty + p6 * tz + p7;
+
+    let d0 = pc * sc - pe * ss;
+    let d1 = pd * sy;
+    let d2 = pc * ss + pe * sc;
+    let d3 = pc * tx + pd * ty + pe * tz + pf;
+
+    let out: i32 = emit_xf(p_m, p_b, p_tex, a0, a1, a2, a3, b0, b1, b2, b3,
+                           d0, d1, d2, d3, p_tr, p_tg, p_tb, p_ta);
+    return out;
+}

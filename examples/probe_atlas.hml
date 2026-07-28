@@ -1,0 +1,784 @@
+// probe_atlas.hml — verification program for src/texture.hml + src/atlas.hml
+//                    (Nightshade W1-8 / G13).
+//
+//   hemlockc -O1 examples/probe_atlas.hml -o /tmp/probe_atlas
+//   SDL_VIDEODRIVER=dummy /tmp/probe_atlas          # headless
+//   DISPLAY=:0 /tmp/probe_atlas                     # real display
+//   hemlock examples/probe_atlas.hml                # interpreted
+//
+// Exits 0 only if every assertion passed AND the number of assertions executed
+// is exactly the number this file says it should execute.  A probe that exits 0
+// while printing FAIL is worse than no probe, and so is one that silently skips
+// half its checks.
+//
+// What it proves, in order:
+//   A. texture.hml is a 4-byte-per-texel RGBA8 container: size, texel
+//      round-trip, fill, clipped blit, keyed blit, RGB24 export.
+//   B. atlas_cell_uv insets by exactly half a texel, and that inset is what
+//      keeps floor(u*W) inside the cell at both ends for every cell of a grid.
+//   C. The SDL texture really is RGBA32 (376840196) and RGBA32 is in the
+//      renderer's own supported-format list — i.e. SDL created no conversion
+//      texture.  (The legacy RGB24 format is queried for contrast.)
+//   D. A known RGBA pattern round-trips byte-for-byte through
+//      atlas_upload -> SDL_RenderCopy -> SDL_RenderReadPixels.
+//   E. atlas_update_rows uploads exactly the rows asked for and nothing else.
+//   F. A 32x32 cell at the atlas edge never samples a neighbouring cell across
+//      a 10 800-frame (3 minutes at 60 fps) grazing-angle sweep — and the same
+//      sweep WITHOUT the inset does bleed, so the test is not vacuous.
+//
+// Sections A and B need no SDL.  C-F open a window; under SDL_VIDEODRIVER=dummy
+// SDL picks the software renderer, which is exact.
+
+import { sin, cos, floor, sqrt, divi, PI } from "@stdlib/math";
+import { exit } from "@stdlib/process";
+import { clock } from "@stdlib/time";
+
+import { TEX_BPP, tex_new, tex_set, tex_set_rgb, tex_get, tex_ch, tex_fill,
+         tex_fill_rect, tex_blit, tex_blit_keyed, tex_to_rgb24, tex_pitch,
+         tex_bytes } from "../src/texture.hml";
+
+import { atlas_new, atlas_px, atlas_px_rgb, atlas_get, atlas_fill,
+         atlas_fill_rect, atlas_cell_of, atlas_cell_x, atlas_cell_y,
+         atlas_cell_w, atlas_cell_h, atlas_cell_count, atlas_cell_uv,
+         atlas_rect_uv, atlas_upload, atlas_update_rows, atlas_mark_rows,
+         atlas_dirty_rows, atlas_flush, atlas_format, atlas_free, atlas_pitch,
+         atlas_tex, atlas_data } from "../src/atlas.hml";
+
+import { window_open_ex, window_close, sdl_clear, sdl_present, set_draw_blend,
+         create_target, set_target, copy_ex, draw_tris_at, read_pixels_rect,
+         set_tex_blend, destroy_tex, query_tex, create_static_tex,
+         FMT_RGBA32, FMT_ARGB8888, FMT_RGB24,
+         BLEND_NONE, BLEND_BLEND, sdl_error } from "../src/sdl.hml";
+
+import { write_png } from "../src/png.hml";
+
+// SDL_GetRendererInfo is not part of the sdl.hml surface (W0-1 owns that file
+// and this is the only caller in the tree), so it is bound locally.  The extern
+// binds to the most recently declared `import` — H-6 — hence the library import
+// immediately above it and nothing between them.
+//
+// SDL_RendererInfo, x86-64:
+//   0  const char *name
+//   8  Uint32 flags
+//   12 Uint32 num_texture_formats
+//   16 Uint32 texture_formats[16]
+//   80 int max_texture_width
+//   84 int max_texture_height        -> sizeof == 88
+import "libSDL2-2.0.so.0";
+extern fn SDL_GetRendererInfo(ren: ptr, info: ptr): i32;   // since 2.0.0
+
+// ===========================================================================
+// harness
+// ===========================================================================
+
+// The number of assertions this file must execute.  Asserted at the end.
+let g_expect_checks: i32 = 79;
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+
+fn chk(name: string, ok: i32) {
+    if (ok == 1) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL: ${name}`);
+    }
+}
+
+fn chk_eq(name: string, got: i32, want: i32) {
+    if (got == want) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL: ${name} — got ${got}, want ${want}`);
+    }
+}
+
+fn chk_equ(name: string, got: u32, want: u32) {
+    if (got == want) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL: ${name} — got ${got}, want ${want}`);
+    }
+}
+
+fn chk_near(name: string, got: f64, want: f64, tol: f64) {
+    let d = got - want;
+    if (d < 0.0) { d = 0.0 - d; }
+    if (d <= tol) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL: ${name} — got ${got}, want ${want}`);
+    }
+}
+
+// r | g<<8 | b<<16 | a<<24, built in u32 so nothing traps on i32 overflow.
+fn rgba_word(p_r: i32, p_g: i32, p_b: i32, p_a: i32): u32 {
+    let r: u32 = u32(p_r & 255);
+    let g: u32 = u32(p_g & 255);
+    let b: u32 = u32(p_b & 255);
+    let a: u32 = u32(p_a & 255);
+    let out: u32 = r + g * 256 + b * 65536 + a * 16777216;
+    return out;
+}
+
+// ===========================================================================
+// A. texture.hml — the RGBA8 container
+// ===========================================================================
+
+fn section_a() {
+    print("A. texture.hml — RGBA8 container");
+
+    chk_eq("TEX_BPP is 4", TEX_BPP, 4);
+
+    let t = tex_new(8, 5);
+    chk_eq("tex_new width", t.width, 8);
+    chk_eq("tex_new height", t.height, 5);
+    chk_eq("tex_new data is w*h*4 bytes", t.data.length, 8 * 5 * 4);
+    chk_eq("tex_bytes", tex_bytes(t), 160);
+    chk_eq("tex_pitch is width*4", tex_pitch(t), 32);
+
+    // A fresh texture is transparent black everywhere.
+    let zeros: i32 = 0;
+    for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 8; x++) {
+            if (tex_get(t, x, y) == 0) { zeros++; }
+        }
+    }
+    chk_eq("tex_new is zero-filled", zeros, 40);
+
+    // Every texel gets a distinct RGBA and reads back exactly.
+    let bad: i32 = 0;
+    for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 8; x++) {
+            let r = (x * 31 + y * 7) & 255;
+            let g = (x * 17 + y * 61) & 255;
+            let b = (x * 5 + y * 43 + 128) & 255;
+            let a = (x + y * 29) & 255;
+            tex_set(t, x, y, r, g, b, a);
+            if (tex_get(t, x, y) != rgba_word(r, g, b, a)) { bad++; }
+            if (tex_ch(t, x, y, 0) != r) { bad++; }
+            if (tex_ch(t, x, y, 1) != g) { bad++; }
+            if (tex_ch(t, x, y, 2) != b) { bad++; }
+            if (tex_ch(t, x, y, 3) != a) { bad++; }
+        }
+    }
+    chk_eq("tex_set/tex_get/tex_ch round-trip, 40 texels", bad, 0);
+
+    // Memory order is R,G,B,A — the layout FMT_RGBA32 wants.
+    tex_set(t, 3, 2, 1, 2, 3, 4);
+    let o = (2 * 8 + 3) * 4;
+    let d = t.data;
+    chk("byte order at (3,2) is R,G,B,A",
+        (d[o] == 1 && d[o + 1] == 2 && d[o + 2] == 3 && d[o + 3] == 4) ? 1 : 0);
+
+    // Out-of-range access is dropped / zero, never a throw.
+    tex_set(t, -1, 0, 9, 9, 9, 9);
+    tex_set(t, 8, 0, 9, 9, 9, 9);
+    tex_set(t, 0, 5, 9, 9, 9, 9);
+    chk_equ("out-of-range tex_get is 0", tex_get(t, 99, 99), 0);
+
+    tex_set_rgb(t, 0, 0, 11, 22, 33);
+    chk_eq("tex_set_rgb forces alpha 255", tex_ch(t, 0, 0, 3), 255);
+
+    tex_fill(t, 7, 8, 9, 10);
+    let filled: i32 = 0;
+    let want = rgba_word(7, 8, 9, 10);
+    for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 8; x++) {
+            if (tex_get(t, x, y) == want) { filled++; }
+        }
+    }
+    chk_eq("tex_fill covers every texel", filled, 40);
+
+    tex_fill_rect(t, 6, 3, 10, 10, 1, 2, 3, 4);      // deliberately overhangs
+    let rectw = rgba_word(1, 2, 3, 4);
+    let inrect: i32 = 0;
+    let outrect: i32 = 0;
+    for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 8; x++) {
+            let hit = tex_get(t, x, y) == rectw;
+            let inside = (x >= 6 && y >= 3);
+            if (inside && hit) { inrect++; }
+            if (!inside && hit) { outrect++; }
+        }
+    }
+    chk_eq("tex_fill_rect clips to the texture", inrect, 4);
+    chk_eq("tex_fill_rect writes nothing outside", outrect, 0);
+
+    // Blit: a 4x4 source into the middle of an 8x8 destination.
+    let src = tex_new(4, 4);
+    for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) { tex_set(src, x, y, 100 + x, 150 + y, 200, 255); }
+    }
+    let dst = tex_new(8, 8);
+    tex_fill(dst, 0, 0, 0, 255);
+    let n = tex_blit(dst, 2, 2, src, 0, 0, 4, 4);
+    chk_eq("tex_blit returns texels written", n, 16);
+    let ok: i32 = 1;
+    for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+            if (tex_get(dst, 2 + x, 2 + y) != tex_get(src, x, y)) { ok = 0; }
+        }
+    }
+    chk("tex_blit copies exactly", ok);
+    chk_equ("tex_blit left neighbour untouched", tex_get(dst, 1, 2),
+            rgba_word(0, 0, 0, 255));
+
+    // Blit clipped on both the near and far edge, and off the source origin.
+    chk_eq("tex_blit clips at the far edge", tex_blit(dst, 6, 6, src, 0, 0, 4, 4), 4);
+    chk_eq("tex_blit clips at a negative destination", tex_blit(dst, -2, -2, src, 0, 0, 4, 4), 4);
+    chk_eq("tex_blit clips a negative source origin", tex_blit(dst, 0, 0, src, -1, -1, 4, 4), 9);
+    chk_eq("tex_blit fully off-texture writes nothing", tex_blit(dst, 20, 20, src, 0, 0, 4, 4), 0);
+
+    // Keyed blit skips alpha-0 source texels.
+    let key = tex_new(4, 4);
+    for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+            let a = ((x + y) % 2 == 0) ? 255 : 0;
+            tex_set(key, x, y, 250, 250, 250, a);
+        }
+    }
+    let kd = tex_new(4, 4);
+    tex_fill(kd, 5, 5, 5, 255);
+    chk_eq("tex_blit_keyed writes only opaque texels", tex_blit_keyed(kd, 0, 0, key, 0, 0, 4, 4), 8);
+    chk_equ("tex_blit_keyed left a transparent texel alone", tex_get(kd, 1, 0),
+            rgba_word(5, 5, 5, 255));
+
+    // RGB24 export drops alpha and keeps R,G,B order.
+    let rgb = buffer(4 * 4 * 3);
+    tex_to_rgb24(key, rgb);
+    chk("tex_to_rgb24 keeps R,G,B",
+        (rgb[0] == 250 && rgb[1] == 250 && rgb[2] == 250) ? 1 : 0);
+}
+
+// ===========================================================================
+// B. atlas cell grid and the half-texel inset — pure arithmetic, no SDL
+// ===========================================================================
+
+let g_uv: array<f64> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+fn section_b() {
+    print("B. atlas.hml — cell grid and the half-texel inset");
+
+    chk("atlas_new rejects a non-divisible width", (atlas_new(255, 256, 8, 8) == null) ? 1 : 0);
+    chk("atlas_new rejects a zero cell count", (atlas_new(256, 256, 0, 8) == null) ? 1 : 0);
+
+    let a = atlas_new(256, 256, 8, 8);
+    chk_eq("atlas cell width", atlas_cell_w(a), 32);
+    chk_eq("atlas cell height", atlas_cell_h(a), 32);
+    chk_eq("atlas cell count", atlas_cell_count(a), 64);
+    chk_eq("atlas pitch is w*4", atlas_pitch(a), 1024);
+    chk_eq("atlas data is w*h*4 bytes", atlas_data(a).length, 256 * 256 * 4);
+    chk("a fresh atlas has no texture", (atlas_tex(a) == ptr_null()) ? 1 : 0);
+    chk_eq("atlas_cell_of is row-major", atlas_cell_of(a, 3, 2), 19);
+    chk_eq("atlas_cell_x", atlas_cell_x(a, 19), 96);
+    chk_eq("atlas_cell_y", atlas_cell_y(a, 19), 64);
+
+    // Cell 0 of a 256-wide atlas with 32-texel cells:
+    //   un-inset would be 0.0 .. 0.125.  Inset is 0.5/256 .. 31.5/256.
+    atlas_cell_uv(a, 0, g_uv, 0);
+    chk_near("cell 0 u0 == 0.5/256", g_uv[0], 0.5 / 256.0, 1e-15);
+    chk_near("cell 0 v0 == 0.5/256", g_uv[1], 0.5 / 256.0, 1e-15);
+    chk_near("cell 0 u1 == 31.5/256", g_uv[2], 31.5 / 256.0, 1e-15);
+    chk_near("cell 0 v1 == 31.5/256", g_uv[3], 31.5 / 256.0, 1e-15);
+
+    // The last cell — the one whose far edge touches the atlas boundary.
+    atlas_cell_uv(a, 63, g_uv, 0);
+    chk_near("cell 63 u0 == 224.5/256", g_uv[0], 224.5 / 256.0, 1e-15);
+    chk_near("cell 63 u1 == 255.5/256", g_uv[2], 255.5 / 256.0, 1e-15);
+
+    // The inset is exactly half a texel, measured, on both axes of every cell.
+    let inset_bad: i32 = 0;
+    for (let c = 0; c < 64; c++) {
+        atlas_cell_uv(a, c, g_uv, 0);
+        let px = f64(atlas_cell_x(a, c));
+        let py = f64(atlas_cell_y(a, c));
+        let du0 = g_uv[0] * 256.0 - px;
+        let dv0 = g_uv[1] * 256.0 - py;
+        let du1 = (px + 32.0) - g_uv[2] * 256.0;
+        let dv1 = (py + 32.0) - g_uv[3] * 256.0;
+        if (du0 < 0.4999999 || du0 > 0.5000001) { inset_bad++; }
+        if (dv0 < 0.4999999 || dv0 > 0.5000001) { inset_bad++; }
+        if (du1 < 0.4999999 || du1 > 0.5000001) { inset_bad++; }
+        if (dv1 < 0.4999999 || dv1 > 0.5000001) { inset_bad++; }
+    }
+    chk_eq("inset is half a texel on all 4 sides of all 64 cells", inset_bad, 0);
+
+    // THE PROPERTY THAT MATTERS: nearest sampling of either UV extreme lands on
+    // a texel that belongs to this cell — for every cell, on both axes.
+    let land_bad: i32 = 0;
+    for (let c = 0; c < 64; c++) {
+        atlas_cell_uv(a, c, g_uv, 0);
+        let cx0 = atlas_cell_x(a, c);
+        let cy0 = atlas_cell_y(a, c);
+        let tu0 = i32(floor(g_uv[0] * 256.0));
+        let tv0 = i32(floor(g_uv[1] * 256.0));
+        let tu1 = i32(floor(g_uv[2] * 256.0));
+        let tv1 = i32(floor(g_uv[3] * 256.0));
+        if (tu0 != cx0) { land_bad++; }
+        if (tv0 != cy0) { land_bad++; }
+        if (tu1 != cx0 + 31) { land_bad++; }
+        if (tv1 != cy0 + 31) { land_bad++; }
+    }
+    chk_eq("floor(u*W) at both UV extremes stays inside the cell, 64 cells", land_bad, 0);
+
+    // The un-inset rect fails that property — this is why the inset exists.
+    let unin_bad: i32 = 0;
+    for (let c = 0; c < 64; c++) {
+        let cx0 = atlas_cell_x(a, c);
+        let u1 = f64(cx0 + 32) / 256.0;
+        if (i32(floor(u1 * 256.0)) != cx0 + 31) { unin_bad++; }
+    }
+    chk_eq("the un-inset far edge lands OUTSIDE the cell in all 64 cases", unin_bad, 64);
+
+    // Neighbouring cells' UV ranges are strictly separated by a full texel.
+    let gap_bad: i32 = 0;
+    for (let c = 0; c < 63; c++) {
+        if ((c % 8) == 7) { continue; }
+        atlas_cell_uv(a, c, g_uv, 0);
+        let hi = g_uv[2];
+        atlas_cell_uv(a, c + 1, g_uv, 4);
+        if (g_uv[4] - hi < 0.999 / 256.0) { gap_bad++; }
+    }
+    chk_eq("adjacent cells' U ranges are a full texel apart", gap_bad, 0);
+
+    // Out-of-range cell degrades to a zero rect, no throw.
+    atlas_cell_uv(a, 64, g_uv, 0);
+    chk("out-of-range cell gives a zero rect",
+        (g_uv[0] == 0.0 && g_uv[2] == 0.0) ? 1 : 0);
+
+    // A non-cell-aligned sub-rectangle gets the same treatment.
+    atlas_rect_uv(a, 10, 20, 5, 7, g_uv, 0);
+    chk_near("atlas_rect_uv u0", g_uv[0], 10.5 / 256.0, 1e-15);
+    chk_near("atlas_rect_uv v1", g_uv[3], 26.5 / 256.0, 1e-15);
+
+    // Texel access and rect fill.
+    atlas_fill(a, 1, 2, 3, 4);
+    chk_equ("atlas_fill wrote texel (255,255)", atlas_get(a, 255, 255),
+            rgba_word(1, 2, 3, 4));
+    atlas_px(a, 5, 6, 250, 240, 230, 220);
+    chk_equ("atlas_px round-trips", atlas_get(a, 5, 6), rgba_word(250, 240, 230, 220));
+    atlas_px_rgb(a, 7, 8, 9, 10, 11);
+    chk_equ("atlas_px_rgb forces alpha 255", atlas_get(a, 7, 8), rgba_word(9, 10, 11, 255));
+    atlas_fill_rect(a, 250, 250, 20, 20, 60, 70, 80, 90);
+    chk_equ("atlas_fill_rect clips at the far corner", atlas_get(a, 255, 255),
+            rgba_word(60, 70, 80, 90));
+    chk_equ("atlas_get out of range is 0", atlas_get(a, 256, 0), 0);
+
+    // Dirty-row bookkeeping, before any texture exists.
+    chk_eq("a fresh atlas has no dirty rows", atlas_dirty_rows(a), 0);
+    atlas_mark_rows(a, 10, 20);
+    atlas_mark_rows(a, 40, 50);
+    chk_eq("atlas_mark_rows unions the span", atlas_dirty_rows(a), 40);
+    chk_eq("atlas_update_rows without a texture returns -1", atlas_update_rows(a, 0, 4), -1);
+}
+
+// ===========================================================================
+// C-F. SDL-backed checks
+// ===========================================================================
+
+let g_vb = alloc(6 * 20);          // 2 triangles of SDL_Vertex (20 B each)
+let g_rinfo = alloc(96);           // SDL_RendererInfo (88 B)
+let g_qt = alloc(16);              // SDL_QueryTexture out
+
+// One SDL_Vertex: pos f32x2 @0, colour u8x4 @8, uv f32x2 @12.
+fn vert(p_i: i32, p_x: f64, p_y: f64, p_u: f64, p_v: f64) {
+    let o: i32 = p_i * 20;
+    ptr_write_f32(ptr_offset(g_vb, o, 1), p_x);
+    ptr_write_f32(ptr_offset(g_vb, o + 4, 1), p_y);
+    ptr_write_u8(ptr_offset(g_vb, o + 8, 1), 255);
+    ptr_write_u8(ptr_offset(g_vb, o + 9, 1), 255);
+    ptr_write_u8(ptr_offset(g_vb, o + 10, 1), 255);
+    ptr_write_u8(ptr_offset(g_vb, o + 11, 1), 255);
+    ptr_write_f32(ptr_offset(g_vb, o + 12, 1), p_u);
+    ptr_write_f32(ptr_offset(g_vb, o + 16, 1), p_v);
+}
+
+// A quad as two triangles: (x0,y0)-(x1,y0)-(x1,y1)-(x0,y1) with the given UVs
+// at the matching corners.  Corner positions are independent so the quad can be
+// made an arbitrarily thin trapezoid — that is the grazing angle.
+fn quad(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64, dx: f64, dy: f64,
+        u0: f64, v0: f64, u1: f64, v1: f64) {
+    vert(0, ax, ay, u0, v0);
+    vert(1, bx, by, u1, v0);
+    vert(2, cx, cy, u1, v1);
+    vert(3, ax, ay, u0, v0);
+    vert(4, cx, cy, u1, v1);
+    vert(5, dx, dy, u0, v1);
+}
+
+fn main() {
+    print("probe_atlas — texture.hml + atlas.hml (W1-8 / G13)");
+    print("");
+    section_a();
+    print("");
+    section_b();
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("C. RGBA32 is native — no conversion texture");
+
+    let win = window_open_ex("probe_atlas", 256, 256, 1, 0);
+    if (win == null) {
+        print("  FAIL: window_open_ex returned null");
+        print(`  ${sdl_error()}`);
+        print("FAIL — could not open a window");
+        exit(1);
+    }
+    set_draw_blend(win, BLEND_NONE);
+
+    // What formats does this renderer actually support?  SDL_CreateTexture
+    // allocates a hidden "native" conversion texture for anything not on this
+    // list, and converts on every single upload.
+    let has_rgba32: i32 = 0;
+    let has_rgb24: i32 = 0;
+    let nfmt: i32 = 0;
+    let accel: i32 = 0;
+    if (SDL_GetRendererInfo(win.ren, g_rinfo) == 0) {
+        // SDL_RENDERER_SOFTWARE = 0x1, SDL_RENDERER_ACCELERATED = 0x2.
+        let flags = i32(ptr_deref_u32(ptr_offset(g_rinfo, 8, 1)));
+        if ((flags & 2) != 0) { accel = 1; }
+        nfmt = i32(ptr_deref_u32(ptr_offset(g_rinfo, 12, 1)));
+        if (nfmt > 16) { nfmt = 16; }
+        for (let i = 0; i < nfmt; i++) {
+            let f = i32(ptr_deref_u32(ptr_offset(g_rinfo, 16 + i * 4, 1)));
+            if (f == FMT_RGBA32) { has_rgba32 = 1; }
+            if (f == FMT_RGB24) { has_rgb24 = 1; }
+        }
+    }
+    print(`  renderer: ${accel == 1 ? "accelerated" : "software"}, ${nfmt} texture formats`);
+    chk("renderer natively supports FMT_RGBA32 (376840196)", has_rgba32);
+    print(`  FMT_RGB24 (386930691) native? ${has_rgb24}  <- 0 means the legacy`);
+    print("    RGB24 path allocates a conversion texture on every upload");
+
+    // The pattern atlas: 32x32, one cell, every texel a different RGBA.
+    let pa = atlas_new(32, 32, 1, 1);
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            atlas_px(pa, x, y,
+                     (x * 8 + 3) & 255,
+                     (y * 8 + 5) & 255,
+                     (x * 5 + y * 3 + 17) & 255,
+                     255);
+        }
+    }
+    let ptex = atlas_upload(win, pa, BLEND_NONE);
+    chk("atlas_upload returned a texture", (ptex != ptr_null()) ? 1 : 0);
+    chk_eq("SDL_QueryTexture reports FMT_RGBA32", i32(atlas_format(pa)), FMT_RGBA32);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("D. byte-for-byte round-trip through upload + RenderReadPixels");
+
+    let tgt = create_target(win, 32, 32);
+    chk("create_target returned a texture", (tgt != ptr_null()) ? 1 : 0);
+    query_tex(tgt, g_qt);
+    chk_eq("render target is FMT_ARGB8888", i32(ptr_deref_u32(g_qt)), FMT_ARGB8888);
+
+    let back = alloc(64 * 64 * 4);      // big enough for every readback below
+
+    set_target(win, tgt);
+    sdl_clear(win, 0, 0, 0, 255);
+    copy_ex(win, ptex, null, null, 0.0, null, 0);
+    let rc = read_pixels_rect(win, 0, 0, 32, 32, FMT_RGBA32, back, 32 * 4);
+    set_target(win, null);
+    chk_eq("SDL_RenderReadPixels succeeded", rc, 0);
+
+    let rgb_bad: i32 = 0;
+    let a_bad: i32 = 0;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let got = ptr_deref_u32(ptr_offset(back, (y * 32 + x) * 4, 1));
+            let want = atlas_get(pa, x, y);
+            if (got != want) {
+                // Split the failure so an alpha-only difference is visible.
+                if ((got & 16777215) != (want & 16777215)) { rgb_bad++; } else { a_bad++; }
+            }
+        }
+    }
+    chk_eq("1024 texels: RGB round-trips byte-for-byte", rgb_bad, 0);
+    chk_eq("1024 texels: alpha round-trips byte-for-byte", a_bad, 0);
+
+    // The same pattern, this time with a varying alpha channel, to prove the
+    // A byte is carried and not silently forced to 255.
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            atlas_px(pa, x, y, (x * 8 + 3) & 255, (y * 8 + 5) & 255,
+                     (x * 5 + y * 3 + 17) & 255, (x * 4 + y * 4 + 7) & 255);
+        }
+    }
+    atlas_upload(win, pa, BLEND_NONE);
+    set_target(win, tgt);
+    sdl_clear(win, 0, 0, 0, 255);
+    copy_ex(win, ptex, null, null, 0.0, null, 0);
+    read_pixels_rect(win, 0, 0, 32, 32, FMT_RGBA32, back, 32 * 4);
+    set_target(win, null);
+    let va_bad: i32 = 0;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            if (ptr_deref_u32(ptr_offset(back, (y * 32 + x) * 4, 1)) != atlas_get(pa, x, y)) {
+                va_bad++;
+            }
+        }
+    }
+    chk_eq("1024 texels with varying alpha round-trip byte-for-byte", va_bad, 0);
+
+    // Dump both sides for the headless PNG record.
+    let dump = buffer(32 * 32 * 3);
+    let cpu = tex_new(32, 32);
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let o = (y * 32 + x) * 4;
+            let d = atlas_data(pa);
+            tex_set(cpu, x, y, d[o], d[o + 1], d[o + 2], 255);
+        }
+    }
+    tex_to_rgb24(cpu, dump);
+    write_png("/tmp/probe_atlas_cpu.png", dump, 32, 32);
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let o = (y * 32 + x) * 4;
+            let q = (y * 32 + x) * 3;
+            dump[q] = ptr_deref_u8(ptr_offset(back, o, 1));
+            dump[q + 1] = ptr_deref_u8(ptr_offset(back, o + 1, 1));
+            dump[q + 2] = ptr_deref_u8(ptr_offset(back, o + 2, 1));
+        }
+    }
+    write_png("/tmp/probe_atlas_readback.png", dump, 32, 32);
+    print("  wrote /tmp/probe_atlas_cpu.png and /tmp/probe_atlas_readback.png");
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("E. atlas_update_rows touches exactly the requested rows");
+
+    let ua = atlas_new(16, 16, 4, 4);
+    atlas_fill(ua, 10, 20, 30, 255);
+    let utex = atlas_upload(win, ua, BLEND_NONE);
+    chk("update-rows atlas uploaded", (utex != ptr_null()) ? 1 : 0);
+
+    // Change the WHOLE CPU buffer, then push only rows 5,6,7.
+    atlas_fill(ua, 200, 210, 220, 255);
+    chk_eq("atlas_update_rows(5,3) reports 3 rows", atlas_update_rows(ua, 5, 3), 3);
+
+    let utgt = create_target(win, 16, 16);
+    set_target(win, utgt);
+    sdl_clear(win, 0, 0, 0, 255);
+    copy_ex(win, utex, null, null, 0.0, null, 0);
+    read_pixels_rect(win, 0, 0, 16, 16, FMT_RGBA32, back, 16 * 4);
+    set_target(win, null);
+
+    let old_w = rgba_word(10, 20, 30, 255);
+    let new_w = rgba_word(200, 210, 220, 255);
+    let wrong: i32 = 0;
+    let updated_rows: i32 = 0;
+    for (let y = 0; y < 16; y++) {
+        let row_new: i32 = 0;
+        let row_old: i32 = 0;
+        for (let x = 0; x < 16; x++) {
+            let g = ptr_deref_u32(ptr_offset(back, (y * 16 + x) * 4, 1));
+            if (g == new_w) { row_new++; }
+            if (g == old_w) { row_old++; }
+        }
+        let want_new = (y >= 5 && y < 8);
+        if (want_new) {
+            if (row_new != 16) { wrong++; }
+            updated_rows++;
+        } else {
+            if (row_old != 16) { wrong++; }
+        }
+    }
+    chk_eq("exactly rows 5..7 changed, all 16 rows verified", wrong, 0);
+    chk_eq("three rows were the ones requested", updated_rows, 3);
+
+    // Clipping and the dirty-span helpers.
+    chk_eq("atlas_update_rows clips at the bottom", atlas_update_rows(ua, 14, 10), 2);
+    chk_eq("atlas_update_rows clips a negative start", atlas_update_rows(ua, -3, 5), 2);
+    chk_eq("atlas_update_rows of an empty span is 0", atlas_update_rows(ua, 20, 4), 0);
+    atlas_mark_rows(ua, 2, 6);
+    chk_eq("atlas_flush uploads the marked span", atlas_flush(ua), 4);
+    chk_eq("atlas_flush leaves the atlas clean", atlas_dirty_rows(ua), 0);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("F. grazing-angle sweep — an edge cell never samples its neighbour");
+
+    // 64x64 atlas, four 32x32 cells, each a different exact RGBA word.  Every
+    // cell touches the atlas edge, so every cell is the "edge cell" case, and
+    // each has two in-atlas neighbours to bleed from.
+    let ba = atlas_new(64, 64, 2, 2);
+    let cw0 = rgba_word(200, 40, 60, 255);
+    let cw1 = rgba_word(10, 240, 30, 255);
+    let cw2 = rgba_word(30, 50, 250, 255);
+    let cw3 = rgba_word(240, 230, 20, 255);
+    atlas_fill_rect(ba, 0, 0, 32, 32, 200, 40, 60, 255);
+    atlas_fill_rect(ba, 32, 0, 32, 32, 10, 240, 30, 255);
+    atlas_fill_rect(ba, 0, 32, 32, 32, 30, 50, 250, 255);
+    atlas_fill_rect(ba, 32, 32, 32, 32, 240, 230, 20, 255);
+    let btex = atlas_upload(win, ba, BLEND_NONE);
+    chk("bleed atlas uploaded", (btex != ptr_null()) ? 1 : 0);
+
+    let btgt = create_target(win, 64, 64);
+    let SWEEP: i32 = 10800;              // 3 minutes at 60 fps
+    let t0 = clock();
+
+    // Two runs: inset UVs (must be clean) and raw cell-edge UVs (the control,
+    // which must bleed — otherwise this whole test proves nothing).
+    let bleed_inset: i32 = 0;
+    let bleed_frames_inset: i32 = 0;
+    let bleed_raw: i32 = 0;
+    let bleed_frames_raw: i32 = 0;
+
+    for (let mode = 0; mode < 2; mode++) {
+        for (let i = 0; i < SWEEP; i++) {
+            let cell = i % 4;
+            let cx0 = f64(atlas_cell_x(ba, cell));
+            let cy0 = f64(atlas_cell_y(ba, cell));
+            let u0 = 0.0; let v0 = 0.0; let u1 = 0.0; let v1 = 0.0;
+            if (mode == 0) {
+                atlas_cell_uv(ba, cell, g_uv, 0);
+                u0 = g_uv[0]; v0 = g_uv[1]; u1 = g_uv[2]; v1 = g_uv[3];
+            } else {
+                u0 = cx0 / 64.0;
+                v0 = cy0 / 64.0;
+                u1 = (cx0 + 32.0) / 64.0;
+                v1 = (cy0 + 32.0) / 64.0;
+            }
+
+            // Sweep the incidence angle from near head-on to 0.6 deg off the
+            // surface, and jitter the sub-pixel placement so the rounding of
+            // every UV extreme is exercised at every angle.
+            let t = f64(i) / f64(SWEEP - 1);
+            let ang = (0.6 + t * 88.8) * PI / 180.0;
+            let shrink = cos(ang);                       // 1.0 -> ~0.01
+            let hw = 0.5 + 31.5 * shrink;
+            let jx = f64(i % 101) / 101.0 - 0.5;
+            let jy = f64(i % 97) / 97.0 - 0.5;
+
+            if (i % 2 == 0) {
+                // Foreshortened along X: the top edge collapses to a sliver.
+                quad(32.0 - hw + jx, 0.0 + jy,
+                     32.0 + hw + jx, 0.0 + jy,
+                     64.0 + jx, 64.0 + jy,
+                     0.0 + jx, 64.0 + jy,
+                     u0, v0, u1, v1);
+            } else {
+                // Foreshortened along Y: the left edge collapses to a sliver.
+                quad(0.0 + jx, 32.0 - hw + jy,
+                     64.0 + jx, 0.0 + jy,
+                     64.0 + jx, 64.0 + jy,
+                     0.0 + jx, 32.0 + hw + jy,
+                     u0, v0, u1, v1);
+            }
+
+            set_target(win, btgt);
+            sdl_clear(win, 0, 0, 0, 255);
+            draw_tris_at(win, btex, g_vb, 0, 6);
+            read_pixels_rect(win, 0, 0, 64, 64, FMT_RGBA32, back, 64 * 4);
+            set_target(win, null);
+
+            // A pixel that exactly equals ANOTHER cell's colour is a bleed.
+            // Anything else (background, or an interpolation artefact) is not
+            // counted, so the test can only report real neighbour sampling.
+            let hits: i32 = 0;
+            for (let q = 0; q < 4096; q++) {
+                let g = ptr_deref_u32(ptr_offset(back, q * 4, 1));
+                if (cell != 0) { if (g == cw0) { hits++; } }
+                if (cell != 1) { if (g == cw1) { hits++; } }
+                if (cell != 2) { if (g == cw2) { hits++; } }
+                if (cell != 3) { if (g == cw3) { hits++; } }
+            }
+            if (mode == 0) {
+                bleed_inset = bleed_inset + hits;
+                if (hits > 0) { bleed_frames_inset++; }
+            } else {
+                bleed_raw = bleed_raw + hits;
+                if (hits > 0) { bleed_frames_raw++; }
+            }
+        }
+    }
+
+    let secs = clock() - t0;
+    print(`  ${SWEEP} inset frames + ${SWEEP} un-inset frames in ${secs} s`);
+    print(`  INSET    : ${bleed_inset} neighbour texels in ${bleed_frames_inset} frames`);
+    print(`  UN-INSET : ${bleed_raw} neighbour texels in ${bleed_frames_raw} frames`);
+    chk_eq("inset UVs: zero neighbour texels in 10800 grazing frames", bleed_inset, 0);
+
+    // POSITIVE CONTROL for the detector itself.  Push the U extreme one full
+    // texel past the cell and re-render head-on: the neighbour's first column
+    // must appear, otherwise this whole section is measuring nothing.
+    //
+    // It only appears on an ACCELERATED renderer.  SDL's software triangle
+    // sampler converts UV to integer texel coordinates per VERTEX and clamps
+    // the interpolant to that box, so it is structurally incapable of sampling
+    // outside the addressed rectangle — which also means a headless run can
+    // never observe cell bleed, with or without the inset.  Measured on this
+    // host: overshoot bleed = 64 texels under DISPLAY=:0 (OpenGL), 0 under
+    // SDL_VIDEODRIVER=dummy (software).  The assertion follows the backend so
+    // exactly one assertion runs either way.
+    atlas_cell_uv(ba, 0, g_uv, 0);
+    quad(0.0, 0.0, 64.0, 0.0, 64.0, 64.0, 0.0, 64.0,
+         g_uv[0], g_uv[1], 32.5 / 64.0, g_uv[3]);
+    set_target(win, btgt);
+    sdl_clear(win, 0, 0, 0, 255);
+    draw_tris_at(win, btex, g_vb, 0, 6);
+    read_pixels_rect(win, 0, 0, 64, 64, FMT_RGBA32, back, 64 * 4);
+    set_target(win, null);
+    let overshoot: i32 = 0;
+    for (let q = 0; q < 4096; q++) {
+        if (ptr_deref_u32(ptr_offset(back, q * 4, 1)) == cw1) { overshoot++; }
+    }
+    print(`  DETECTOR : ${overshoot} neighbour texels when U overshoots by one texel`);
+    if (accel == 1) {
+        chk("detector control: a one-texel UV overshoot IS seen as a bleed",
+            (overshoot > 0) ? 1 : 0);
+    } else {
+        print("  NOTE: the software renderer clamps sampling to the triangle's own");
+        print("        UV box, so a headless run cannot observe cell bleed at all.");
+        print("        Run under DISPLAY=:0 for the discriminating measurement.");
+        chk_eq("software backend: UV overshoot is clamped, as documented", overshoot, 0);
+    }
+
+    // Leave a picture of the last swept frame.
+    let sweep_png = buffer(64 * 64 * 3);
+    for (let q = 0; q < 4096; q++) {
+        sweep_png[q * 3] = ptr_deref_u8(ptr_offset(back, q * 4, 1));
+        sweep_png[q * 3 + 1] = ptr_deref_u8(ptr_offset(back, q * 4 + 1, 1));
+        sweep_png[q * 3 + 2] = ptr_deref_u8(ptr_offset(back, q * 4 + 2, 1));
+    }
+    write_png("/tmp/probe_atlas_sweep.png", sweep_png, 64, 64);
+    print("  wrote /tmp/probe_atlas_sweep.png");
+
+    // -----------------------------------------------------------------------
+    atlas_free(pa);
+    atlas_free(ua);
+    atlas_free(ba);
+    chk("atlas_free clears the texture handle", (atlas_tex(ba) == ptr_null()) ? 1 : 0);
+    atlas_free(ba);                       // must be safe twice
+    chk_eq("double atlas_free is safe", atlas_dirty_rows(ba), 0);
+
+    destroy_tex(tgt);
+    destroy_tex(utgt);
+    destroy_tex(btgt);
+    window_close(win);
+
+    // -----------------------------------------------------------------------
+    print("");
+    let total = g_pass + g_fail;
+    if (total != g_expect_checks) {
+        print(`FAIL — executed ${total} assertions, expected ${g_expect_checks}`);
+        print(`PASS ${g_pass}/${total}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL ${g_fail}/${total} assertions failed`);
+        print(`PASS ${g_pass}/${total}`);
+        exit(1);
+    }
+    print(`PASS ${g_pass}/${total}`);
+}
+
+main();

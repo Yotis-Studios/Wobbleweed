@@ -1,0 +1,400 @@
+// atlas.hml — RGBA8 texture atlas: cell grid, half-texel-inset UV rects,
+//             RGBA32 upload, dirty-rect row update.  (Nightshade W1-8 / G13)
+//
+// This module is GENERIC.  An atlas is a rectangle of RGBA8 texels divided into
+// a uniform grid of cells.  It knows nothing about what any cell contains: no
+// colours, no materials, no game nouns.  Every value is a parameter.
+//
+// ---------------------------------------------------------------------------
+// WHY RGBA32 (376840196)
+// ---------------------------------------------------------------------------
+// SDL_CreateTexture with a format the renderer does not support silently
+// allocates a second, internal "native" texture and converts on every upload —
+// a per-frame copy for streaming textures, and the root cause of the
+// SDL_SetTextureScaleMode segfault class (G5).  RGBA32 is in the supported
+// format list of both the software and the OpenGL renderer on this host, so no
+// conversion texture is ever created.  Its *memory byte order is R, G, B, A*,
+// which is also the natural order for a procedural generator: the CPU-side
+// buffer is uploaded verbatim, byte for byte, with pitch = width * 4.
+// (The *8888 names are packed-integer names, not byte order.  ARGB8888 is
+// B,G,R,A in memory.  Do not use it for a CPU-authored texture.)
+//
+// ---------------------------------------------------------------------------
+// WHY THE HALF-TEXEL INSET IS NOT OPTIONAL
+// ---------------------------------------------------------------------------
+// Cell k spans texels [k*cw, k*cw + cw).  Its *geometric* UV rect is therefore
+// [k*cw/W, (k*cw + cw)/W] — but those are texel EDGES, and nearest sampling at
+// an edge is a coin flip decided by float rounding: `floor(u * W)` at
+// u = (k*cw + cw)/W lands on the first texel of the NEXT cell.  At a grazing
+// angle the rasterizer's affine UV interpolation overshoots the interval ends
+// by a fraction of a texel as well, so the coin is weighted against you.
+//
+// The fix is to address texel CENTRES instead of edges:
+//     u0 = (k*cw + 0.5) / W        u1 = (k*cw + cw - 0.5) / W
+// so the sampled range can never leave the cell no matter how the interpolation
+// rounds.  atlas_cell_uv does this and there is no un-inset variant on purpose.
+//
+// ---------------------------------------------------------------------------
+// POINTER RULE
+// ---------------------------------------------------------------------------
+// `a.tex` is ptr_null() until uploaded, never the `null` literal.  `p == null`
+// is FALSE in compiled code for a NULL ptr returned from FFI (HEMLOCK_ISSUES
+// H-7); `p == ptr_null()` is correct on both backends.  Every guard below uses
+// ptr_null().
+
+import { divi } from "@stdlib/math";
+import { create_static_tex, update_tex, update_tex_rect, set_tex_blend,
+         destroy_tex, query_tex, FMT_RGBA32 } from "./sdl.hml";
+
+// Scratch for query_tex: format(u32)@0 access@4 width@8 height@12.
+let g_atlas_q = alloc(16);
+
+// ---------------------------------------------------------------------------
+// construction
+// ---------------------------------------------------------------------------
+
+// A `w` x `h` RGBA8 atlas divided into `cx` by `cy` cells.
+//
+// `w` must be divisible by `cx` and `h` by `cy` — a fractional cell size makes
+// the inset arithmetic lie.  Returns null (the literal, not a ptr) if it is not,
+// so a caller that ignores the result fails loudly at the first field access
+// rather than rendering garbage.
+//
+// Fields (public; hot code may read them directly):
+//   w, h        atlas size in texels
+//   cx, cy      cell grid dimensions
+//   cw, ch      cell size in texels
+//   ncells      cx * cy
+//   data        buffer, w*h*4 bytes, R,G,B,A memory order
+//   tex         SDL_Texture* or ptr_null()
+//   dy0, dy1    dirty row span [dy0, dy1); dy0 >= dy1 means clean
+export fn atlas_new(w: i32, h: i32, cx: i32, cy: i32) {
+    if (w <= 0) { return null; }
+    if (h <= 0) { return null; }
+    if (cx <= 0) { return null; }
+    if (cy <= 0) { return null; }
+    if (w % cx != 0) { return null; }
+    if (h % cy != 0) { return null; }
+    let cw: i32 = divi(w, cx);
+    let ch: i32 = divi(h, cy);
+    let n: i32 = cx * cy;
+    let fw: f64 = f64(w);
+    let fh: f64 = f64(h);
+    // Every cell's inset UV rect, computed once, stored flat as
+    // [u0, v0, u1, v1] per cell.  atlas_cell_uv is then four array reads with
+    // no division and no float work at all.  Measured, 1e6 calls, compiled:
+    //   computed per call : 363 ns    from this table : 175 ns   (2.1x)
+    //   reading the table directly (atlas_uv_table) :  43 ns
+    // 175 ns is still a call into a boxed object, so a per-quad path should
+    // hoist atlas_uv_table() out of the loop and index it.
+    let uv: array<f64> = [];
+    for (let c = 0; c < n; c++) {
+        let px: f64 = f64((c % cx) * cw);
+        let py: f64 = f64(divi(c, cx) * ch);
+        uv.push((px + 0.5) / fw);                 // u0 — half-texel inset
+        uv.push((py + 0.5) / fh);                 // v0
+        uv.push((px + f64(cw) - 0.5) / fw);       // u1
+        uv.push((py + f64(ch) - 0.5) / fh);       // v1
+    }
+    return { w: w, h: h, cx: cx, cy: cy,
+             cw: cw, ch: ch, ncells: n, uv: uv,
+             data: buffer(w * h * 4), tex: ptr_null(),
+             dy0: h, dy1: 0 };
+}
+
+// The CPU-side buffer, for handing to a generator that wants raw access.
+export fn atlas_data(a: object): buffer { return a.data; }
+// Raw base pointer.  HOIST OUT OF LOOPS (N4).  Valid while `a` is alive.
+export fn atlas_base(a: object): ptr { return buffer_ptr(a.data); }
+// Bytes per row.  This is the pitch every SDL upload uses.
+export fn atlas_pitch(a: object): i32 { return a.w * 4; }
+// The SDL texture, or ptr_null() before the first atlas_upload.
+export fn atlas_tex(a: object) { return a.tex; }
+
+// ---------------------------------------------------------------------------
+// texel access
+//
+// Called once per texel of every generated atlas (256x256 = 65 536 for the
+// largest atlas Nightshade builds), so: p_-prefixed parameters, typed locals,
+// no allocation, no call in the body.  Out-of-range writes are dropped, not
+// thrown.
+// ---------------------------------------------------------------------------
+
+export fn atlas_px(p_a: object, p_x: i32, p_y: i32,
+                   p_r: i32, p_g: i32, p_b: i32, p_al: i32) {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_a.w;
+    let h: i32 = p_a.h;
+    if (x < 0) { return; }
+    if (y < 0) { return; }
+    if (x >= w) { return; }
+    if (y >= h) { return; }
+    let d = p_a.data;
+    let o: i32 = (y * w + x) * 4;
+    d[o] = p_r & 255;
+    d[o + 1] = p_g & 255;
+    d[o + 2] = p_b & 255;
+    d[o + 3] = p_al & 255;
+}
+
+// Opaque write — alpha forced to 255.
+export fn atlas_px_rgb(p_a: object, p_x: i32, p_y: i32,
+                       p_r: i32, p_g: i32, p_b: i32) {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_a.w;
+    let h: i32 = p_a.h;
+    if (x < 0) { return; }
+    if (y < 0) { return; }
+    if (x >= w) { return; }
+    if (y >= h) { return; }
+    let d = p_a.data;
+    let o: i32 = (y * w + x) * 4;
+    d[o] = p_r & 255;
+    d[o + 1] = p_g & 255;
+    d[o + 2] = p_b & 255;
+    d[o + 3] = 255;
+}
+
+// The texel as one word: r | g<<8 | b<<16 | a<<24.  Bit-identical to the 32-bit
+// value SDL holds for RGBA32, so a readback comparison is one compare per texel.
+export fn atlas_get(p_a: object, p_x: i32, p_y: i32): u32 {
+    let x: i32 = p_x;
+    let y: i32 = p_y;
+    let w: i32 = p_a.w;
+    let h: i32 = p_a.h;
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= w) { return 0; }
+    if (y >= h) { return 0; }
+    let d = p_a.data;
+    let o: i32 = (y * w + x) * 4;
+    let r: u32 = u32(d[o]);
+    let g: u32 = u32(d[o + 1]);
+    let b: u32 = u32(d[o + 2]);
+    let al: u32 = u32(d[o + 3]);
+    let out: u32 = r + g * 256 + b * 65536 + al * 16777216;
+    return out;
+}
+
+// Flood the whole atlas.
+export fn atlas_fill(p_a: object, p_r: i32, p_g: i32, p_b: i32, p_al: i32) {
+    let n: i32 = p_a.w * p_a.h;
+    let r: i32 = p_r & 255;
+    let g: i32 = p_g & 255;
+    let b: i32 = p_b & 255;
+    let al: i32 = p_al & 255;
+    let d = p_a.data;
+    let o: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        d[o] = r;
+        d[o + 1] = g;
+        d[o + 2] = b;
+        d[o + 3] = al;
+        o = o + 4;
+    }
+}
+
+// Flood a rectangle, clipped to the atlas.
+export fn atlas_fill_rect(p_a: object, p_x: i32, p_y: i32, p_w: i32, p_h: i32,
+                          p_r: i32, p_g: i32, p_b: i32, p_al: i32) {
+    let aw: i32 = p_a.w;
+    let ah: i32 = p_a.h;
+    let x0: i32 = p_x;
+    let y0: i32 = p_y;
+    let x1: i32 = p_x + p_w;
+    let y1: i32 = p_y + p_h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > aw) { x1 = aw; }
+    if (y1 > ah) { y1 = ah; }
+    if (x0 >= x1) { return; }
+    if (y0 >= y1) { return; }
+    let r: i32 = p_r & 255;
+    let g: i32 = p_g & 255;
+    let b: i32 = p_b & 255;
+    let al: i32 = p_al & 255;
+    let d = p_a.data;
+    for (let y = y0; y < y1; y++) {
+        let o: i32 = (y * aw + x0) * 4;
+        for (let x = x0; x < x1; x++) {
+            d[o] = r;
+            d[o + 1] = g;
+            d[o + 2] = b;
+            d[o + 3] = al;
+            o = o + 4;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the cell grid
+//
+// Cells are numbered row-major from the top-left: cell = cyi * cx + cxi.
+// ---------------------------------------------------------------------------
+
+export fn atlas_cell_of(a: object, cxi: i32, cyi: i32): i32 {
+    return cyi * a.cx + cxi;
+}
+// Top-left texel of a cell.
+export fn atlas_cell_x(a: object, cell: i32): i32 { return (cell % a.cx) * a.cw; }
+export fn atlas_cell_y(a: object, cell: i32): i32 { return divi(cell, a.cx) * a.ch; }
+export fn atlas_cell_w(a: object): i32 { return a.cw; }
+export fn atlas_cell_h(a: object): i32 { return a.ch; }
+export fn atlas_cell_count(a: object): i32 { return a.ncells; }
+
+// The cell's UV rect, INSET BY HALF A TEXEL on all four sides, written into
+// `out` as four f64 at [off] = u0, [off+1] = v0, [off+2] = u1, [off+3] = v1.
+//
+// Allocation-free by construction: it writes through to a caller-owned array so
+// nothing is allocated per call and it is safe on a per-frame path.
+//
+// Out-of-range `cell` writes a degenerate zero rect rather than throwing.
+export fn atlas_cell_uv(p_a: object, p_cell: i32, p_out: array<f64>, p_off: i32) {
+    let cell: i32 = p_cell;
+    let off: i32 = p_off;
+    let out = p_out;
+    let n: i32 = p_a.ncells;
+    if (cell < 0) {
+        out[off] = 0.0; out[off + 1] = 0.0; out[off + 2] = 0.0; out[off + 3] = 0.0;
+        return;
+    }
+    if (cell >= n) {
+        out[off] = 0.0; out[off + 1] = 0.0; out[off + 2] = 0.0; out[off + 3] = 0.0;
+        return;
+    }
+    let src = p_a.uv;
+    let s: i32 = cell * 4;
+    out[off] = src[s];
+    out[off + 1] = src[s + 1];
+    out[off + 2] = src[s + 2];
+    out[off + 3] = src[s + 3];
+}
+
+// The whole table: 4 f64 per cell, [u0, v0, u1, v1], indexed cell*4.  Read it
+// directly from a hot loop to skip the call entirely (A5: array<f64> random
+// access beats a raw ptr, 240 vs 408 ms).  Do not write to it.
+export fn atlas_uv_table(a: object): array<f64> { return a.uv; }
+
+// The same rect for an arbitrary sub-rectangle of the atlas in texels — for a
+// glyph or a sprite that is not cell-aligned.  Same half-texel inset.
+export fn atlas_rect_uv(p_a: object, p_x: i32, p_y: i32, p_w: i32, p_h: i32,
+                        p_out: array<f64>, p_off: i32) {
+    let off: i32 = p_off;
+    let out = p_out;
+    let fw: f64 = f64(p_a.w);
+    let fh: f64 = f64(p_a.h);
+    let px: f64 = f64(p_x);
+    let py: f64 = f64(p_y);
+    out[off] = (px + 0.5) / fw;
+    out[off + 1] = (py + 0.5) / fh;
+    out[off + 2] = (px + f64(p_w) - 0.5) / fw;
+    out[off + 3] = (py + f64(p_h) - 0.5) / fh;
+}
+
+// ---------------------------------------------------------------------------
+// upload
+// ---------------------------------------------------------------------------
+
+// Create the SDL texture on first call (STATIC access, FMT_RGBA32), upload the
+// whole buffer, and set the blend mode — blend mode is the material model, so
+// it is a parameter, never a policy of this module.
+//
+// Returns the SDL_Texture*, or ptr_null() if creation failed.  Marks the atlas
+// clean.  Idempotent: call it again to re-upload after a full regeneration.
+export fn atlas_upload(win: object, a: object, blend: i32) {
+    let t = a.tex;
+    if (t == ptr_null()) {
+        t = create_static_tex(win, FMT_RGBA32, a.w, a.h);
+        if (t == ptr_null()) { return ptr_null(); }
+        a.tex = t;
+    }
+    update_tex(t, buffer_ptr(a.data), a.w * 4);
+    set_tex_blend(t, blend);
+    a.dy0 = a.h;
+    a.dy1 = 0;
+    return t;
+}
+
+// Push rows [y0, y0 + rows) and nothing else, with one dirty-rect
+// SDL_UpdateTexture.  This is the incremental re-bake path (e.g. N rows of a
+// N rows of a slowly re-baked panorama per frame).
+//
+// The span is clipped to the atlas.  Returns the number of rows actually
+// uploaded, or -1 if there is no texture yet or SDL rejected the update.
+export fn atlas_update_rows(a: object, y0: i32, rows: i32): i32 {
+    let t = a.tex;
+    if (t == ptr_null()) { return -1; }
+    let h: i32 = a.h;
+    let w: i32 = a.w;
+    let ry0: i32 = y0;
+    let ry1: i32 = y0 + rows;
+    if (ry0 < 0) { ry0 = 0; }
+    if (ry1 > h) { ry1 = h; }
+    if (ry0 >= ry1) { return 0; }
+    let n: i32 = ry1 - ry0;
+    let pitch: i32 = w * 4;
+    // `pixels` points at the first byte of the sub-rectangle; the rect spans the
+    // full width, so the full-row pitch is the correct stride.
+    let base = ptr_offset(buffer_ptr(a.data), ry0 * pitch, 1);
+    if (update_tex_rect(t, 0, ry0, w, n, base, pitch) != 0) { return -1; }
+    // Clear the dirty span only if this upload fully covered it.  Partial
+    // coverage leaves it set, so the remainder is still uploaded later — the
+    // conservative direction (a redundant upload, never a missed one).
+    if (a.dy0 >= ry0) {
+        if (a.dy1 <= ry1) { a.dy0 = h; a.dy1 = 0; }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// dirty-row bookkeeping (optional; atlas_update_rows can be driven directly)
+// ---------------------------------------------------------------------------
+
+// Union rows [y0, y1) into the dirty span.
+export fn atlas_mark_rows(a: object, y0: i32, y1: i32) {
+    let lo: i32 = y0;
+    let hi: i32 = y1;
+    if (lo < 0) { lo = 0; }
+    if (hi > a.h) { hi = a.h; }
+    if (lo >= hi) { return; }
+    if (lo < a.dy0) { a.dy0 = lo; }
+    if (hi > a.dy1) { a.dy1 = hi; }
+}
+export fn atlas_dirty_rows(a: object): i32 {
+    if (a.dy0 >= a.dy1) { return 0; }
+    return a.dy1 - a.dy0;
+}
+// Upload the dirty span, if any, and clear it.  Returns rows uploaded.
+export fn atlas_flush(a: object): i32 {
+    if (a.dy0 >= a.dy1) { return 0; }
+    let n = atlas_update_rows(a, a.dy0, a.dy1 - a.dy0);
+    a.dy0 = a.h;
+    a.dy1 = 0;
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// introspection and teardown
+// ---------------------------------------------------------------------------
+
+// The pixel format SDL actually gave the texture.  Must equal FMT_RGBA32
+// (376840196): a different answer means SDL substituted a format, which means a
+// conversion texture exists and every upload is a CPU copy.  Returns 0 if the
+// atlas has not been uploaded.
+export fn atlas_format(a: object): u32 {
+    if (a.tex == ptr_null()) { return 0; }
+    query_tex(a.tex, g_atlas_q);
+    return ptr_deref_u32(g_atlas_q);
+}
+
+// Destroy the SDL texture.  The CPU buffer is refcounted and released with the
+// object.  Safe to call twice.
+export fn atlas_free(a: object) {
+    if (a.tex != ptr_null()) {
+        destroy_tex(a.tex);
+        a.tex = ptr_null();
+    }
+}

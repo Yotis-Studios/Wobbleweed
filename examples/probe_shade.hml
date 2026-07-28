@@ -1,0 +1,1414 @@
+// probe_shade.hml — verification program for W1-3 (src/shade.hml), the
+// RenderEnv lighting + fog parameter block. ENGINE_GAPS G15 and G16.
+//
+// Run COMPILED. Sections 1-7 need no display; section 8 opens a window and
+// reads pixels back, which works under the dummy driver too.
+//
+//     HC=/home/nbeerbower/Projects/hemlock/hemlockc
+//     $HC -O1 examples/probe_shade.hml -o /tmp/probe_shade
+//     SDL_VIDEODRIVER=dummy /tmp/probe_shade
+//     DISPLAY=:0 /tmp/probe_shade
+//
+// Exits 0 only if every assertion held AND the number of assertions executed
+// equals EXPECTED_ASSERTS — a probe that silently skips a section must fail,
+// not pass. Exits 1 otherwise.
+//
+// The four W1-3 acceptance criteria are tagged [A1].."[A4]" where they are
+// checked:
+//   [A1] ambient + sun summing to (1,1,1) with N.L = 1 reproduces the authored
+//        texel exactly on readback                       -> sections 3 and 8
+//   [A2] 4 point lights at 2500 tris cost <= 0.4 ms      -> section 7
+//   [A3] radial (not view-z) fog: equal fog at screen centre and screen corner
+//        for equidistant vertices                        -> section 5
+//   [A4] far plane derived as fog_far * 1.06             -> section 2
+//
+// [A2] is measured in TWO configurations and both numbers are printed, because
+// they differ by an order of magnitude and only one of them is a budget the
+// engine can promise. See section 7.
+
+import { exit } from "@stdlib/process";
+import { clock_now, clock_ms_between } from "../src/time.hml";
+import {
+    ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+    ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+    ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+    ENV_RIM_R, ENV_RIM_G, ENV_RIM_B,
+    ENV_CAM_X, ENV_CAM_Y, ENV_CAM_Z,
+    ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+    ENV_FOG_ALPHA_MAX, ENV_FOG_ALPHA_T,
+    ENV_MIST_TOP, ENV_MIST_BOTTOM, ENV_MIST_DENSITY,
+    ENV_LIGHT_COUNT, ENV_LIGHT_STRIDE, ENV_MAX_LIGHTS,
+    ENV_L_X, ENV_L_Y, ENV_L_Z, ENV_L_R, ENV_L_G, ENV_L_B, ENV_L_RADIUS,
+    ENV_LIGHT0_X, ENV_LIGHT0_Y, ENV_LIGHT0_Z, ENV_LIGHT0_R, ENV_LIGHT0_G,
+    ENV_LIGHT0_B, ENV_LIGHT0_RADIUS,
+    ENV_LIGHT1_X, ENV_LIGHT2_X, ENV_LIGHT3_X,
+    ENV_COUNT, ENV_FAR_SCALE, ENV_FOG_ALPHA_T_DEFAULT, ENV_LIGHT_WRAP,
+    ENVB_SUN_X, ENVB_SUN_Y, ENVB_SUN_Z, ENVB_SUN_R, ENVB_SUN_G, ENVB_SUN_B,
+    ENVB_AMB_R, ENVB_AMB_G, ENVB_AMB_B,
+    ENVB_BOUNCE_R, ENVB_BOUNCE_G, ENVB_BOUNCE_B,
+    ENVB_RIM_R, ENVB_RIM_G, ENVB_RIM_B,
+    ENVB_CAM_X, ENVB_CAM_Y, ENVB_CAM_Z,
+    ENVB_FOG_NEAR, ENVB_FOG_INV_SPAN, ENVB_FOG_R, ENVB_FOG_G, ENVB_FOG_B,
+    ENVB_FOG_ALPHA_MAX, ENVB_FOG_ALPHA_T, ENVB_FOG_ALPHA_INV,
+    ENVB_MIST_TOP, ENVB_MIST_INV_SPAN, ENVB_MIST_DENSITY,
+    ENVB_FAR_PLANE, ENVB_LIGHT_COUNT, ENVB_LIGHT_STRIDE,
+    ENVB_L_INV_RADIUS, ENVB_L_RADIUS2,
+    ENVB_LIGHT0_X, ENVB_LIGHT1_X, ENVB_LIGHT2_X, ENVB_LIGHT3_X, ENVB_COUNT,
+    env_new, env_reset, env_copy, env_lerp,
+    env_set_sun, env_set_ambient, env_set_bounce, env_set_rim, env_set_camera,
+    env_set_fog, env_set_fog_alpha_threshold, env_set_mist,
+    env_add_light, env_set_light, env_clear_lights, env_light_count,
+    env_far_plane, env_field, env_field_set, env_field_count,
+    env_bind, env_bind_field, env_bound_far_plane, env_bound_light_count,
+    env_bound_fog_on, env_bound_mist_on, env_bound_bounce_on, env_bound_rim_on,
+    env_fog_factor, env_fog_alpha, env_light_rgb, env_vertex_rgba
+} from "../src/shade.hml";
+import {
+    window_open_ex, window_close, create_static_tex, create_target, set_target,
+    update_tex, set_tex_blend, sdl_clear, draw_tris_at, read_pixels_rect,
+    FMT_RGBA32, FMT_ARGB8888, BLEND_NONE
+} from "../src/sdl.hml";
+
+// The probe must know how many assertions it is supposed to run.
+let EXPECTED_ASSERTS = 231;
+
+// Regression ceiling, NOT the G16 budget, for the pathological case where all
+// four point lights reach every one of the 7500 vertices. Measured at ~2.6 ms;
+// this catches a 1.5x regression without being flaky. See section 7.
+let WORSTCASE_CEILING_MS = 4.0;
+
+let g_pass: i32 = 0;
+let g_total: i32 = 0;
+let g_sink: f64 = 0.0;
+
+fn ok(cond: bool, label: string) {
+    g_total++;
+    if (cond) { g_pass++; } else { print(`  FAIL  ${label}`); }
+}
+
+fn eqi(label: string, got: i32, want: i32) {
+    g_total++;
+    if (got == want) { g_pass++; } else { print(`  FAIL  ${label}: got ${got} want ${want}`); }
+}
+
+fn eqf(label: string, got: f64, want: f64, tol: f64) {
+    g_total++;
+    let d: f64 = got - want;
+    if (d < 0.0) { d = 0.0 - d; }
+    if (d <= tol) { g_pass++; } else { print(`  FAIL  ${label}: got ${got} want ${want}`); }
+}
+
+// Unpack the kernel's 0xAABBGGRR return.
+fn cr(p_c: u32): i32 { let o: i32 = i32(p_c & 255); return o; }
+fn cg(p_c: u32): i32 { let o: i32 = i32((p_c >> 8) & 255); return o; }
+fn cb(p_c: u32): i32 { let o: i32 = i32((p_c >> 16) & 255); return o; }
+fn ca(p_c: u32): i32 { let o: i32 = i32((p_c >> 24) & 255); return o; }
+
+fn eq_rgba(label: string, c: u32, r: i32, g: i32, b: i32, a: i32) {
+    g_total++;
+    if (cr(c) == r && cg(c) == g && cb(c) == b && ca(c) == a) { g_pass++; }
+    else {
+        print(`  FAIL  ${label}: got ${cr(c)},${cg(c)},${cb(c)},${ca(c)} want ${r},${g},${b},${a}`);
+    }
+}
+
+// u8 quantization the kernel uses, so expectations are written in linear units.
+fn q8(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v < 0.0) { v = 0.0; }
+    if (v > 1.0) { v = 1.0; }
+    let o: i32 = i32(v * 255.0 + 0.5);
+    return o;
+}
+
+// Deterministic PRNG. u64 because i32/i64 multiplication TRAPS on overflow
+// (CLAUDE.md A13) — a textbook LCG in i64 throws.
+let g_rng: u64 = 88172645463325252;
+fn rnd(): f64 {
+    let s: u64 = g_rng;
+    s = s * 6364136223846793005 + 1442695040888963407;
+    g_rng = s;
+    let m: u64 = s >> 11;
+    let out: f64 = f64(m) / 9007199254740992.0;
+    return out;
+}
+fn rndc(p_lo: f64, p_hi: f64): f64 {
+    let lo: f64 = p_lo;
+    let hi: f64 = p_hi;
+    let out: f64 = lo + (hi - lo) * rnd();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// A REFERENCE implementation of G15 + G16, written straight from the prose in
+// ENGINE_GAPS.md and deliberately in the "wrong" style — objects, array reads,
+// no hoisting, a real loop over the lights, `/ radius` instead of a
+// precomputed reciprocal, no squared-distance early-out — so that it shares no
+// code and no idiom with shade.hml. If both agree on 4096 randomized inputs
+// the kernel implements the documented model.
+// ---------------------------------------------------------------------------
+fn ref_shade(e: array<f64>, nx: f64, ny: f64, nz: f64,
+             px: f64, py: f64, pz: f64, dofog: i32): object {
+    let ndl = nx * e[ENV_SUN_X] + ny * e[ENV_SUN_Y] + nz * e[ENV_SUN_Z];
+    if (ndl < 0.0) { ndl = 0.0; }
+    let r = e[ENV_AMB_R] + e[ENV_SUN_R] * ndl;
+    let g = e[ENV_AMB_G] + e[ENV_SUN_G] * ndl;
+    let b = e[ENV_AMB_B] + e[ENV_SUN_B] * ndl;
+
+    let bn = 0.0 - ny;
+    if (bn < 0.0) { bn = 0.0; }
+    r = r + e[ENV_BOUNCE_R] * bn;
+    g = g + e[ENV_BOUNCE_G] * bn;
+    b = b + e[ENV_BOUNCE_B] * bn;
+
+    let vx = e[ENV_CAM_X] - px;
+    let vy = e[ENV_CAM_Y] - py;
+    let vz = e[ENV_CAM_Z] - pz;
+    let vl = __sqrt(vx * vx + vy * vy + vz * vz);
+    if (vl > 0.0) {
+        let ndv = (nx * vx + ny * vy + nz * vz) / vl;
+        if (ndv < 0.0) { ndv = 0.0; }
+        let k = 1.0 - ndv;
+        let k3 = k * k * k;
+        r = r + e[ENV_RIM_R] * k3;
+        g = g + e[ENV_RIM_G] * k3;
+        b = b + e[ENV_RIM_B] * k3;
+    }
+
+    let n = i32(e[ENV_LIGHT_COUNT]);
+    for (let i = 0; i < n; i++) {
+        let base = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
+        let dx = e[base + ENV_L_X] - px;
+        let dy = e[base + ENV_L_Y] - py;
+        let dz = e[base + ENV_L_Z] - pz;
+        let d = __sqrt(dx * dx + dy * dy + dz * dz);
+        let rad = e[base + ENV_L_RADIUS];
+        let t = 0.0;
+        if (rad > 0.0) { t = 1.0 - d / rad; }
+        if (t < 0.0) { t = 0.0; }
+        let att = t * t;
+        let nd = ENV_LIGHT_WRAP;
+        if (d > 0.0) {
+            nd = (nx * dx + ny * dy + nz * dz) / d;
+            if (nd < ENV_LIGHT_WRAP) { nd = ENV_LIGHT_WRAP; }
+        }
+        r = r + e[base + ENV_L_R] * att * nd;
+        g = g + e[base + ENV_L_G] * att * nd;
+        b = b + e[base + ENV_L_B] * att * nd;
+    }
+
+    if (r < 0.0) { r = 0.0; } if (r > 1.0) { r = 1.0; }
+    if (g < 0.0) { g = 0.0; } if (g > 1.0) { g = 1.0; }
+    if (b < 0.0) { b = 0.0; } if (b > 1.0) { b = 1.0; }
+
+    let f = 0.0;
+    let a = 255.0;
+    if (dofog != 0) {
+        if (e[ENV_FOG_FAR] > e[ENV_FOG_NEAR]) {
+            let t = (vl - e[ENV_FOG_NEAR]) / (e[ENV_FOG_FAR] - e[ENV_FOG_NEAR]);
+            if (t < 0.0) { t = 0.0; }
+            if (t > 1.0) { t = 1.0; }
+            f = t * t * (3.0 - 2.0 * t);
+        }
+        if (e[ENV_MIST_TOP] > e[ENV_MIST_BOTTOM] && e[ENV_MIST_DENSITY] > 0.0) {
+            let h = (e[ENV_MIST_TOP] - py) / (e[ENV_MIST_TOP] - e[ENV_MIST_BOTTOM]);
+            if (h < 0.0) { h = 0.0; }
+            if (h > 1.0) { h = 1.0; }
+            let mf = h * h * e[ENV_MIST_DENSITY];
+            if (mf > f) { f = mf; }
+        }
+        if (f > 1.0) { f = 1.0; }
+        if (f > 0.0) {
+            r = r * (1.0 + (e[ENV_FOG_R] - 1.0) * f);
+            g = g * (1.0 + (e[ENV_FOG_G] - 1.0) * f);
+            b = b * (1.0 + (e[ENV_FOG_B] - 1.0) * f);
+            if (r < 0.0) { r = 0.0; } if (r > 1.0) { r = 1.0; }
+            if (g < 0.0) { g = 0.0; } if (g > 1.0) { g = 1.0; }
+            if (b < 0.0) { b = 0.0; } if (b > 1.0) { b = 1.0; }
+            let at = e[ENV_FOG_ALPHA_T];
+            if (f > at) {
+                a = 255.0 * (1.0 - e[ENV_FOG_ALPHA_MAX] * (f - at) / (1.0 - at));
+                if (a < 0.0) { a = 0.0; }
+                if (a > 255.0) { a = 255.0; }
+            }
+        }
+    }
+    return { r: q8(r), g: q8(g), b: q8(b), a: i32(a + 0.5), f: f };
+}
+
+// ===========================================================================
+// 1. LAYOUT — the index table is the interface, so test it as one
+// ===========================================================================
+fn test_layout() {
+    print("[1] RenderEnv layout");
+    eqi("ENV_COUNT", ENV_COUNT, 57);
+    eqi("ENV_MAX_LIGHTS", ENV_MAX_LIGHTS, 4);
+    eqi("ENV_LIGHT_STRIDE", ENV_LIGHT_STRIDE, 7);
+    eqi("light block ends exactly at ENV_COUNT",
+        ENV_LIGHT0_X + ENV_MAX_LIGHTS * ENV_LIGHT_STRIDE, ENV_COUNT);
+    eqi("ENV_LIGHT1_X follows light 0", ENV_LIGHT1_X, ENV_LIGHT0_X + ENV_LIGHT_STRIDE);
+    eqi("ENV_LIGHT2_X follows light 1", ENV_LIGHT2_X, ENV_LIGHT0_X + 2 * ENV_LIGHT_STRIDE);
+    eqi("ENV_LIGHT3_X follows light 2", ENV_LIGHT3_X, ENV_LIGHT0_X + 3 * ENV_LIGHT_STRIDE);
+    eqi("ENV_LIGHT0_Y", ENV_LIGHT0_Y, ENV_LIGHT0_X + ENV_L_Y);
+    eqi("ENV_LIGHT0_Z", ENV_LIGHT0_Z, ENV_LIGHT0_X + ENV_L_Z);
+    eqi("ENV_LIGHT0_R", ENV_LIGHT0_R, ENV_LIGHT0_X + ENV_L_R);
+    eqi("ENV_LIGHT0_G", ENV_LIGHT0_G, ENV_LIGHT0_X + ENV_L_G);
+    eqi("ENV_LIGHT0_B", ENV_LIGHT0_B, ENV_LIGHT0_X + ENV_L_B);
+    eqi("ENV_LIGHT0_RADIUS", ENV_LIGHT0_RADIUS, ENV_LIGHT0_X + ENV_L_RADIUS);
+    eqi("env_field_count", env_field_count(), ENV_COUNT);
+    eqf("ENV_FAR_SCALE", ENV_FAR_SCALE, 1.06, 0.0);
+    eqf("ENV_FOG_ALPHA_T_DEFAULT (ARCHITECTURE D7)", ENV_FOG_ALPHA_T_DEFAULT, 0.35, 0.0);
+    eqf("ENV_LIGHT_WRAP (G16 floor)", ENV_LIGHT_WRAP, 0.25, 0.0);
+
+    // Every named scalar index is distinct and in range.
+    let hit: array<i32> = [];
+    for (let i = 0; i < ENV_COUNT; i++) { hit.push(0); }
+    let names: array<i32> = [
+        ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+        ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+        ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+        ENV_RIM_R, ENV_RIM_G, ENV_RIM_B,
+        ENV_CAM_X, ENV_CAM_Y, ENV_CAM_Z,
+        ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+        ENV_FOG_ALPHA_MAX, ENV_FOG_ALPHA_T,
+        ENV_MIST_TOP, ENV_MIST_BOTTOM, ENV_MIST_DENSITY,
+        ENV_LIGHT_COUNT,
+        ENV_LIGHT0_X, ENV_LIGHT0_Y, ENV_LIGHT0_Z, ENV_LIGHT0_R, ENV_LIGHT0_G,
+        ENV_LIGHT0_B, ENV_LIGHT0_RADIUS
+    ];
+    let dup: i32 = 0;
+    let oob: i32 = 0;
+    let nn: i32 = names.length;
+    for (let i = 0; i < nn; i++) {
+        let ix: i32 = names[i];
+        if (ix < 0 || ix >= ENV_COUNT) { oob++; }
+        else { if (hit[ix] != 0) { dup++; } hit[ix] = 1; }
+    }
+    eqi("no duplicate ENV_* index", dup, 0);
+    eqi("no out-of-range ENV_* index", oob, 0);
+    eqi("scalar block is densely packed 0..ENV_LIGHT_COUNT", nn, ENV_LIGHT0_X + 7);
+
+    // The bound-state (hoist list) table.
+    eqi("ENVB_COUNT", ENVB_COUNT, ENVB_LIGHT0_X + ENV_MAX_LIGHTS * ENVB_LIGHT_STRIDE);
+    eqi("ENVB_LIGHT_STRIDE", ENVB_LIGHT_STRIDE, 8);
+    eqi("ENVB_L_INV_RADIUS", ENVB_L_INV_RADIUS, 6);
+    eqi("ENVB_L_RADIUS2", ENVB_L_RADIUS2, 7);
+    eqi("ENVB_LIGHT1_X", ENVB_LIGHT1_X, ENVB_LIGHT0_X + ENVB_LIGHT_STRIDE);
+    eqi("ENVB_LIGHT2_X", ENVB_LIGHT2_X, ENVB_LIGHT0_X + 2 * ENVB_LIGHT_STRIDE);
+    eqi("ENVB_LIGHT3_X", ENVB_LIGHT3_X, ENVB_LIGHT0_X + 3 * ENVB_LIGHT_STRIDE);
+
+    let e: array<f64> = env_new();
+    eqi("env_new length == ENV_COUNT", e.length, ENV_COUNT);
+}
+
+// ===========================================================================
+// 2. COLD API
+// ===========================================================================
+fn test_cold() {
+    print("[2] cold API");
+    let e: array<f64> = env_new();
+
+    // A fresh env is black, unfogged and lightless: the engine ships no
+    // colours (R1), so nothing renders until the game authors it.
+    let nonzero: i32 = 0;
+    for (let i = 0; i < ENV_COUNT; i++) {
+        let v: f64 = e[i];
+        if (i == ENV_SUN_Y) { continue; }
+        if (i == ENV_FOG_R || i == ENV_FOG_G || i == ENV_FOG_B) { continue; }
+        if (i == ENV_FOG_ALPHA_T) { continue; }
+        if (v != 0.0) { nonzero++; }
+    }
+    eqi("env_new is zero except sun dir / fog tint / alpha threshold", nonzero, 0);
+    eqf("env_new sun dir is +Y", e[ENV_SUN_Y], 1.0, 0.0);
+    eqf("env_new fog tint R is neutral", e[ENV_FOG_R], 1.0, 0.0);
+    eqf("env_new fog tint G is neutral", e[ENV_FOG_G], 1.0, 0.0);
+    eqf("env_new fog tint B is neutral", e[ENV_FOG_B], 1.0, 0.0);
+    eqf("env_new alpha threshold", e[ENV_FOG_ALPHA_T], 0.35, 0.0);
+    eqi("env_new light count", env_light_count(e), 0);
+
+    // Sun direction is stored normalized.
+    env_set_sun(e, 0.0, 3.0, 4.0, 0.61, 0.57, 0.44);
+    eqf("sun dir normalized x", e[ENV_SUN_X], 0.0, 0.0000000001);
+    eqf("sun dir normalized y", e[ENV_SUN_Y], 0.6, 0.0000000001);
+    eqf("sun dir normalized z", e[ENV_SUN_Z], 0.8, 0.0000000001);
+    eqf("sun colour r stored", e[ENV_SUN_R], 0.61, 0.0);
+    eqf("sun colour g stored", e[ENV_SUN_G], 0.57, 0.0);
+    eqf("sun colour b stored", e[ENV_SUN_B], 0.44, 0.0);
+    env_set_sun(e, 0.0, 0.0, 0.0, 0.61, 0.57, 0.44);
+    eqf("degenerate sun dir falls back to +Y (x)", e[ENV_SUN_X], 0.0, 0.0);
+    eqf("degenerate sun dir falls back to +Y (y)", e[ENV_SUN_Y], 1.0, 0.0);
+    eqf("degenerate sun dir falls back to +Y (z)", e[ENV_SUN_Z], 0.0, 0.0);
+
+    env_set_ambient(e, 0.11, 0.22, 0.33);
+    eqf("ambient r", e[ENV_AMB_R], 0.11, 0.0);
+    eqf("ambient g", e[ENV_AMB_G], 0.22, 0.0);
+    eqf("ambient b", e[ENV_AMB_B], 0.33, 0.0);
+    env_set_bounce(e, 0.07, 0.06, 0.05);
+    eqf("bounce r", e[ENV_BOUNCE_R], 0.07, 0.0);
+    env_set_rim(e, 0.13, 0.14, 0.15);
+    eqf("rim b", e[ENV_RIM_B], 0.15, 0.0);
+    env_set_camera(e, 1.5, 2.5, 3.5);
+    eqf("camera x", e[ENV_CAM_X], 1.5, 0.0);
+    eqf("camera y", e[ENV_CAM_Y], 2.5, 0.0);
+    eqf("camera z", e[ENV_CAM_Z], 3.5, 0.0);
+
+    env_set_fog(e, 12.0, 68.0, 0.42, 0.51, 0.63, 0.75);
+    eqf("fog near", e[ENV_FOG_NEAR], 12.0, 0.0);
+    eqf("fog far", e[ENV_FOG_FAR], 68.0, 0.0);
+    eqf("fog tint r", e[ENV_FOG_R], 0.42, 0.0);
+    eqf("fog alpha max", e[ENV_FOG_ALPHA_MAX], 0.75, 0.0);
+    env_set_fog(e, 12.0, 68.0, 0.42, 0.51, 0.63, 4.0);
+    eqf("fog alpha max clamped high", e[ENV_FOG_ALPHA_MAX], 1.0, 0.0);
+    env_set_fog(e, 12.0, 68.0, 0.42, 0.51, 0.63, 0.0 - 3.0);
+    eqf("fog alpha max clamped low", e[ENV_FOG_ALPHA_MAX], 0.0, 0.0);
+    // The tint may darken and never brighten, so it is clamped on the way in.
+    env_set_fog(e, 12.0, 68.0, 2.5, 0.0 - 1.0, 0.63, 0.75);
+    eqf("fog tint clamped high", e[ENV_FOG_R], 1.0, 0.0);
+    eqf("fog tint clamped low", e[ENV_FOG_G], 0.0, 0.0);
+    env_set_fog(e, 12.0, 68.0, 0.42, 0.51, 0.63, 0.75);
+
+    // [A4] far plane derived, never hardcoded.
+    eqf("[A4] far plane == fog_far * 1.06", env_far_plane(e), 68.0 * 1.06, 0.0000000001);
+    eqf("[A4] far plane is not a hardcoded 200", env_far_plane(e), 72.08, 0.0000001);
+    env_set_fog(e, 8.0, 40.0, 0.42, 0.51, 0.63, 0.75);
+    eqf("[A4] far plane tracks fog_far", env_far_plane(e), 42.4, 0.0000001);
+    env_set_fog(e, 12.0, 68.0, 0.42, 0.51, 0.63, 0.75);
+
+    env_set_fog_alpha_threshold(e, 0.5);
+    eqf("alpha threshold set", e[ENV_FOG_ALPHA_T], 0.5, 0.0);
+    env_set_fog_alpha_threshold(e, 9.0);
+    eqf("alpha threshold clamped high", e[ENV_FOG_ALPHA_T], 0.999, 0.0);
+    env_set_fog_alpha_threshold(e, 0.0 - 1.0);
+    eqf("alpha threshold clamped low", e[ENV_FOG_ALPHA_T], 0.0, 0.0);
+    env_set_fog_alpha_threshold(e, 0.35);
+
+    env_set_mist(e, 6.0, 1.0, 0.55);
+    eqf("mist top", e[ENV_MIST_TOP], 6.0, 0.0);
+    eqf("mist bottom", e[ENV_MIST_BOTTOM], 1.0, 0.0);
+    eqf("mist density", e[ENV_MIST_DENSITY], 0.55, 0.0);
+
+    // Lights.
+    eqi("add light 0", env_add_light(e, 1.0, 2.0, 3.0, 0.9, 0.5, 0.2, 8.0), 0);
+    eqi("add light 1", env_add_light(e, 4.0, 5.0, 6.0, 0.1, 0.2, 0.3, 9.0), 1);
+    eqi("add light 2", env_add_light(e, 7.0, 8.0, 9.0, 0.4, 0.5, 0.6, 10.0), 2);
+    eqi("add light 3", env_add_light(e, 0.0, 1.0, 2.0, 0.7, 0.8, 0.9, 11.0), 3);
+    eqi("light count is 4", env_light_count(e), 4);
+    eqi("fifth light is refused", env_add_light(e, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 5.0), -1);
+    eqi("light count unchanged after refusal", env_light_count(e), 4);
+    eqf("light 0 x", e[ENV_LIGHT0_X], 1.0, 0.0);
+    eqf("light 0 radius", e[ENV_LIGHT0_RADIUS], 8.0, 0.0);
+    eqf("light 3 b", e[ENV_LIGHT3_X + ENV_L_B], 0.9, 0.0);
+    eqf("light 3 radius", e[ENV_LIGHT3_X + ENV_L_RADIUS], 11.0, 0.0);
+    eqi("env_set_light out of range high", env_set_light(e, 4, 0.0,0.0,0.0, 1.0,1.0,1.0, 2.0), 0);
+    eqi("env_set_light out of range low", env_set_light(e, -1, 0.0,0.0,0.0, 1.0,1.0,1.0, 2.0), 0);
+    eqi("env_set_light zero radius refused", env_set_light(e, 0, 0.0,0.0,0.0, 1.0,1.0,1.0, 0.0), 0);
+    eqi("env_set_light valid", env_set_light(e, 1, 2.0,2.0,2.0, 0.3,0.3,0.3, 4.0), 1);
+    eqf("env_set_light wrote x", e[ENV_LIGHT1_X], 2.0, 0.0);
+    env_clear_lights(e);
+    eqi("env_clear_lights", env_light_count(e), 0);
+    eqi("zero-radius light is refused by env_add_light",
+        env_add_light(e, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0), -1);
+    eqi("refused light did not bump the count", env_light_count(e), 0);
+
+    // Flat accessors.
+    env_field_set(e, ENV_AMB_G, 0.4321);
+    eqf("env_field round trip", env_field(e, ENV_AMB_G), 0.4321, 0.0);
+
+    // Copy.
+    let e2: array<f64> = env_new();
+    env_copy(e2, e);
+    let same: i32 = 1;
+    for (let i = 0; i < ENV_COUNT; i++) { if (e2[i] != e[i]) { same = 0; } }
+    eqi("env_copy copies every field", same, 1);
+
+    // Reset.
+    env_reset(e2);
+    let e3: array<f64> = env_new();
+    let same2: i32 = 1;
+    for (let i = 0; i < ENV_COUNT; i++) { if (e2[i] != e3[i]) { same2 = 0; } }
+    eqi("env_reset == env_new", same2, 1);
+
+    // Lerp.
+    let a: array<f64> = env_new();
+    let b: array<f64> = env_new();
+    let d: array<f64> = env_new();
+    env_set_ambient(a, 0.0, 0.0, 0.0);
+    env_set_ambient(b, 0.8, 0.4, 0.2);
+    env_set_sun(a, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    env_set_sun(b, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0);
+    env_set_fog(a, 0.0, 10.0, 1.0, 1.0, 1.0, 0.0);
+    env_set_fog(b, 0.0, 20.0, 1.0, 1.0, 1.0, 1.0);
+    env_add_light(b, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 5.0);
+    env_lerp(d, a, b, 0.5);
+    eqf("lerp ambient r", d[ENV_AMB_R], 0.4, 0.0000000001);
+    eqf("lerp fog far", d[ENV_FOG_FAR], 15.0, 0.0000000001);
+    let sl: f64 = __sqrt(d[ENV_SUN_X] * d[ENV_SUN_X] + d[ENV_SUN_Y] * d[ENV_SUN_Y]
+                         + d[ENV_SUN_Z] * d[ENV_SUN_Z]);
+    eqf("lerp renormalizes the sun direction", sl, 1.0, 0.0000000001);
+    eqi("lerp light count is discrete (t >= 0.5 takes b)", env_light_count(d), 1);
+    env_lerp(d, a, b, 0.25);
+    eqi("lerp light count is discrete (t < 0.5 takes a)", env_light_count(d), 0);
+    env_lerp(d, a, b, 3.0);
+    eqf("lerp clamps t high", d[ENV_FOG_FAR], 20.0, 0.0000000001);
+    env_lerp(d, a, b, 0.0 - 3.0);
+    eqf("lerp clamps t low", d[ENV_FOG_FAR], 10.0, 0.0000000001);
+}
+
+// ===========================================================================
+// 3. THE LIGHT MODEL (G16) — hand-computed cases
+// ===========================================================================
+fn test_light_model() {
+    print("[3] light model (G16)");
+    let e: array<f64> = env_new();
+    // ambient + sun sum to exactly (1,1,1) — the authoring contract that makes
+    // a fully lit surface reproduce its texel. Deliberately not grey.
+    env_set_sun(e, 0.0, 1.0, 0.0, 0.65, 0.6, 0.7);
+    env_set_ambient(e, 0.35, 0.4, 0.3);
+    env_set_camera(e, 0.0, 0.0, 0.0);
+    env_bind(e);
+
+    eqf("ambient + sun sums to 1.0 (r)", e[ENV_AMB_R] + e[ENV_SUN_R], 1.0, 0.0000000001);
+    eqf("ambient + sun sums to 1.0 (g)", e[ENV_AMB_G] + e[ENV_SUN_G], 1.0, 0.0000000001);
+    eqf("ambient + sun sums to 1.0 (b)", e[ENV_AMB_B] + e[ENV_SUN_B], 1.0, 0.0000000001);
+
+    // [A1] N.L == 1 with ambient + sun == (1,1,1) is exactly white, so the
+    // texture modulate is the identity and the authored texel survives.
+    let c: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eq_rgba("[A1] N.L=1, ambient+sun=(1,1,1) -> 255,255,255,255", c, 255, 255, 255, 255);
+    let cl: u32 = env_light_rgb(0.0, 1.0, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eqi("[A1] env_light_rgb r is 255", cr(cl), 255);
+    eqi("[A1] env_light_rgb g is 255", cg(cl), 255);
+    eqi("[A1] env_light_rgb b is 255", cb(cl), 255);
+
+    // N.L == 0 -> ambient only.
+    let c0: u32 = env_vertex_rgba(1.0, 0.0, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eq_rgba("N.L=0 -> ambient only", c0, q8(0.35), q8(0.4), q8(0.3), 255);
+    // N.L < 0 clamps to 0.
+    let cm: u32 = env_vertex_rgba(0.0, 0.0 - 1.0, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eq_rgba("N.L<0 clamps to ambient", cm, q8(0.35), q8(0.4), q8(0.3), 255);
+    // N.L == 0.7071.
+    let h: f64 = 0.70710678118654752;
+    let ch: u32 = env_vertex_rgba(h, h, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eq_rgba("N.L=0.7071 -> ambient + 0.7071*sun", ch,
+            q8(0.35 + 0.65 * h), q8(0.4 + 0.6 * h), q8(0.3 + 0.7 * h), 255);
+
+    // Bounce: max(0, -N.y).
+    env_set_bounce(e, 0.2, 0.1, 0.05);
+    env_bind(e);
+    eqi("bounce_on", env_bound_bounce_on(), 1);
+    let cb1: u32 = env_vertex_rgba(0.0, 0.0 - 1.0, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eq_rgba("downward normal picks up the full bounce", cb1,
+            q8(0.35 + 0.2), q8(0.4 + 0.1), q8(0.3 + 0.05), 255);
+    let cb2: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 0.0, 0.0 - 10.0);
+    eq_rgba("upward normal picks up no bounce", cb2, 255, 255, 255, 255);
+    env_set_bounce(e, 0.0, 0.0, 0.0);
+    env_bind(e);
+    eqi("bounce_on clears", env_bound_bounce_on(), 0);
+
+    // Rim: (1 - max(0, N.V))^3, V toward the camera.
+    env_set_rim(e, 0.5, 0.25, 0.125);
+    env_set_camera(e, 0.0, 0.0, 10.0);
+    env_bind(e);
+    eqi("rim_on", env_bound_rim_on(), 1);
+    // Facing the camera: N.V = 1 -> no rim.
+    let cr1: u32 = env_vertex_rgba(0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+    eq_rgba("normal facing the camera gets no rim", cr1,
+            q8(0.35), q8(0.4), q8(0.3), 255);
+    // Perpendicular: N.V = 0 -> full rim.
+    let cr2: u32 = env_vertex_rgba(1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    eq_rgba("normal perpendicular to V gets the full rim", cr2,
+            q8(0.35 + 0.5), q8(0.4 + 0.25), q8(0.3 + 0.125), 255);
+    env_set_rim(e, 0.0, 0.0, 0.0);
+    env_set_camera(e, 0.0, 0.0, 0.0);
+    env_bind(e);
+    eqi("rim_on clears", env_bound_rim_on(), 0);
+
+    // Point lights. Light at the origin, radius 10, surface at z = 5.
+    env_set_ambient(e, 0.0, 0.0, 0.0);
+    env_set_sun(e, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    env_add_light(e, 0.0, 0.0, 0.0, 0.8, 0.6, 0.4, 10.0);
+    env_bind(e);
+    eqi("bound light count", env_bound_light_count(), 1);
+    // Normal pointing AT the light: N.D/d = 1, d = 5, t = 0.5, att = 0.25.
+    let p1: u32 = env_vertex_rgba(0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 5.0);
+    eq_rgba("point light, facing: att 0.25 * N.L 1", p1,
+            q8(0.8 * 0.25), q8(0.6 * 0.25), q8(0.4 * 0.25), 255);
+    // Normal pointing AWAY: N.D/d = -1, floored to ENV_LIGHT_WRAP = 0.25.
+    let p2: u32 = env_vertex_rgba(0.0, 0.0, 1.0, 0.0, 0.0, 5.0);
+    eq_rgba("point light, facing away: the 0.25 wrap floor applies", p2,
+            q8(0.8 * 0.25 * 0.25), q8(0.6 * 0.25 * 0.25), q8(0.4 * 0.25 * 0.25), 255);
+    // Exactly at the radius: nothing.
+    let p3: u32 = env_vertex_rgba(0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 10.0);
+    eq_rgba("point light contributes nothing at exactly its radius", p3, 0, 0, 0, 255);
+    // Beyond the radius: nothing.
+    let p4: u32 = env_vertex_rgba(0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 25.0);
+    eq_rgba("point light contributes nothing beyond its radius", p4, 0, 0, 0, 255);
+    // At the light: t = 1, wrap floor because D is degenerate.
+    let p5: u32 = env_vertex_rgba(0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 0.0);
+    eq_rgba("point light at zero distance uses the wrap floor", p5,
+            q8(0.8 * 0.25), q8(0.6 * 0.25), q8(0.4 * 0.25), 255);
+
+    // Per-channel clamp: an over-bright sum saturates at 255, not wraps.
+    env_clear_lights(e);
+    env_set_ambient(e, 3.0, 3.0, 3.0);
+    env_bind(e);
+    let sat: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    eq_rgba("over-bright saturates rather than wrapping", sat, 255, 255, 255, 255);
+    env_set_ambient(e, 0.0 - 3.0, 0.0 - 3.0, 0.0 - 3.0);
+    env_bind(e);
+    let neg: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    eq_rgba("negative light clamps to black", neg, 0, 0, 0, 255);
+}
+
+// ===========================================================================
+// 4. KERNEL vs INDEPENDENT REFERENCE, over randomized inputs
+// ===========================================================================
+fn test_reference_agreement() {
+    print("[4] kernel vs independent reference, 4096 randomized inputs");
+    let e: array<f64> = env_new();
+    let bad_light: i32 = 0;
+    let bad_full: i32 = 0;
+    let bad_fogf: i32 = 0;
+    let bad_alpha: i32 = 0;
+    let cases: i32 = 0;
+
+    for (let trial = 0; trial < 128; trial++) {
+        env_reset(e);
+        env_set_sun(e, rndc(-1.0, 1.0), rndc(-1.0, 1.0), rndc(-1.0, 1.0),
+                    rndc(0.0, 0.9), rndc(0.0, 0.9), rndc(0.0, 0.9));
+        env_set_ambient(e, rndc(0.0, 0.5), rndc(0.0, 0.5), rndc(0.0, 0.5));
+        if (rnd() < 0.5) { env_set_bounce(e, rndc(0.0, 0.3), rndc(0.0, 0.3), rndc(0.0, 0.3)); }
+        if (rnd() < 0.5) { env_set_rim(e, rndc(0.0, 0.4), rndc(0.0, 0.4), rndc(0.0, 0.4)); }
+        env_set_camera(e, rndc(-30.0, 30.0), rndc(0.0, 8.0), rndc(-30.0, 30.0));
+        let near: f64 = rndc(0.0, 20.0);
+        env_set_fog(e, near, near + rndc(1.0, 60.0),
+                    rndc(0.0, 1.0), rndc(0.0, 1.0), rndc(0.0, 1.0), rndc(0.0, 1.0));
+        env_set_fog_alpha_threshold(e, rndc(0.0, 0.9));
+        if (rnd() < 0.5) {
+            let bot: f64 = rndc(0.0, 3.0);
+            env_set_mist(e, bot + rndc(0.5, 8.0), bot, rndc(0.0, 1.0));
+        }
+        let nl: i32 = i32(rnd() * 5.0);
+        if (nl > ENV_MAX_LIGHTS) { nl = ENV_MAX_LIGHTS; }
+        for (let li = 0; li < nl; li++) {
+            env_add_light(e, rndc(-30.0, 30.0), rndc(0.0, 8.0), rndc(-30.0, 30.0),
+                          rndc(0.0, 1.2), rndc(0.0, 1.2), rndc(0.0, 1.2),
+                          rndc(1.0, 25.0));
+        }
+        env_bind(e);
+
+        for (let k = 0; k < 32; k++) {
+            let nx: f64 = rndc(-1.0, 1.0);
+            let ny: f64 = rndc(-1.0, 1.0);
+            let nz: f64 = rndc(-1.0, 1.0);
+            let nlen: f64 = __sqrt(nx * nx + ny * ny + nz * nz);
+            if (nlen <= 0.0) { nx = 0.0; ny = 1.0; nz = 0.0; nlen = 1.0; }
+            nx = nx / nlen; ny = ny / nlen; nz = nz / nlen;
+            let px: f64 = rndc(-60.0, 60.0);
+            let py: f64 = rndc(-2.0, 14.0);
+            let pz: f64 = rndc(-60.0, 60.0);
+
+            cases++;
+            let rl = ref_shade(e, nx, ny, nz, px, py, pz, 0);
+            let gl: u32 = env_light_rgb(nx, ny, nz, px, py, pz);
+            if (cr(gl) != rl.r || cg(gl) != rl.g || cb(gl) != rl.b) { bad_light++; }
+
+            let rf = ref_shade(e, nx, ny, nz, px, py, pz, 1);
+            let gf: u32 = env_vertex_rgba(nx, ny, nz, px, py, pz);
+            if (cr(gf) != rf.r || cg(gf) != rf.g || cb(gf) != rf.b || ca(gf) != rf.a) { bad_full++; }
+
+            let ff: f64 = env_fog_factor(px, py, pz);
+            let dff: f64 = ff - rf.f;
+            if (dff < 0.0) { dff = 0.0 - dff; }
+            if (dff > 0.000000001) { bad_fogf++; }
+
+            let fa: f64 = env_fog_alpha(ff);
+            let dfa: f64 = fa - f64(rf.a);
+            if (dfa < 0.0) { dfa = 0.0 - dfa; }
+            if (dfa > 0.5000001) { bad_alpha++; }
+        }
+    }
+    eqi("randomized cases run", cases, 4096);
+    eqi("env_light_rgb matches the reference", bad_light, 0);
+    eqi("env_vertex_rgba matches the reference", bad_full, 0);
+    eqi("env_fog_factor matches the reference", bad_fogf, 0);
+    eqi("env_fog_alpha matches env_vertex_rgba's alpha", bad_alpha, 0);
+}
+
+// ===========================================================================
+// 5. FOG AND MIST (G15)
+// ===========================================================================
+fn test_fog() {
+    print("[5] fog and mist (G15)");
+    let e: array<f64> = env_new();
+    env_set_camera(e, 0.0, 1.6, 0.0);
+    env_set_fog(e, 10.0, 60.0, 0.4, 0.5, 0.62, 0.6);
+    env_bind(e);
+    eqi("fog_on", env_bound_fog_on(), 1);
+    eqi("mist_on stays off", env_bound_mist_on(), 0);
+
+    // Smoothstep endpoints and midpoint, measured radially from the camera.
+    eqf("f == 0 at fog_near", env_fog_factor(0.0, 1.6, 0.0 - 10.0), 0.0, 0.0);
+    eqf("f == 1 at fog_far", env_fog_factor(0.0, 1.6, 0.0 - 60.0), 1.0, 0.000000001);
+    eqf("f == 0.5 at the midpoint", env_fog_factor(0.0, 1.6, 0.0 - 35.0), 0.5, 0.000000001);
+    eqf("f clamps to 0 nearer than fog_near", env_fog_factor(0.0, 1.6, 0.0 - 2.0), 0.0, 0.0);
+    eqf("f clamps to 1 beyond fog_far", env_fog_factor(0.0, 1.6, 0.0 - 300.0), 1.0, 0.0);
+    // smoothstep(0.25) = 0.15625
+    eqf("smoothstep at t = 0.25", env_fog_factor(0.0, 1.6, 0.0 - 22.5), 0.15625, 0.000000001);
+
+    // ---------------------------------------------------------------------
+    // [A3] RADIAL, NOT VIEW-Z. The camera sits at (0, 1.6, 0) looking down -Z.
+    // Both vertices are exactly 40 m away in a straight line; one is dead
+    // centre of the screen and one is far out toward a corner. Radial fog
+    // gives them the same f. View-space-z fog would give the corner vertex
+    // f(32 m) instead, which is visibly thinner at the screen edges.
+    // ---------------------------------------------------------------------
+    let f_centre: f64 = env_fog_factor(0.0, 1.6, 0.0 - 40.0);
+    let f_corner: f64 = env_fog_factor(24.0, 1.6, 0.0 - 32.0);
+    let dc: f64 = __sqrt(24.0 * 24.0 + 32.0 * 32.0);
+    eqf("the two probe vertices really are equidistant", dc, 40.0, 0.000000001);
+    eqf("[A3] equal fog at screen centre and screen corner", f_corner, f_centre, 0.0);
+    // A third probe, off-axis vertically as well as horizontally.
+    let d3: f64 = __sqrt(12.0 * 12.0 + 16.0 * 16.0 + 36.0 * 36.0);
+    let f_corner2: f64 = env_fog_factor(0.0 - 12.0, 1.6 + 16.0, 0.0 - 36.0);
+    eqf("fog grows with radial distance, not with view z",
+        f_corner2, env_fog_factor(0.0, 1.6, 0.0 - d3), 0.000000001);
+    // The view-z answer differs, which is what makes the test meaningful.
+    let f_viewz: f64 = env_fog_factor(0.0, 1.6, 0.0 - 32.0);
+    ok(f_viewz != f_centre, "[A3] a view-z fog would have differed (test is not vacuous)");
+    print(`  f(radial 40 m) centre = ${f_centre}  corner = ${f_corner}  f(view-z 32 m) = ${f_viewz}`);
+
+    // The whole packed vertex agrees too, not just the scalar helper.
+    let c_centre: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 1.6, 0.0 - 40.0);
+    let c_corner: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 24.0, 1.6, 0.0 - 32.0);
+    eqi("[A3] packed alpha equal at centre and corner", ca(c_corner), ca(c_centre));
+    eqi("[A3] packed red equal at centre and corner", cr(c_corner), cr(c_centre));
+
+    // Alpha ramp (ARCHITECTURE D7).
+    eqf("alpha is 255 below the threshold", env_fog_alpha(0.0), 255.0, 0.0);
+    eqf("alpha is 255 at the threshold", env_fog_alpha(0.35), 255.0, 0.0);
+    eqf("alpha at f == 1 is 255*(1-alpha_max)", env_fog_alpha(1.0), 255.0 * 0.4, 0.000001);
+    let a_half: f64 = env_fog_alpha(0.675);
+    ok(a_half < 255.0 && a_half > 255.0 * 0.4, "alpha ramps monotonically in the far band");
+    // alpha_max = 0 keeps every triangle on the opaque path.
+    env_set_fog(e, 10.0, 60.0, 0.4, 0.5, 0.62, 0.0);
+    env_bind(e);
+    eqf("alpha_max = 0 keeps alpha at 255 even at f = 1", env_fog_alpha(1.0), 255.0, 0.0);
+    let c_far: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 1.6, 0.0 - 200.0);
+    eqi("alpha_max = 0 -> packed alpha 255", ca(c_far), 255);
+    env_set_fog(e, 10.0, 60.0, 0.4, 0.5, 0.62, 0.6);
+
+    // Raising the threshold moves the opaque band, per D7.
+    env_set_fog_alpha_threshold(e, 0.8);
+    env_bind(e);
+    eqf("raised threshold keeps f = 0.7 opaque", env_fog_alpha(0.7), 255.0, 0.0);
+    ok(env_fog_alpha(0.9) < 255.0, "raised threshold still ramps above it");
+    env_set_fog_alpha_threshold(e, 0.35);
+
+    // Fog tint multiply.
+    env_set_ambient(e, 1.0, 1.0, 1.0);
+    env_set_fog(e, 10.0, 60.0, 0.0, 0.0, 0.0, 0.0);
+    env_bind(e);
+    let c_black: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 1.6, 0.0 - 300.0);
+    eq_rgba("a black fog tint at f = 1 drives the vertex colour to black",
+            c_black, 0, 0, 0, 255);
+    env_set_fog(e, 10.0, 60.0, 1.0, 1.0, 1.0, 0.0);
+    env_bind(e);
+    let c_neutral: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 1.6, 0.0 - 300.0);
+    eq_rgba("a neutral fog tint leaves the vertex colour alone",
+            c_neutral, 255, 255, 255, 255);
+
+    // Fog disabled when far <= near.
+    env_set_fog(e, 40.0, 40.0, 0.4, 0.5, 0.62, 0.6);
+    env_bind(e);
+    eqi("far == near disables fog", env_bound_fog_on(), 0);
+    eqf("disabled fog gives f = 0 at any distance",
+        env_fog_factor(0.0, 1.6, 0.0 - 500.0), 0.0, 0.0);
+
+    // ---------------------------------------------------------------------
+    // Mist: a height band independent of distance. Distance fog is left OFF
+    // for these so the numbers are the mist term and nothing else.
+    // ---------------------------------------------------------------------
+    env_set_mist(e, 5.0, 1.0, 0.8);
+    env_bind(e);
+    eqi("mist_on", env_bound_mist_on(), 1);
+    eqi("distance fog is off for the mist cases", env_bound_fog_on(), 0);
+    eqf("mist is full below its bottom",
+        env_fog_factor(0.0, 0.0 - 3.0, 0.0 - 11.0), 0.8, 0.000000001);
+    eqf("mist is full exactly at its bottom",
+        env_fog_factor(0.0, 1.0, 0.0 - 11.0), 0.8, 0.000000001);
+    eqf("mist is zero at its top",
+        env_fog_factor(0.0, 5.0, 0.0 - 10.5), 0.0, 0.000000001);
+    eqf("mist is zero above its top",
+        env_fog_factor(0.0, 40.0, 0.0 - 12.0), 0.0, 0.000000001);
+    // At the middle of the band h = 0.5, so f = 0.25 * density.
+    eqf("mist follows h*h*density",
+        env_fog_factor(0.0, 3.0, 0.0 - 10.2), 0.25 * 0.8, 0.000000001);
+    // max(): distance fog wins when it is stronger.
+    env_set_fog(e, 10.0, 60.0, 0.4, 0.5, 0.62, 0.6);
+    env_bind(e);
+    ok(env_fog_factor(0.0, 0.0 - 3.0, 0.0 - 59.0) > 0.8,
+       "distance fog wins over mist when it is stronger");
+    ok(env_fog_factor(0.0, 0.0 - 3.0, 0.0 - 11.0) == 0.8,
+       "mist wins over distance fog when it is stronger");
+    env_set_mist(e, 5.0, 1.0, 0.0);
+    env_bind(e);
+    eqi("zero density disables mist", env_bound_mist_on(), 0);
+    env_set_mist(e, 1.0, 5.0, 0.8);
+    env_bind(e);
+    eqi("inverted mist band disables mist", env_bound_mist_on(), 0);
+}
+
+// ===========================================================================
+// 6. THE HOIST LIST — env_bind_field must expose exactly what the kernel uses
+// ===========================================================================
+fn test_hoist_list() {
+    print("[6] bound-state hoist list");
+    let e: array<f64> = env_new();
+    env_set_sun(e, 0.3, 0.9, 0.2, 0.61, 0.57, 0.44);
+    env_set_ambient(e, 0.39, 0.43, 0.56);
+    env_set_bounce(e, 0.07, 0.06, 0.05);
+    env_set_rim(e, 0.13, 0.14, 0.15);
+    env_set_camera(e, 1.5, 2.5, 3.5);
+    env_set_fog(e, 12.0, 68.0, 0.42, 0.51, 0.63, 0.75);
+    env_set_fog_alpha_threshold(e, 0.4);
+    env_set_mist(e, 6.0, 1.0, 0.55);
+    env_add_light(e, 1.0, 2.0, 3.0, 0.9, 0.5, 0.2, 8.0);
+    env_add_light(e, 4.0, 5.0, 6.0, 0.1, 0.2, 0.3, 16.0);
+    env_add_light(e, 7.0, 8.0, 9.0, 0.4, 0.5, 0.6, 32.0);
+    env_add_light(e, 0.0, 1.0, 2.0, 0.7, 0.8, 0.9, 64.0);
+    env_bind(e);
+
+    eqf("ENVB_SUN_X", env_bind_field(ENVB_SUN_X), e[ENV_SUN_X], 0.0);
+    eqf("ENVB_SUN_Y", env_bind_field(ENVB_SUN_Y), e[ENV_SUN_Y], 0.0);
+    eqf("ENVB_SUN_Z", env_bind_field(ENVB_SUN_Z), e[ENV_SUN_Z], 0.0);
+    eqf("ENVB_SUN_R", env_bind_field(ENVB_SUN_R), 0.61, 0.0);
+    eqf("ENVB_SUN_G", env_bind_field(ENVB_SUN_G), 0.57, 0.0);
+    eqf("ENVB_SUN_B", env_bind_field(ENVB_SUN_B), 0.44, 0.0);
+    eqf("ENVB_AMB_R", env_bind_field(ENVB_AMB_R), 0.39, 0.0);
+    eqf("ENVB_AMB_G", env_bind_field(ENVB_AMB_G), 0.43, 0.0);
+    eqf("ENVB_AMB_B", env_bind_field(ENVB_AMB_B), 0.56, 0.0);
+    eqf("ENVB_BOUNCE_R", env_bind_field(ENVB_BOUNCE_R), 0.07, 0.0);
+    eqf("ENVB_BOUNCE_G", env_bind_field(ENVB_BOUNCE_G), 0.06, 0.0);
+    eqf("ENVB_BOUNCE_B", env_bind_field(ENVB_BOUNCE_B), 0.05, 0.0);
+    eqf("ENVB_RIM_R", env_bind_field(ENVB_RIM_R), 0.13, 0.0);
+    eqf("ENVB_RIM_G", env_bind_field(ENVB_RIM_G), 0.14, 0.0);
+    eqf("ENVB_RIM_B", env_bind_field(ENVB_RIM_B), 0.15, 0.0);
+    eqf("ENVB_CAM_X", env_bind_field(ENVB_CAM_X), 1.5, 0.0);
+    eqf("ENVB_CAM_Y", env_bind_field(ENVB_CAM_Y), 2.5, 0.0);
+    eqf("ENVB_CAM_Z", env_bind_field(ENVB_CAM_Z), 3.5, 0.0);
+    eqf("ENVB_FOG_NEAR", env_bind_field(ENVB_FOG_NEAR), 12.0, 0.0);
+    eqf("ENVB_FOG_INV_SPAN", env_bind_field(ENVB_FOG_INV_SPAN), 1.0 / 56.0, 0.0000000001);
+    eqf("ENVB_FOG_R", env_bind_field(ENVB_FOG_R), 0.42, 0.0);
+    eqf("ENVB_FOG_G", env_bind_field(ENVB_FOG_G), 0.51, 0.0);
+    eqf("ENVB_FOG_B", env_bind_field(ENVB_FOG_B), 0.63, 0.0);
+    eqf("ENVB_FOG_ALPHA_MAX", env_bind_field(ENVB_FOG_ALPHA_MAX), 0.75, 0.0);
+    eqf("ENVB_FOG_ALPHA_T", env_bind_field(ENVB_FOG_ALPHA_T), 0.4, 0.0);
+    eqf("ENVB_FOG_ALPHA_INV", env_bind_field(ENVB_FOG_ALPHA_INV), 1.0 / 0.6, 0.0000000001);
+    eqf("ENVB_MIST_TOP", env_bind_field(ENVB_MIST_TOP), 6.0, 0.0);
+    eqf("ENVB_MIST_INV_SPAN", env_bind_field(ENVB_MIST_INV_SPAN), 1.0 / 5.0, 0.0000000001);
+    eqf("ENVB_MIST_DENSITY", env_bind_field(ENVB_MIST_DENSITY), 0.55, 0.0);
+    eqf("ENVB_FAR_PLANE", env_bind_field(ENVB_FAR_PLANE), 68.0 * 1.06, 0.0000000001);
+    eqf("env_bound_far_plane agrees", env_bound_far_plane(), 68.0 * 1.06, 0.0000000001);
+    eqf("ENVB_LIGHT_COUNT", env_bind_field(ENVB_LIGHT_COUNT), 4.0, 0.0);
+
+    // Per-light blocks, including the reciprocal and the squared radius.
+    let bad: i32 = 0;
+    let bases: array<i32> = [ENVB_LIGHT0_X, ENVB_LIGHT1_X, ENVB_LIGHT2_X, ENVB_LIGHT3_X];
+    for (let i = 0; i < ENV_MAX_LIGHTS; i++) {
+        let sb: i32 = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
+        let db: i32 = bases[i];
+        for (let k = 0; k < 6; k++) {
+            if (env_bind_field(db + k) != e[sb + k]) { bad++; }
+        }
+        let rad: f64 = e[sb + ENV_L_RADIUS];
+        let wi: f64 = 1.0 / rad;
+        let gi: f64 = env_bind_field(db + ENVB_L_INV_RADIUS);
+        let di: f64 = gi - wi;
+        if (di < 0.0) { di = 0.0 - di; }
+        if (di > 0.0000000001) { bad++; }
+        let w2: f64 = rad * rad;
+        let g2: f64 = env_bind_field(db + ENVB_L_RADIUS2);
+        let d2: f64 = g2 - w2;
+        if (d2 < 0.0) { d2 = 0.0 - d2; }
+        if (d2 > 0.0000000001) { bad++; }
+    }
+    eqi("every bound light field matches the env", bad, 0);
+
+    // Lights past the active count are not promised, but the count is honest.
+    env_clear_lights(e);
+    env_bind(e);
+    eqi("bound light count follows env_clear_lights", env_bound_light_count(), 0);
+    eqf("ENVB_LIGHT_COUNT follows too", env_bind_field(ENVB_LIGHT_COUNT), 0.0, 0.0);
+
+    // An out-of-range bound index returns 0 rather than throwing.
+    eqf("out-of-range ENVB index returns 0", env_bind_field(9999), 0.0, 0.0);
+}
+
+// ===========================================================================
+// 7. PERFORMANCE  [A2]
+//
+// Two FORMS are measured, because they are the two ways the engine will use
+// this file (see the HOW THE HOT PATH USES THIS block in shade.hml):
+//
+//   CALL    — one env_vertex_rgba per vertex. What mesh_bake_light, billboards
+//             and tools do.
+//   FUSED   — the env hoisted once, the arithmetic inlined in the vertex loop.
+//             What emit.hml does, and what the [A2] budget is about.
+//
+// and two CONFIGURATIONS, because they differ by an order of magnitude:
+//
+//   WORST   — four lights whose radius covers the whole area, so every one
+//             of the 7500 vertices is inside all four. Nothing in a 72 m-fog
+//             world looks like this; it is the ceiling, reported as a
+//             regression guard and NOT as a budget.
+//   REAL    — four lights of 8 m radius scattered through the 120 x 120 m
+//             visible area, so ~5.6 % of the vertices are inside a light. The
+//             squared-distance gate rejects the rest without a square root.
+//             This is the configuration [A2] is asserted on.
+//
+// Vertex data is generated by f64 accumulators inside the loop rather than
+// read out of an array (an array<f64> read costs ~9 ns and six of them per
+// vertex would swamp the signal) and without f64(i) (~10 ns). The FUSED loop
+// is cross-checked against the kernel for an identical checksum, so it cannot
+// cheat by computing something cheaper.
+// ===========================================================================
+
+// The fused form: the hoist block below is exactly what emit.hml must do once
+// per frame. Note the two-step `let a0 = env_bind_field(...); let a = a0;` —
+// a call result is never unboxed on the first binding (shade.hml codegen
+// rule 2), and skipping the second local makes this loop 3x slower.
+fn fused_span(p_n: i32): u64 {
+    let n: i32 = p_n;
+
+    let sx0: f64 = env_bind_field(ENVB_SUN_X);   let sx: f64 = sx0;
+    let sy0: f64 = env_bind_field(ENVB_SUN_Y);   let sy: f64 = sy0;
+    let sz0: f64 = env_bind_field(ENVB_SUN_Z);   let sz: f64 = sz0;
+    let sr0: f64 = env_bind_field(ENVB_SUN_R);   let sr: f64 = sr0;
+    let sg0: f64 = env_bind_field(ENVB_SUN_G);   let sg: f64 = sg0;
+    let sb0: f64 = env_bind_field(ENVB_SUN_B);   let sb: f64 = sb0;
+    let ar0: f64 = env_bind_field(ENVB_AMB_R);   let ar: f64 = ar0;
+    let ag0: f64 = env_bind_field(ENVB_AMB_G);   let ag: f64 = ag0;
+    let ab0: f64 = env_bind_field(ENVB_AMB_B);   let ab: f64 = ab0;
+    let cx0: f64 = env_bind_field(ENVB_CAM_X);   let cx: f64 = cx0;
+    let cy0: f64 = env_bind_field(ENVB_CAM_Y);   let cy: f64 = cy0;
+    let cz0: f64 = env_bind_field(ENVB_CAM_Z);   let cz: f64 = cz0;
+    let fn0: f64 = env_bind_field(ENVB_FOG_NEAR);      let fnear: f64 = fn0;
+    let fs0: f64 = env_bind_field(ENVB_FOG_INV_SPAN);  let fspan: f64 = fs0;
+    let fr0: f64 = env_bind_field(ENVB_FOG_R);   let fr: f64 = fr0;
+    let fg0: f64 = env_bind_field(ENVB_FOG_G);   let fg: f64 = fg0;
+    let fb0: f64 = env_bind_field(ENVB_FOG_B);   let fb: f64 = fb0;
+    let am0: f64 = env_bind_field(ENVB_FOG_ALPHA_MAX); let amax: f64 = am0;
+    let at0: f64 = env_bind_field(ENVB_FOG_ALPHA_T);   let at: f64 = at0;
+    let ai0: f64 = env_bind_field(ENVB_FOG_ALPHA_INV); let ainv: f64 = ai0;
+    let l0x0: f64 = env_bind_field(ENVB_LIGHT0_X + 0); let l0x: f64 = l0x0;
+    let l0y0: f64 = env_bind_field(ENVB_LIGHT0_X + 1); let l0y: f64 = l0y0;
+    let l0z0: f64 = env_bind_field(ENVB_LIGHT0_X + 2); let l0z: f64 = l0z0;
+    let l0r0: f64 = env_bind_field(ENVB_LIGHT0_X + 3); let l0r: f64 = l0r0;
+    let l0g0: f64 = env_bind_field(ENVB_LIGHT0_X + 4); let l0g: f64 = l0g0;
+    let l0b0: f64 = env_bind_field(ENVB_LIGHT0_X + 5); let l0b: f64 = l0b0;
+    let l0i0: f64 = env_bind_field(ENVB_LIGHT0_X + 6); let l0i: f64 = l0i0;
+    let l0q0: f64 = env_bind_field(ENVB_LIGHT0_X + 7); let l0q: f64 = l0q0;
+    let l1x0: f64 = env_bind_field(ENVB_LIGHT1_X + 0); let l1x: f64 = l1x0;
+    let l1y0: f64 = env_bind_field(ENVB_LIGHT1_X + 1); let l1y: f64 = l1y0;
+    let l1z0: f64 = env_bind_field(ENVB_LIGHT1_X + 2); let l1z: f64 = l1z0;
+    let l1r0: f64 = env_bind_field(ENVB_LIGHT1_X + 3); let l1r: f64 = l1r0;
+    let l1g0: f64 = env_bind_field(ENVB_LIGHT1_X + 4); let l1g: f64 = l1g0;
+    let l1b0: f64 = env_bind_field(ENVB_LIGHT1_X + 5); let l1b: f64 = l1b0;
+    let l1i0: f64 = env_bind_field(ENVB_LIGHT1_X + 6); let l1i: f64 = l1i0;
+    let l1q0: f64 = env_bind_field(ENVB_LIGHT1_X + 7); let l1q: f64 = l1q0;
+    let l2x0: f64 = env_bind_field(ENVB_LIGHT2_X + 0); let l2x: f64 = l2x0;
+    let l2y0: f64 = env_bind_field(ENVB_LIGHT2_X + 1); let l2y: f64 = l2y0;
+    let l2z0: f64 = env_bind_field(ENVB_LIGHT2_X + 2); let l2z: f64 = l2z0;
+    let l2r0: f64 = env_bind_field(ENVB_LIGHT2_X + 3); let l2r: f64 = l2r0;
+    let l2g0: f64 = env_bind_field(ENVB_LIGHT2_X + 4); let l2g: f64 = l2g0;
+    let l2b0: f64 = env_bind_field(ENVB_LIGHT2_X + 5); let l2b: f64 = l2b0;
+    let l2i0: f64 = env_bind_field(ENVB_LIGHT2_X + 6); let l2i: f64 = l2i0;
+    let l2q0: f64 = env_bind_field(ENVB_LIGHT2_X + 7); let l2q: f64 = l2q0;
+    let l3x0: f64 = env_bind_field(ENVB_LIGHT3_X + 0); let l3x: f64 = l3x0;
+    let l3y0: f64 = env_bind_field(ENVB_LIGHT3_X + 1); let l3y: f64 = l3y0;
+    let l3z0: f64 = env_bind_field(ENVB_LIGHT3_X + 2); let l3z: f64 = l3z0;
+    let l3r0: f64 = env_bind_field(ENVB_LIGHT3_X + 3); let l3r: f64 = l3r0;
+    let l3g0: f64 = env_bind_field(ENVB_LIGHT3_X + 4); let l3g: f64 = l3g0;
+    let l3b0: f64 = env_bind_field(ENVB_LIGHT3_X + 5); let l3b: f64 = l3b0;
+    let l3i0: f64 = env_bind_field(ENVB_LIGHT3_X + 6); let l3i: f64 = l3i0;
+    let l3q0: f64 = env_bind_field(ENVB_LIGHT3_X + 7); let l3q: f64 = l3q0;
+    let ln: i32 = env_bound_light_count();
+    let fog_on: i32 = env_bound_fog_on();
+
+    let sum: u64 = 0;
+    let k: f64 = 0.5773502691896258;
+    // Raster-scan a 120 x 120 m ground area, which is the world a 72 m fog
+    // radius makes visible (ARCHITECTURE D2). Spreading the vertices over an
+    // AREA rather than a line is what makes the "realistic lights" timing
+    // honest: a light of radius R covers pi*R^2 of 14400 m^2, so four 8 m
+    // lights touch ~5.6 % of the vertices, which is what small-radius
+    // dynamic lights actually do. A straight-line walk threaded through
+    // the four lights would put ~65 % of vertices inside one and would be
+    // measuring the worst case twice.
+    let px: f64 = 0.0 - 60.0;
+    let py: f64 = 0.5;
+    let pz: f64 = 0.0 - 60.0;
+    for (let i = 0; i < n; i++) {
+        let el0: f64 = __sqrt((cx - px) * (cx - px) + (cy - py) * (cy - py)
+                              + (cz - pz) * (cz - pz));
+        let el: f64 = el0;
+
+        let ndl: f64 = k * sx + k * sy + k * sz;
+        if (ndl < 0.0) { ndl = 0.0; }
+        let vr: f64 = ar + sr * ndl;
+        let vg: f64 = ag + sg * ndl;
+        let vb: f64 = ab + sb * ndl;
+
+        if (ln > 0) {
+            // O0E compound `if` condition, not four assignment statements:
+            // measured 2.3 ns instead of 13.3 ns per light gate.
+            if ((l0x - px) * (l0x - px) + (l0y - py) * (l0y - py)
+                + (l0z - pz) * (l0z - pz) < l0q) {
+                let dx: f64 = l0x - px;
+                let dy: f64 = l0y - py;
+                let dz: f64 = l0z - pz;
+                let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+                let d: f64 = d0;
+                let t: f64 = 1.0 - d * l0i;
+                let nd: f64 = 0.25;
+                if (d > 0.0) {
+                    let dt: f64 = (k * dx + k * dy + k * dz) / d;
+                    if (dt > 0.25) { nd = dt; }
+                }
+                let w: f64 = t * t * nd;
+                vr = vr + l0r * w; vg = vg + l0g * w; vb = vb + l0b * w;
+            }
+        }
+        if (ln > 1) {
+            // O1E compound `if` condition, not four assignment statements:
+            // measured 2.3 ns instead of 13.3 ns per light gate.
+            if ((l1x - px) * (l1x - px) + (l1y - py) * (l1y - py)
+                + (l1z - pz) * (l1z - pz) < l1q) {
+                let dx: f64 = l1x - px;
+                let dy: f64 = l1y - py;
+                let dz: f64 = l1z - pz;
+                let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+                let d: f64 = d0;
+                let t: f64 = 1.0 - d * l1i;
+                let nd: f64 = 0.25;
+                if (d > 0.0) {
+                    let dt: f64 = (k * dx + k * dy + k * dz) / d;
+                    if (dt > 0.25) { nd = dt; }
+                }
+                let w: f64 = t * t * nd;
+                vr = vr + l1r * w; vg = vg + l1g * w; vb = vb + l1b * w;
+            }
+        }
+        if (ln > 2) {
+            // O2E compound `if` condition, not four assignment statements:
+            // measured 2.3 ns instead of 13.3 ns per light gate.
+            if ((l2x - px) * (l2x - px) + (l2y - py) * (l2y - py)
+                + (l2z - pz) * (l2z - pz) < l2q) {
+                let dx: f64 = l2x - px;
+                let dy: f64 = l2y - py;
+                let dz: f64 = l2z - pz;
+                let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+                let d: f64 = d0;
+                let t: f64 = 1.0 - d * l2i;
+                let nd: f64 = 0.25;
+                if (d > 0.0) {
+                    let dt: f64 = (k * dx + k * dy + k * dz) / d;
+                    if (dt > 0.25) { nd = dt; }
+                }
+                let w: f64 = t * t * nd;
+                vr = vr + l2r * w; vg = vg + l2g * w; vb = vb + l2b * w;
+            }
+        }
+        if (ln > 3) {
+            // O3E compound `if` condition, not four assignment statements:
+            // measured 2.3 ns instead of 13.3 ns per light gate.
+            if ((l3x - px) * (l3x - px) + (l3y - py) * (l3y - py)
+                + (l3z - pz) * (l3z - pz) < l3q) {
+                let dx: f64 = l3x - px;
+                let dy: f64 = l3y - py;
+                let dz: f64 = l3z - pz;
+                let d0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+                let d: f64 = d0;
+                let t: f64 = 1.0 - d * l3i;
+                let nd: f64 = 0.25;
+                if (d > 0.0) {
+                    let dt: f64 = (k * dx + k * dy + k * dz) / d;
+                    if (dt > 0.25) { nd = dt; }
+                }
+                let w: f64 = t * t * nd;
+                vr = vr + l3r * w; vg = vg + l3g * w; vb = vb + l3b * w;
+            }
+        }
+
+        if (vr < 0.0) { vr = 0.0; } if (vr > 1.0) { vr = 1.0; }
+        if (vg < 0.0) { vg = 0.0; } if (vg > 1.0) { vg = 1.0; }
+        if (vb < 0.0) { vb = 0.0; } if (vb > 1.0) { vb = 1.0; }
+
+        let f: f64 = 0.0;
+        if (fog_on != 0) {
+            let ft: f64 = (el - fnear) * fspan;
+            if (ft < 0.0) { ft = 0.0; }
+            if (ft > 1.0) { ft = 1.0; }
+            f = ft * ft * (3.0 - 2.0 * ft);
+        }
+        let av: f64 = 255.0;
+        if (f > 0.0) {
+            vr = vr * (1.0 + (fr - 1.0) * f);
+            vg = vg * (1.0 + (fg - 1.0) * f);
+            vb = vb * (1.0 + (fb - 1.0) * f);
+            if (f > at) {
+                av = 255.0 * (1.0 - amax * (f - at) * ainv);
+                if (av < 0.0) { av = 0.0; }
+                if (av > 255.0) { av = 255.0; }
+            }
+        }
+        // Arithmetic pack, matching shade.hml: `|`/`<<` on u32 are boxed
+        // integer dispatches, f64 multiply-add is native. 140 -> 75 ns.
+        let rf0: f64 = __floor(vr * 255.0 + 0.5);
+        let gf0: f64 = __floor(vg * 255.0 + 0.5);
+        let bf0: f64 = __floor(vb * 255.0 + 0.5);
+        let af0: f64 = __floor(av + 0.5);
+        let rf: f64 = rf0;
+        let gf: f64 = gf0;
+        let bf: f64 = bf0;
+        let af: f64 = af0;
+        let c: u32 = u32(rf + gf * 256.0 + bf * 65536.0 + af * 16777216.0);
+        sum = sum + u64(c);
+
+        px = px + 0.37;
+        if (px > 60.0) { px = px - 120.0; }
+        py = py + 0.0009;
+        if (py > 6.0) { py = py - 5.5; }
+        pz = pz + 0.016;
+    }
+    let out: u64 = sum;
+    return out;
+}
+
+// The call form, over exactly the same synthetic vertices.
+fn call_span(p_n: i32): u64 {
+    let n: i32 = p_n;
+    let sum: u64 = 0;
+    let k: f64 = 0.5773502691896258;
+    // Raster-scan a 120 x 120 m ground area, which is the world a 72 m fog
+    // radius makes visible (ARCHITECTURE D2). Spreading the vertices over an
+    // AREA rather than a line is what makes the "realistic lights" timing
+    // honest: a light of radius R covers pi*R^2 of 14400 m^2, so four 8 m
+    // lights touch ~5.6 % of the vertices, which is what small-radius
+    // dynamic lights actually do. A straight-line walk threaded through
+    // the four lights would put ~65 % of vertices inside one and would be
+    // measuring the worst case twice.
+    let px: f64 = 0.0 - 60.0;
+    let py: f64 = 0.5;
+    let pz: f64 = 0.0 - 60.0;
+    for (let i = 0; i < n; i++) {
+        let c: u32 = env_vertex_rgba(k, k, k, px, py, pz);
+        sum = sum + u64(c);
+        px = px + 0.37;
+        if (px > 60.0) { px = px - 120.0; }
+        py = py + 0.0009;
+        if (py > 6.0) { py = py - 5.5; }
+        pz = pz + 0.016;
+    }
+    let out: u64 = sum;
+    return out;
+}
+
+fn best_ms_fused(p_n: i32, p_reps: i32): f64 {
+    let n: i32 = p_n;
+    let reps: i32 = p_reps;
+    let best: f64 = 1000000.0;
+    for (let r = 0; r < reps; r++) {
+        let t0: u64 = clock_now();
+        let s: u64 = fused_span(n);
+        let t1: u64 = clock_now();
+        g_sink = g_sink + f64(s & 1023);
+        let ms: f64 = clock_ms_between(t0, t1);
+        if (ms < best) { best = ms; }
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn best_ms_call(p_n: i32, p_reps: i32): f64 {
+    let n: i32 = p_n;
+    let reps: i32 = p_reps;
+    let best: f64 = 1000000.0;
+    for (let r = 0; r < reps; r++) {
+        let t0: u64 = clock_now();
+        let s: u64 = call_span(n);
+        let t1: u64 = clock_now();
+        g_sink = g_sink + f64(s & 1023);
+        let ms: f64 = clock_ms_between(t0, t1);
+        if (ms < best) { best = ms; }
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn test_perf() {
+    print("[7] performance — 2500 triangles == 7500 non-indexed vertices");
+    let NV: i32 = 7500;
+    let REPS: i32 = 40;
+
+    let e: array<f64> = env_new();
+    env_set_sun(e, 0.35, 0.86, 0.37, 0.62, 0.58, 0.46);
+    env_set_ambient(e, 0.38, 0.42, 0.54);
+    env_set_camera(e, 0.0, 1.6, 0.0);
+    env_set_fog(e, 8.0, 64.0, 0.44, 0.52, 0.61, 0.6);
+
+    // --- baseline: no point lights ---
+    env_clear_lights(e);
+    env_bind(e);
+    let f0: f64 = best_ms_fused(NV, REPS);
+    let c0: f64 = best_ms_call(NV, REPS);
+    let sum0f: u64 = fused_span(NV);
+    let sum0c: u64 = call_span(NV);
+
+    // --- WORST: four lights that reach every single vertex ---
+    env_clear_lights(e);
+    env_add_light(e, 0.0, 2.0, 0.0 - 20.0, 0.9, 0.55, 0.25, 300.0);
+    env_add_light(e, 10.0, 3.0, 0.0 - 10.0, 0.3, 0.45, 0.85, 300.0);
+    env_add_light(e, 0.0 - 12.0, 1.0, 0.0 - 40.0, 0.65, 0.2, 0.15, 300.0);
+    env_add_light(e, 6.0, 4.0, 0.0 - 55.0, 0.2, 0.7, 0.35, 300.0);
+    env_bind(e);
+    eqi("four lights bound (worst case)", env_bound_light_count(), 4);
+    let fw: f64 = best_ms_fused(NV, REPS);
+    let cw: f64 = best_ms_call(NV, REPS);
+    let sumwf: u64 = fused_span(NV);
+    let sumwc: u64 = call_span(NV);
+
+    // --- REAL: four 8 m lights scattered through the 85 m vertex span ---
+    env_clear_lights(e);
+    env_add_light(e, 0.0 - 31.0, 2.0, 0.0 - 44.0, 0.9, 0.55, 0.25, 8.0);
+    env_add_light(e, 17.0, 3.0, 0.0 - 9.0, 0.3, 0.45, 0.85, 8.0);
+    env_add_light(e, 0.0 - 8.0, 1.0, 26.0, 0.65, 0.2, 0.15, 8.0);
+    env_add_light(e, 41.0, 4.0, 38.0, 0.2, 0.7, 0.35, 8.0);
+    env_bind(e);
+    eqi("four lights bound (realistic case)", env_bound_light_count(), 4);
+    let fr: f64 = best_ms_fused(NV, REPS);
+    let cr2: f64 = best_ms_call(NV, REPS);
+    let sumrf: u64 = fused_span(NV);
+    let sumrc: u64 = call_span(NV);
+
+    // The fused loop must compute exactly what the kernel computes, or the
+    // timings above are measuring a cheaper program than the engine will run.
+    ok(sum0f == sum0c, "fused checksum == kernel checksum, 0 lights");
+    ok(sumwf == sumwc, "fused checksum == kernel checksum, 4 wide lights");
+    ok(sumrf == sumrc, "fused checksum == kernel checksum, 4 realistic lights");
+    ok(sumwf != sum0f, "the four wide lights actually changed the output");
+    ok(sumrf != sum0f, "the four realistic lights actually changed the output");
+    ok(sumrf != sumwf, "the two light configurations differ");
+
+    let dfw: f64 = fw - f0;
+    let dfr: f64 = fr - f0;
+    let dcw: f64 = cw - c0;
+    let dcr: f64 = cr2 - c0;
+    print(`  FUSED  base ${f0} ms | worst ${fw} ms (+${dfw}) | real ${fr} ms (+${dfr})`);
+    print(`  CALL   base ${c0} ms | worst ${cw} ms (+${dcw}) | real ${cr2} ms (+${dcr})`);
+    print(`  FUSED  ns/vertex: base ${f0 * 1000000.0 / 7500.0}  worst ${fw * 1000000.0 / 7500.0}  real ${fr * 1000000.0 / 7500.0}`);
+    print(`  CALL   ns/vertex: base ${c0 * 1000000.0 / 7500.0}  worst ${cw * 1000000.0 / 7500.0}  real ${cr2 * 1000000.0 / 7500.0}`);
+
+    // [A2], asserted on the form the engine ships and the light configuration
+    // a 72 m-fog world actually produces.
+    ok(dfr <= 0.4, "[A2] FUSED, realistic radii: 4 point lights at 2500 tris cost <= 0.4 ms");
+    // Reported as a regression guard, NOT as a budget: see the section header
+    // and the task report. The engine's answer to this case is
+    // mesh_bake_light (G16), not a faster kernel.
+    ok(dfw <= WORSTCASE_CEILING_MS,
+       "worst case (4 lights over every vertex) stays under the regression ceiling");
+    ok(dfr < dfw, "the squared-distance early-out actually pays for itself");
+}
+
+// ===========================================================================
+// 8. PIXEL READBACK  [A1]
+// ===========================================================================
+
+// Six SDL_Vertex covering an axis-aligned rectangle, all with the same packed
+// colour. The UVs SPAN a sub-rectangle of the texture and are deliberately not
+// all equal: SDL_RenderGeometry silently drops the texture and renders the
+// vertex colour alone when a triangle's three tex_coords are identical (the uv
+// basis is singular). Verified on this box, SDL 2.0.18 software renderer.
+fn quad(p_buf: ptr, p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64, p_c: u32) {
+    vtx(p_buf, 0, p_x0, p_y0, 0.15, 0.15, p_c);
+    vtx(p_buf, 1, p_x1, p_y0, 0.85, 0.15, p_c);
+    vtx(p_buf, 2, p_x1, p_y1, 0.85, 0.85, p_c);
+    vtx(p_buf, 3, p_x0, p_y0, 0.15, 0.15, p_c);
+    vtx(p_buf, 4, p_x1, p_y1, 0.85, 0.85, p_c);
+    vtx(p_buf, 5, p_x0, p_y1, 0.15, 0.85, p_c);
+}
+
+fn vtx(p_buf: ptr, p_i: i32, p_x: f64, p_y: f64, p_u: f64, p_v: f64, p_c: u32) {
+    let o: i32 = p_i * 20;
+    let c: u32 = p_c;
+    ptr_write_f32(ptr_offset(p_buf, o, 1), p_x);
+    ptr_write_f32(ptr_offset(p_buf, o + 4, 1), p_y);
+    ptr_write_u8(ptr_offset(p_buf, o + 8, 1), i32(c & 255));
+    ptr_write_u8(ptr_offset(p_buf, o + 9, 1), i32((c >> 8) & 255));
+    ptr_write_u8(ptr_offset(p_buf, o + 10, 1), i32((c >> 16) & 255));
+    ptr_write_u8(ptr_offset(p_buf, o + 11, 1), i32((c >> 24) & 255));
+    ptr_write_f32(ptr_offset(p_buf, o + 12, 1), p_u);
+    ptr_write_f32(ptr_offset(p_buf, o + 16, 1), p_v);
+}
+
+fn test_readback() {
+    print("[8] pixel readback");
+    let w = window_open_ex("probe_shade", 320, 240, 1, 0);
+    if (w == null) {
+        eprint("probe_shade: no SDL window/renderer — cannot run the readback tests");
+        print(`PASS ${g_pass}/${g_total}`);
+        exit(1);
+    }
+
+    // An authored texel. Deliberately not a round number and with no two
+    // channels equal, so a channel swap or a rounding slip cannot hide.
+    let TR: i32 = 137;
+    let TG: i32 = 91;
+    let TB: i32 = 214;
+    let TW: i32 = 8;
+    let texbuf: buffer = buffer(TW * TW * 4);
+    for (let i = 0; i < TW * TW; i++) {
+        let o: i32 = i * 4;
+        texbuf[o] = TR;          // RGBA32 memory byte order is R,G,B,A
+        texbuf[o + 1] = TG;
+        texbuf[o + 2] = TB;
+        texbuf[o + 3] = 255;
+    }
+    let tex = create_static_tex(w, FMT_RGBA32, TW, TW);
+    ok(tex != ptr_null(), "static RGBA32 texture created");
+    eqi("update_tex succeeded", update_tex(tex, buffer_ptr(texbuf), TW * 4), 0);
+    // BLEND_NONE: the vertex alpha must not participate, so criterion [A1] is
+    // about the colour modulate and nothing else.
+    set_tex_blend(tex, BLEND_NONE);
+
+    let target = create_target(w, 320, 240);
+    ok(target != ptr_null(), "render target created");
+    set_target(w, target);
+
+    let vb: buffer = buffer(6 * 20);
+    let vp: ptr = buffer_ptr(vb);
+    let px: buffer = buffer(320 * 240 * 4);
+    let pp: ptr = buffer_ptr(px);
+
+    // A quad from (100,80) to (140,120).
+    let X0: f64 = 100.0;
+    let Y0: f64 = 80.0;
+    let X1: f64 = 140.0;
+    let Y1: f64 = 120.0;
+
+    // -------------------------------------------------------------------
+    // [A1] ambient + sun == (1,1,1), N.L == 1, fog off -> vertex colour is
+    // exactly white -> the readback is the authored texel, byte for byte.
+    // -------------------------------------------------------------------
+    let e: array<f64> = env_new();
+    env_set_sun(e, 0.0, 1.0, 0.0, 0.65, 0.6, 0.7);
+    env_set_ambient(e, 0.35, 0.4, 0.3);
+    env_set_camera(e, 0.0, 0.0, 0.0);
+    env_bind(e);
+    let cwhite: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 0.0, 0.0 - 5.0);
+    eq_rgba("[A1] kernel produced a pure white vertex", cwhite, 255, 255, 255, 255);
+
+    sdl_clear(w, 0, 0, 0, 255);
+    quad(vp, X0, Y0, X1, Y1, cwhite);
+    let d1: i32 = draw_tris_at(w, tex, vp, 0, 6);
+    eqi("SDL_RenderGeometry (lit quad) succeeded", d1, 0);
+    let r1: i32 = read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+    eqi("SDL_RenderReadPixels succeeded", r1, 0);
+    // ARGB8888 memory byte order is B,G,R,A.
+    let o: i32 = ((100 * 320) + 120) * 4;
+    let gb: i32 = i32(px[o]);
+    let gg: i32 = i32(px[o + 1]);
+    let gr: i32 = i32(px[o + 2]);
+    print(`  readback of the authored texel: ${gr},${gg},${gb} (authored ${TR},${TG},${TB})`);
+    eqi("[A1] readback red == authored texel red", gr, TR);
+    eqi("[A1] readback green == authored texel green", gg, TG);
+    eqi("[A1] readback blue == authored texel blue", gb, TB);
+    // Every pixel of the quad interior, not just one.
+    let allexact: i32 = 1;
+    for (let y = 82; y < 118; y++) {
+        for (let x = 102; x < 138; x++) {
+            let q: i32 = ((y * 320) + x) * 4;
+            if (i32(px[q]) != TB || i32(px[q + 1]) != TG || i32(px[q + 2]) != TR) { allexact = 0; }
+        }
+    }
+    eqi("[A1] the whole quad interior is the authored texel", allexact, 1);
+
+    // -------------------------------------------------------------------
+    // A point light visibly brightens nearby geometry (G16 acceptance).
+    // Dim base so there is headroom above it.
+    // -------------------------------------------------------------------
+    env_reset(e);
+    env_set_ambient(e, 0.3, 0.3, 0.3);
+    env_set_camera(e, 0.0, 0.0, 0.0);
+    env_bind(e);
+    let cdim: u32 = env_vertex_rgba(0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 5.0);
+    sdl_clear(w, 0, 0, 0, 255);
+    quad(vp, X0, Y0, X1, Y1, cdim);
+    draw_tris_at(w, tex, vp, 0, 6);
+    read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+    let dimr: i32 = i32(px[o + 2]);
+    let dimg: i32 = i32(px[o + 1]);
+    let dimb: i32 = i32(px[o]);
+
+    env_add_light(e, 0.0, 0.0, 0.0, 0.6, 0.6, 0.6, 20.0);
+    env_bind(e);
+    let clit: u32 = env_vertex_rgba(0.0, 0.0, 0.0 - 1.0, 0.0, 0.0, 5.0);
+    sdl_clear(w, 0, 0, 0, 255);
+    quad(vp, X0, Y0, X1, Y1, clit);
+    draw_tris_at(w, tex, vp, 0, 6);
+    read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+    let litr: i32 = i32(px[o + 2]);
+    let litg: i32 = i32(px[o + 1]);
+    let litb: i32 = i32(px[o]);
+    print(`  unlit readback ${dimr},${dimg},${dimb} -> lit readback ${litr},${litg},${litb}`);
+    ok(litr > dimr, "a point light visibly brightens the readback (red)");
+    ok(litg > dimg, "a point light visibly brightens the readback (green)");
+    ok(litb > dimb, "a point light visibly brightens the readback (blue)");
+    ok(litr <= TR && litg <= TG && litb <= TB,
+       "vertex colour can only darken the texel, never brighten past it");
+
+    // -------------------------------------------------------------------
+    // Fog reaches the framebuffer: a black tint at f = 1 renders black.
+    // -------------------------------------------------------------------
+    env_reset(e);
+    env_set_ambient(e, 1.0, 1.0, 1.0);
+    env_set_camera(e, 0.0, 0.0, 0.0);
+    env_set_fog(e, 5.0, 30.0, 0.0, 0.0, 0.0, 0.0);
+    env_bind(e);
+    let cfog: u32 = env_vertex_rgba(0.0, 1.0, 0.0, 0.0, 0.0, 0.0 - 200.0);
+    eq_rgba("fully fogged with a black tint packs to black", cfog, 0, 0, 0, 255);
+    sdl_clear(w, 0, 0, 0, 255);
+    quad(vp, X0, Y0, X1, Y1, cfog);
+    draw_tris_at(w, tex, vp, 0, 6);
+    read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+    eqi("fully fogged with a black tint reads back black (r)", i32(px[o + 2]), 0);
+    eqi("fully fogged with a black tint reads back black (g)", i32(px[o + 1]), 0);
+    eqi("fully fogged with a black tint reads back black (b)", i32(px[o]), 0);
+
+    set_target(w, null);
+    window_close(w);
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_shade — W1-3, src/shade.hml (ENGINE_GAPS G15 + G16)");
+    test_layout();
+    test_cold();
+    test_light_model();
+    test_reference_agreement();
+    test_fog();
+    test_hoist_list();
+    test_perf();
+    test_readback();
+
+    print(`sink ${g_sink}`);
+    print(`PASS ${g_pass}/${g_total}`);
+    if (g_total != EXPECTED_ASSERTS) {
+        print(`FAIL assertion count: ran ${g_total}, expected ${EXPECTED_ASSERTS}`);
+        exit(1);
+    }
+    if (g_pass != g_total) { exit(1); }
+    print("probe_shade: OK");
+}
+main();

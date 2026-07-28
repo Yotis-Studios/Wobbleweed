@@ -1,0 +1,242 @@
+// target.hml — the offscreen render target and the integer upscale present.
+//
+// This module is GENERIC. It knows about a low-resolution offscreen surface, an
+// integer magnification factor and a screen-shake offset. It knows nothing about
+// any particular game: every dimension, every scale and every colour is a
+// parameter supplied by the caller.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS EXISTS (ENGINE_GAPS G12)
+// ---------------------------------------------------------------------------
+// `SDL_RenderSetLogicalSize` scales *rasterization*, so polygons are rasterized
+// at window resolution and their edges come out smooth. That is the opposite of
+// the low-resolution look. The fix is to rasterize into a real low-resolution
+// texture and magnify the finished image:
+//
+//     target_begin(t)      SDL_SetRenderTarget(ren, tex)   <- all drawing here
+//        ... clear, draw geometry, draw the overlay ...
+//     target_end(t)        SDL_SetRenderTarget(ren, NULL)
+//     target_present(t)    SDL_RenderCopyEx(..., angle = 0.0, ...)
+//     sdl_present(w)
+//
+// The window must therefore be opened with `window_open_ex(..., logical = 0)`.
+// With `logical = 1` SDL scales the renderer for you, the target texture is
+// magnified twice and every guarantee below is void.
+//
+// ---------------------------------------------------------------------------
+// FOUR RULES THAT ARE LOAD-BEARING
+// ---------------------------------------------------------------------------
+//
+// 1. `SDL_RenderCopyEx`'s `angle` is a C `double`. It is passed here as the
+//    literal `0.0`, never `0`. Passing an integer corrupts the call.
+//
+// 2. The target texture is `FMT_ARGB8888` (372645892), which is renderer-native
+//    on both the software and the accelerated backend. A non-native format makes
+//    SDL allocate an internal conversion texture, which is the G5 crash class.
+//
+// 3. The magnification factor is an INTEGER and the destination rectangle is
+//    exactly `w * scale` by `h * scale`. One source texel therefore becomes an
+//    exact `scale x scale` block of identical window pixels. A fractional scale
+//    (or a logical size underneath) turns those blocks into ragged 2/3-pixel
+//    runs and the whole point of the module is lost.
+//
+// 4. The shake offset is quantized to WHOLE TARGET PIXELS before it is scaled.
+//    A shake expressed in window pixels would slide the image off the block grid
+//    and the image would shimmer against its own magnification lattice. Shake
+//    finer than one target pixel is invisible by design.
+//
+// ---------------------------------------------------------------------------
+// LIFECYCLE
+// ---------------------------------------------------------------------------
+//   let t = target_new(w, 320, 240, 3);   // scale <= 0 => largest that fits
+//   ...
+//   target_free(t);                        // BEFORE window_close(w)
+//
+// `target_free` must run before the renderer is destroyed; the documented engine
+// teardown order is audio -> target -> textures -> renderer -> window -> SDL_Quit.
+//
+// After a window resize, call `target_layout(t)` to recentre the image.
+
+import { divi, floor } from "@stdlib/math";
+import { create_target, destroy_tex, set_target, set_tex_blend, copy_ex,
+         sdl_clear, window_size, sdl_error,
+         BLEND_NONE, FLIP_NONE } from "./sdl.hml";
+
+// Module-scope scratch. Top-level names are `g_` prefixed: hemlockc refuses to
+// unbox any function-local whose name matches a top-level variable, with no
+// scope awareness, so a bare `size` here would de-optimize every local named
+// `size` in the whole program.
+let g_target_wh = alloc(8);      // window_size() scratch: w @0, h @4
+
+fn rect_write(p_r: ptr, p_x: i32, p_y: i32, p_w: i32, p_h: i32) {
+    ptr_write_i32(p_r, p_x);
+    ptr_write_i32(ptr_offset(p_r, 4, 1), p_y);
+    ptr_write_i32(ptr_offset(p_r, 8, 1), p_w);
+    ptr_write_i32(ptr_offset(p_r, 12, 1), p_h);
+}
+
+// ===========================================================================
+// CONSTRUCTION
+// ===========================================================================
+
+// Create an offscreen render target `tw` x `th`, magnified by `scale` when
+// presented.
+//
+//   w      a window handle from window_open_ex(..., logical = 0)
+//   tw/th  the low resolution everything is drawn at (e.g. 320 x 240)
+//   scale  integer magnification. Pass <= 0 to auto-pick the largest integer
+//          factor that fits the current window (never less than 1).
+//
+// Returns a target handle, or `null` if the texture could not be created (the
+// SDL error is printed; the caller decides whether that is fatal).
+//
+// The returned object is plain data and its fields are part of the interface:
+//   tex   SDL_Texture*     the render target
+//   w, h  i32              target resolution
+//   scale i32              magnification
+//   ox,oy i32              window-pixel origin of the magnified image
+//   sx,sy i32              shake offset in TARGET pixels (already quantized)
+export fn target_new(p_w: object, p_tw: i32, p_th: i32, p_scale: i32) {
+    let tw: i32 = p_tw;
+    let th: i32 = p_th;
+    if (tw < 1 || th < 1) {
+        eprint(`target_new: invalid size ${tw}x${th}`);
+        return null;
+    }
+    let tex = create_target(p_w, tw, th);
+    // H-7: a NULL ptr from FFI does NOT compare equal to `null` in compiled
+    // code. Always test with ptr_null().
+    if (tex == ptr_null()) {
+        eprint(`target_new: SDL_CreateTexture failed: ${sdl_error()}`);
+        return null;
+    }
+    // Explicit, so the final blit does not depend on SDL's per-format default
+    // (ARGB8888 has an alpha channel and would otherwise default to BLEND).
+    // A straight copy is what makes the software and accelerated backends agree.
+    set_tex_blend(tex, BLEND_NONE);
+
+    let t = { tex: tex, win: p_w, w: tw, h: th,
+              scale: 1, ox: 0, oy: 0, sx: 0, sy: 0,
+              bord_r: 0, bord_g: 0, bord_b: 0,
+              rect: alloc(16) };
+    target_set_scale(t, p_scale);
+    return t;
+}
+
+// Destroy the target texture. Safe to call twice. Must be called before the
+// renderer is destroyed.
+export fn target_free(p_t: object) {
+    let t: object = p_t;
+    if (t.tex != ptr_null()) {
+        destroy_tex(t.tex);
+        t.tex = ptr_null();
+    }
+}
+
+// Set the integer magnification and recentre. `scale <= 0` auto-picks the
+// largest factor that fits the window. Returns the scale actually in use.
+export fn target_set_scale(p_t: object, p_scale: i32): i32 {
+    let t: object = p_t;
+    let s: i32 = p_scale;
+    if (s <= 0) {
+        window_size(t.win, g_target_wh);
+        let ww = ptr_deref_i32(g_target_wh);
+        let wh = ptr_deref_i32(ptr_offset(g_target_wh, 4, 1));
+        let fx = divi(ww, t.w);
+        let fy = divi(wh, t.h);
+        s = fx;
+        if (fy < s) { s = fy; }
+    }
+    if (s < 1) { s = 1; }
+    t.scale = s;
+    target_layout(t);
+    let out: i32 = s;
+    return out;
+}
+
+// Recompute the window-pixel origin so the magnified image is centred. Call
+// after a window resize. Cheap, but it does query SDL, so it is not per-frame
+// work — target_present() uses the cached origin.
+export fn target_layout(p_t: object) {
+    let t: object = p_t;
+    window_size(t.win, g_target_wh);
+    let ww = ptr_deref_i32(g_target_wh);
+    let wh = ptr_deref_i32(ptr_offset(g_target_wh, 4, 1));
+    // divi truncates toward zero, which is what we want: a half-pixel of
+    // letterbox goes on the bottom/right rather than shifting the block grid.
+    t.ox = divi(ww - t.w * t.scale, 2);
+    t.oy = divi(wh - t.h * t.scale, 2);
+}
+
+// The colour of the letterbox border and of whatever the shake offset uncovers.
+// The engine has no opinion about it; the default is black.
+export fn target_set_border(p_t: object, p_r: i32, p_g: i32, p_b: i32) {
+    let t: object = p_t;
+    t.bord_r = p_r;
+    t.bord_g = p_g;
+    t.bord_b = p_b;
+}
+
+// ===========================================================================
+// PER FRAME
+// ===========================================================================
+
+// Direct all subsequent drawing into the target. Returns 0 on success, -1 if
+// the target has already been freed (which would otherwise silently redirect
+// the whole frame at the window backbuffer instead).
+// SDL resets the viewport and clip rect to the target's dimensions, so screen
+// coordinates from here to target_end() are in target space (0..w, 0..h).
+export fn target_begin(p_t: object): i32 {
+    let t: object = p_t;
+    if (t.tex == ptr_null()) {
+        eprint("target_begin: the target has been freed");
+        let dead: i32 = -1;
+        return dead;
+    }
+    let rc: i32 = set_target(t.win, t.tex);
+    return rc;
+}
+
+// Restore the window backbuffer. Returns 0 on success.
+export fn target_end(p_t: object): i32 {
+    let t: object = p_t;
+    let rc: i32 = set_target(t.win, null);
+    return rc;
+}
+
+// Screen shake, in TARGET pixels. Quantized to whole target pixels (rule 4), so
+// the magnified image never leaves its block grid. Fractional input is rounded
+// with floor(v + 0.5), the same snap the vertex path uses.
+export fn target_set_shake(p_t: object, p_dx: f64, p_dy: f64) {
+    let t: object = p_t;
+    let dx: f64 = p_dx;
+    let dy: f64 = p_dy;
+    t.sx = i32(floor(dx + 0.5));
+    t.sy = i32(floor(dy + 0.5));
+}
+
+// The quantized shake actually in effect, in target pixels.
+export fn target_shake_x(p_t: object): i32 { let t: object = p_t; let out: i32 = t.sx; return out; }
+export fn target_shake_y(p_t: object): i32 { let t: object = p_t; let out: i32 = t.sy; return out; }
+
+// Magnify the target onto the window backbuffer at `scale`, offset by the
+// shake. Clears the backbuffer to the border colour first — with a shake offset
+// the image no longer covers the window, and without the clear the uncovered
+// strip holds the previous frame.
+//
+// `angle` is passed as the f64 literal 0.0 (rule 1). Call target_end() first;
+// call sdl_present() after.
+//
+// Side effect: this leaves SDL's render draw COLOUR set to the border colour.
+// Nothing downstream of the present should depend on the previous draw colour.
+//
+// Returns 0 on success, the SDL_RenderCopyEx status otherwise.
+export fn target_present(p_t: object): i32 {
+    let t: object = p_t;
+    sdl_clear(t.win, t.bord_r, t.bord_g, t.bord_b, 255);
+    let dx: i32 = t.ox + t.sx * t.scale;
+    let dy: i32 = t.oy + t.sy * t.scale;
+    rect_write(t.rect, dx, dy, t.w * t.scale, t.h * t.scale);
+    let rc: i32 = copy_ex(t.win, t.tex, null, t.rect, 0.0, null, FLIP_NONE);
+    return rc;
+}
