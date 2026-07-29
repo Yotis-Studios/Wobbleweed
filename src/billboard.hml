@@ -170,7 +170,7 @@ export fn billboard_set_proj(p_sx: f64, p_sy: f64) {
 // Convenience for the common case: a symmetric perspective projection built by
 // vec.hml's `mat_perspective(fov_y, aspect, near, far)`.
 export fn billboard_set_proj_persp(fov_y: f64, aspect: f64, vw: f64, vh: f64) {
-    let f = 1.0 / tan(fov_y * 0.5);
+    let f: f64 = 1.0 / tan(fov_y * 0.5);   // typed: untyped locals stay boxed (CLAUDE.md A1)
     g_bb_sx = 0.5 * vw * (f / aspect);
     g_bb_sy = 0.5 * vh * f;
 }
