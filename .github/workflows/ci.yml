@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, 'feat/**', 'fix/**', 'claude/**' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probes:
+    name: probes (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # BOTH modes run, and this is the point of the matrix.
+        #
+        # The engine once shipped a crash that fired on EVERY run against a real
+        # display: upload_texture() called SDL_SetTextureScaleMode on an RGB24
+        # texture, which is not an OpenGL-native format, so SDL allocated an
+        # internal conversion texture and the scale-mode path faulted on it. The
+        # software and dummy renderers never take that path, so every headless
+        # test passed and every real run dumped core. It survived indefinitely
+        # because testing was headless-only.
+        #
+        # `xvfb` gives a real X display with a real GL-ish renderer path, so that
+        # entire class of bug is caught here instead of by a user.
+        mode: [headless, xvfb]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDL and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc make cmake pkg-config \
+            libsdl2-dev libsdl2-mixer-dev \
+            libffi-dev zlib1g-dev libssl-dev libwebsockets-dev \
+            xvfb mesa-utils libgl1-mesa-dri
+          echo "SDL runtime:"; pkg-config --modversion sdl2 || true
+
+      # Hemlock is the toolchain, not a dependency of the product, so pin to its
+      # default branch and cache the build. Keyed on the resolved commit so a
+      # Hemlock change invalidates the cache rather than silently testing against
+      # a stale compiler -- which has already cost this project a wave of bad
+      # measurements.
+      - name: Resolve Hemlock revision
+        id: hem
+        run: echo "sha=$(git ls-remote https://github.com/hemlang/hemlock.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Hemlock toolchain
+        id: hemcache
+        uses: actions/cache@v4
+        with:
+          path: /opt/hemlock
+          key: hemlock-${{ runner.os }}-${{ steps.hem.outputs.sha }}
+
+      - name: Build Hemlock
+        if: steps.hemcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/hemlang/hemlock.git /tmp/hemlock
+          cd /tmp/hemlock
+          # USearch backs @stdlib/vector; the engine never imports it, but the
+          # stdlib build expects the header/lib to exist.
+          git clone --depth 1 --branch v2.24.0 --recurse-submodules --shallow-submodules \
+            https://github.com/unum-cloud/usearch.git /tmp/usearch
+          cmake -B /tmp/usearch/build -S /tmp/usearch \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DUSEARCH_BUILD_LIB_C=ON \
+            -DUSEARCH_BUILD_TEST_C=OFF -DUSEARCH_BUILD_TEST_CPP=OFF -DUSEARCH_BUILD_BENCH_CPP=OFF
+          cmake --build /tmp/usearch/build --config Release
+          sudo cp "$(find /tmp/usearch/build -name 'libusearch_c.so' | head -1)" /usr/local/lib/
+          sudo cp /tmp/usearch/c/usearch.h /usr/local/include/
+          sudo ldconfig
+          make -j"$(nproc)" && make stdlib
+          mkdir -p /opt/hemlock
+          cp -a /tmp/hemlock/. /opt/hemlock/
+
+      - name: Install Hemlock
+        run: |
+          sudo ldconfig || true
+          cd /opt/hemlock && sudo make install
+          hemlockc --version || true
+          hemlock --version || true
+
+      - name: Run probes (headless)
+        if: matrix.mode == 'headless'
+        run: ci/probes.sh headless
+
+      # A real X server. Software GL via llvmpipe is fine -- what matters is that
+      # SDL takes the accelerated-renderer code path rather than the dummy one.
+      # Exit 77 means the preflight found SDL cannot open a window/renderer here
+      # (Xvfb without a working GLX). That is reported as SKIPPED with a warning
+      # annotation, never as a pass: the whole point of this job is that a
+      # real-display-only crash once survived indefinitely behind headless-only
+      # testing, and a false green would rebuild that blind spot. It is also not
+      # a hard failure -- a CI that is red for reasons nobody can fix is a CI
+      # everybody learns to ignore.
+      - name: Run probes (Xvfb display)
+        if: matrix.mode == 'xvfb'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          set +e
+          xvfb-run -a --server-args="-screen 0 1280x960x24 +extension GLX +render" ci/probes.sh display
+          rc=$?
+          set -e
+          if [ "$rc" -eq 77 ]; then
+            echo "::warning title=Display path untested::Xvfb could not create an SDL window/renderer (no working GLX). The GPU/real-display code path was NOT exercised by this run."
+            echo "### :warning: Display path UNTESTED" >> "$GITHUB_STEP_SUMMARY"
+            echo "Xvfb on this runner has no working GLX, so SDL could not create a renderer." >> "$GITHUB_STEP_SUMMARY"
+            echo "The headless job still ran in full. Real-display coverage must be done manually until this is resolved." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-logs-${{ matrix.mode }}
+          path: /tmp/ww-probes/*.log
+          if-no-files-found: ignore
+          retention-days: 14
