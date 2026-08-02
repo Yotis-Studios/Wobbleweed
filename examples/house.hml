@@ -1,0 +1,367 @@
+// house.hml — THE HOUSE. A specific two-storey white colonial, built from a
+// photograph, in the wobbleweed shipping core.
+//
+//   hemlockc -O1 examples/house.hml -o /tmp/house
+//   SDL_VIDEODRIVER=dummy /tmp/house          # headless: writes the PNGs, CI-safe
+//   DISPLAY=:0            /tmp/house          # same, on a real display
+//
+// Writes /tmp/house_front.png, _left.png, _right.png, _porch.png (320x240 each)
+// and /tmp/house_front_x3.png (960x720, what the window actually shows).
+//
+// ===========================================================================
+// SHARED WORLD CONTRACT  — agreed with `the-yard`, which owns the ground,
+// the trees, the planting, the driveway and the mailbox.
+// ===========================================================================
+//   UNITS ARE METRES.
+//
+//   ORIGIN (0,0,0) = the point on the ground at the CENTRE OF THE FRONT DOOR,
+//                    in the plane of the main facade.
+//   +X  right, as seen by someone on the lawn facing the house (toward the
+//       garage end)
+//   +Y  up
+//   +Z  out of the facade, toward the lawn and the camera
+//
+//   GROUND: the lawn is at y = 0 at the house and falls away toward the
+//   viewer.  house.hml assumes
+//       ground_y(z) = -GROUND_SLOPE * z    for z > 0,   0 for z <= 0
+//   with GROUND_SLOPE = 0.030, i.e. 0.60 m lower at the reference camera.
+//   The ground drawn by THIS file is a flat green placeholder and nothing
+//   more — the-yard replaces it wholesale.
+//
+//   BUILDING FOOTPRINT, for foundation planting and the driveway:
+//       main block          x [-5.40, +6.10]   z [-8.40,  0.00]
+//       cross-gable wing    x [+1.75, +6.10]   z [ 0.00, +1.35]
+//       entry porch/stoop   x [-1.50, +1.50]   z [ 0.00, +1.80]
+//       right wing (link)   x [+6.10, +8.60]   z [-4.60, +1.35]
+//       right wing (garage) x [+8.60, +13.00]  z [-4.60, +3.05]
+//       chimney             x [+6.14, +7.34]   z [-1.55, -0.05]  (above y 2.60)
+//   Nothing of the house exists outside x [-5.64, +13.12], z [-8.74, +3.39].
+//   Wall faces to plant against, front to back:
+//       z = +3.05  garage front  (x +8.60 .. +13.00)
+//       z = +1.80  front edge of the entry stoop (x -1.50 .. +1.50)
+//       z = +1.35  link front (x +6.10 .. +8.60) and cross gable (+1.75 .. +6.10)
+//       z =  0.00  main facade (x -5.40 .. +1.75)
+//   Shrub balls want to sit at z = front_face + 0.55 with their centres about
+//   0.45 m up; the arborvitae by the entry belongs at x ~ +2.0, the one by
+//   the garage at x ~ +8.9.  The driveway meets the garage door at
+//   x [+9.70, +12.50], z = +3.05.
+//
+//   REFERENCE CAMERA (the photograph): eye at (-3.00, 1.05, 19.00), yaw 0.300,
+//   pitch 0.020, 58 deg vertical FOV.  That is 1.62 m above the lawn at that
+//   point (the lawn is 0.57 m down at z = 19), looking slightly UP the slope —
+//   the pitch is near zero because the house already sits above eye level.
+//
+// ===========================================================================
+// WHAT THIS FILE IS AND IS NOT
+// ===========================================================================
+// It is an EXAMPLE. Nothing in src/ was changed to make it work. It uses the
+// shipping core only: engine, sdl, vec, atlas, mesh, emit, batch, quad,
+// target, shade, stats, png.
+//
+// THE WHOLE BUILDING IS ONE MESH AND ONE TEXTURE.  Built once at startup into
+// a mesh.hml arena, emitted every frame with `emit_mesh_buf` on the baked
+// path (`emit_set_lighting(0)`, fog off), so the frame contains no lighting
+// maths at all: the sun, the eave shadows, the tree shade across the ground
+// storey and the black hole inside the porch are all baked into vertex
+// colour at build time.
+//
+// VERTEX COLOUR CAN ONLY DARKEN, so every texture in the atlas is authored at
+// FULL SUN and every surface is a multiplier below 1.0.  The sunlit siding
+// texel is 238; the reference photograph's sunlit siding is 150; the front
+// wall's multiplier is 0.66.  That is the whole shading model.
+//
+// TEXEL DENSITY IS 16 TEXELS PER METRE on every tiled surface — siding, brick
+// and shingle all use a 32x32 tile covering 2.00 m.  A wall is subdivided
+// into sub-quads that each map the WHOLE tile rect, which is how the tile
+// repeats without needing texture wrap (SDL clamps, and an atlas cannot wrap
+// anyway).  Feature sizes within that budget:
+//     clapboard course   4 texels = 0.25 m   (real ~0.13 m: doubled, because
+//                                             3 texels shimmers at 320x240)
+//     brick course       2 texels = 0.125 m  (real ~0.086 m)
+//     brick length       4 texels = 0.25 m   (real ~0.20 m)
+//     shingle course     4 texels = 0.25 m   (real ~0.14 m)
+// All horizontal structure, none of it per-texel noise.
+//
+// DEPTH, AND THE ONE THING THAT REALLY BIT.  There is no z-buffer and the
+// painter key is the view-space w OF THE WHOLE TRIANGLE.  A 2 m wall quad and
+// a 1.9 m window sprite lying on it are not sorted by "which is in front at
+// this pixel" but by which CENTROID is nearer — and with the camera 17 deg off
+// the wall normal, a wall quad whose centre is 1 m to the left of the window
+// is 0.3 m nearer in w than the window sitting on top of it.  So the wall drew
+// OVER the window, in diagonal slashes following the triangle diagonals.  A
+// 60 mm physical offset cannot fix that; it is two orders of magnitude too
+// small.
+//
+// The fix is a DECAL BIAS.  Applied details live in their own mesh (`g_trim`)
+// and are committed with TRIM_BIAS subtracted from the depth key emit.hml
+// computed, which pulls every one of them 0.60 m toward the camera in the
+// sort and nothing else.  0.60 m beats the worst wall-quad centroid error
+// (a 2 m quad's half-diagonal times sin 17 deg = 0.42 m) and is far smaller
+// than the 1.3 m separation to the nearest thing that legitimately occludes a
+// detail (the porch columns in front of the front door).
+//
+// This is only possible because `emit_mesh_buf` writes its depth keys into an
+// array the CALLER owns and the caller commits them one by one.  There is no
+// polygon-offset, decal or sort-bias concept anywhere in the engine — see the
+// report.
+import { exit } from "@stdlib/process";
+
+import { sdl_clear, sdl_present, set_hint, read_pixels_rect, sdl_error,
+         FMT_ARGB8888, BLEND_NONE } from "../src/sdl.hml";
+import { engine_init, engine_handle, engine_shutdown } from "../src/engine.hml";
+import { v3, mat_mul, mat_perspective, mat_look_dir } from "../src/vec.hml";
+import { atlas_upload } from "../src/atlas.hml";
+import { mesh_buf, mesh_tri_count } from "../src/mesh.hml";
+import { env_new, env_set_camera } from "../src/shade.hml";
+import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
+         emit_set_backface, emit_set_lighting, emit_straddle_reserve,
+         emit_mesh_buf, emit_stats_reset, EMIT_BF_CCW } from "../src/emit.hml";
+import { batch_new, batch_reset, batch_reserve, batch_commit, batch_release,
+         batch_vbuf, batch_count, batch_flush, batch_sort_flush,
+         batch_draw_calls, LAYER_SKY, LAYER_WORLD } from "../src/batch.hml";
+import { quad_fullscreen } from "../src/quad.hml";
+import { target_new, target_begin, target_end, target_present,
+         target_set_border, target_set_shake } from "../src/target.hml";
+import { write_png } from "../src/png.hml";
+
+// THE BUILDING ITSELF lives in examples/house_shell.hml so that
+// examples/house_scene.hml can put it in the real yard. This file is the
+// four-angle silhouette check over it.
+import { hs_build_assets, hs_atlas, hs_sky_atlas, hs_build, hs_build_ground,
+         hs_mesh_house, hs_mesh_trim, hs_mesh_ground, hs_tris, hs_mass_tris,
+         hs_trim_tris, hs_ground_tris, HS_TRIM_BIAS,
+         TW, TH, SCALE, FOVY, ASPECT, NEARZ, FARZ, GUARD, DEPTH_FAR,
+         CAP_WORLD, CAP_SKY } from "./house_shell.hml";
+
+// ===========================================================================
+// STATE
+// ===========================================================================
+
+let g_eng = null;
+let g_win = null;
+let g_target = null;
+let g_tex = ptr_null();
+let g_tex_sky = ptr_null();
+let g_house = null;
+let g_trim = null;
+let g_ground = null;
+let g_bworld = null;
+let g_bsky = null;
+let g_env: array<f64> = [];
+let g_dep: array<f64> = [];
+let g_mvp = [];
+let g_pix = ptr_null();
+let g_big = ptr_null();
+let g_rgb = null;
+let g_rgb_big = null;
+let g_tris: i32 = 0;
+let g_draw_ground: i32 = 1;
+let TRIM_BIAS: f64 = HS_TRIM_BIAS;
+
+
+// ===========================================================================
+// THE FRAME
+// ===========================================================================
+
+// Emit one mesh, subtracting `p_bias` from every painter key on the way to
+// batch_commit.  p_bias == 0 for the masses; TRIM_BIAS for applied detail.
+fn emit_mesh(p_mesh, p_tex, p_bias: f64) {
+    let b = g_bworld;
+    let vb: ptr = batch_vbuf(b);
+    let n: i32 = mesh_tri_count(p_mesh);
+    let cur: i32 = batch_reserve(b, n);
+    if (cur < 0) { return; }
+    let k: i32 = emit_mesh_buf(vb, cur, n, g_dep, 0, mesh_buf(p_mesh), n,
+                               0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0);
+    let bias: f64 = p_bias;
+    for (let i = 0; i < k; i++) {
+        batch_commit(b, cur + i * 60, p_tex, g_dep[i] - bias);
+    }
+    if (k < n) { batch_release(b, n - k); }
+}
+
+fn frame(p_ex: f64, p_ey: f64, p_ez: f64, p_yaw: f64, p_pitch: f64,
+         p_grab: i32) {
+    let proj = mat_perspective(FOVY, ASPECT, NEARZ, FARZ);
+    let view = mat_look_dir(v3(p_ex, p_ey, p_ez), p_yaw, p_pitch);
+    g_mvp = mat_mul(proj, view);
+    emit_set_mvp(g_mvp);
+    env_set_camera(g_env, p_ex, p_ey, p_ez);
+    emit_set_env(g_env);
+
+    batch_reset(g_bsky);
+    batch_reset(g_bworld);
+    emit_stats_reset();
+
+    // sky first, at the far plane so it sorts behind everything.  The 640-wide
+    // strip is windowed by yaw, so turning the camera pans the cloud bands.
+    let u0: f64 = 0.26 + p_yaw * 0.11;
+    if (u0 < 0.0) { u0 = 0.0; }
+    if (u0 > 0.5) { u0 = 0.5; }
+    let vv: f64 = 0.0 - p_pitch * 0.55;
+    if (vv < 0.0) { vv = 0.0; }
+    if (vv > 0.35) { vv = 0.35; }
+    quad_fullscreen(g_bsky, g_tex_sky, f64(TW), f64(TH),
+                    u0, vv, u0 + 0.5, vv + 0.999, 255, 255, 255, 255, DEPTH_FAR);
+
+    emit_set_lighting(0);
+    if (g_draw_ground == 1) { emit_mesh(g_ground, g_tex, 0.0); }
+    emit_mesh(g_house, g_tex, 0.0);
+    emit_mesh(g_trim, g_tex, TRIM_BIAS);
+
+    target_begin(g_target);
+    sdl_clear(g_win, 34, 66, 146, 255);
+    batch_flush(g_win, g_bsky);
+    batch_sort_flush(g_win, g_bworld);
+    g_tris = batch_count(g_bworld);
+    if (p_grab == 1) {
+        read_pixels_rect(g_win, 0, 0, TW, TH, FMT_ARGB8888, g_pix, TW * 4);
+    }
+    target_end(g_target);
+    target_present(g_target);
+    // The window backbuffer, AFTER the integer upscale and BEFORE the present:
+    // 960x720 of what the window actually shows, which is the version a human
+    // can look at without a magnifier.
+    if (p_grab == 2) {
+        read_pixels_rect(g_win, 0, 0, TW * SCALE, TH * SCALE, FMT_ARGB8888,
+                         g_big, TW * SCALE * 4);
+    }
+    sdl_present(g_win);
+}
+
+fn save_png(p_path: string, p_src: ptr, p_buf, p_w: i32, p_h: i32) {
+    let dst: ptr = buffer_ptr(p_buf);
+    let n: i32 = p_w * p_h;
+    for (let i = 0; i < n; i++) {
+        let v = ptr_deref_u32(ptr_offset(p_src, i * 4, 1));
+        ptr_write_u8(ptr_offset(dst, i * 3, 1), (v >> 16) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 1, 1), (v >> 8) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 2, 1), v & 255);
+    }
+    write_png(p_path, p_buf, p_w, p_h);
+}
+
+// 3-decimal fixed formatting, cold path only.
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    while (fs.length < 3) { fs = "0" + fs; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = "-" + s; }
+    let o: string = s;
+    return o;
+}
+
+// ===========================================================================
+// CAMERAS.  The first is the photograph; the rest exist because a silhouette
+// that only works from one spot is a matte painting, not a building.
+// ===========================================================================
+
+let g_cam_x: array<f64> = [-3.00,  -14.20,  19.60,  -1.60];
+let g_cam_y: array<f64> = [ 1.05,    1.45,   1.50,   1.30];
+let g_cam_z: array<f64> = [19.00,   12.60,  11.90,   8.20];
+let g_cam_yw: array<f64> = [0.300, 0.760, -0.665,  0.230];
+let g_cam_pt: array<f64> = [0.020, 0.075,  0.085, -0.010];
+let g_cam_nm: array = ["front", "left", "right", "porch"];
+
+fn main() {
+    print("house.hml — the owner's house, in wobbleweed");
+
+    set_hint("SDL_RENDER_DRIVER", "software");
+    set_hint("SDL_RENDER_SCALE_QUALITY", "0");
+
+    g_eng = engine_init("wobbleweed — the house", TW, TH, SCALE);
+    if (g_eng == null) { print(`FAIL engine_init: ${sdl_error()}`); exit(1); }
+    g_win = engine_handle(g_eng);
+    g_target = target_new(g_win, TW, TH, SCALE);
+    if (g_target == null) { print(`FAIL target_new: ${sdl_error()}`); exit(1); }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+
+    let t0: f64 = __clock();
+    hs_build_assets();
+    g_tex = atlas_upload(g_win, hs_atlas(), BLEND_NONE);
+    g_tex_sky = atlas_upload(g_win, hs_sky_atlas(), BLEND_NONE);
+    if (g_tex == ptr_null() || g_tex_sky == ptr_null()) {
+        print(`FAIL atlas_upload: ${sdl_error()}`); exit(1);
+    }
+
+    hs_build();
+    hs_build_ground();
+    g_house = hs_mesh_house();
+    g_trim = hs_mesh_trim();
+    g_ground = hs_mesh_ground();
+    let ht: i32 = hs_tris();
+    let gt: i32 = hs_ground_tris();
+    let t1: f64 = __clock();
+
+    g_env = env_new();
+    g_bworld = batch_new(CAP_WORLD, DEPTH_FAR, LAYER_WORLD);
+    g_bsky = batch_new(CAP_SKY, DEPTH_FAR, LAYER_SKY);
+    for (let i = 0; i < CAP_WORLD; i++) { g_dep.push(0.0); }
+    emit_straddle_reserve(CAP_WORLD);
+    emit_set_viewport(f64(TW), f64(TH), GUARD);
+    emit_set_near(NEARZ);
+    emit_set_backface(EMIT_BF_CCW);
+    emit_set_lighting(0);
+
+    g_pix = alloc(TW * TH * 4);
+    g_rgb = buffer(TW * TH * 3);
+    g_big = alloc(TW * SCALE * TH * SCALE * 4);
+    g_rgb_big = buffer(TW * SCALE * TH * SCALE * 3);
+
+    print(`  house   ${ht} triangles (${hs_mass_tris()} mass + ${hs_trim_tris()} trim)`);
+    print(`  ground  ${gt} triangles (placeholder — examples/house_scene.hml uses the real one)`);
+    print(`  build   ${f3((t1 - t0) * 1000.0)} ms`);
+
+    let n: i32 = g_cam_nm.length;
+    for (let c = 0; c < n; c++) {
+        frame(g_cam_x[c], g_cam_y[c], g_cam_z[c], g_cam_yw[c], g_cam_pt[c], 1);
+        let path: string = `/tmp/house_${g_cam_nm[c]}.png`;
+        save_png(path, g_pix, g_rgb, TW, TH);
+        // and the same frame at window resolution, for looking at
+        frame(g_cam_x[c], g_cam_y[c], g_cam_z[c], g_cam_yw[c], g_cam_pt[c], 2);
+        save_png(`/tmp/house_${g_cam_nm[c]}_x${SCALE}.png`, g_big, g_rgb_big,
+                 TW * SCALE, TH * SCALE);
+        print(`  ${g_cam_nm[c]}: ${batch_count(g_bworld)} tris drawn, ` +
+              `${batch_draw_calls(g_bworld)} draw call(s)  ->  ${path}`);
+    }
+
+    // ---- timing: the reference camera, min of TRIALS batches, CPU time ----
+    let TRIALS: i32 = 9;
+    let REPS: i32 = 24;
+    let best: f64 = 0.0;
+    for (let t = 0; t < TRIALS; t++) {
+        let c0: f64 = __clock();
+        for (let i = 0; i < REPS; i++) {
+            frame(g_cam_x[0], g_cam_y[0], g_cam_z[0], g_cam_yw[0], g_cam_pt[0], 0);
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(REPS);
+        if (t == 0 || ms < best) { best = ms; }
+    }
+    print(`  frame   ${f3(best)} ms  (${g_tris} triangles, house + placeholder lawn)`);
+    g_draw_ground = 0;
+    let bh: f64 = 0.0;
+    for (let t = 0; t < TRIALS; t++) {
+        let c0: f64 = __clock();
+        for (let i = 0; i < REPS; i++) {
+            frame(g_cam_x[0], g_cam_y[0], g_cam_z[0], g_cam_yw[0], g_cam_pt[0], 0);
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(REPS);
+        if (t == 0 || ms < bh) { bh = ms; }
+    }
+    g_draw_ground = 1;
+    print(`  frame   ${f3(bh)} ms  (${g_tris} triangles, the building alone)`);
+
+    engine_shutdown(g_eng);
+    print("done");
+}
+
+main();
