@@ -1,0 +1,390 @@
+// house_yard.hml — "u guys should make my house in wobbleweed lol"
+//
+// THE YARD half. The ground, the mowing stripes, the shade under the tree, both
+// deciduous trees, the foundation planting, the driveway, the mulch bed, the
+// mailbox, the neighbour's outbuilding, the treeline and the sky. The house
+// itself is a deliberately crude massing stand-in (see house_world.hml) so the
+// composition and the painter's sort can be judged; `yw_set_standin(0)` removes
+// it the moment the house half has a real emitter.
+//
+// The world contract — origin, axes, ground_h — is documented at the top of
+// examples/house_world.hml and is shared with the house half.
+//
+//   hemlockc -O1 examples/house_yard.hml -o /tmp/house_yard
+//   SDL_VIDEODRIVER=dummy /tmp/house_yard          # headless, writes the PNGs
+//   DISPLAY=:0            /tmp/house_yard          # on a real display
+//
+// Writes, for each of five views:
+//   /tmp/house_yard_<name>.png          320x240, what the renderer produced
+//   /tmp/house_yard_<name>_up.png       1280x960, what the window showed
+//
+// Views: hero (the photograph), right (from the driveway side), under (standing
+// at the trunk looking up), street (wide, from the road) and shrubs (the
+// four-approach bake-off, side by side).
+
+import { exit } from "@stdlib/process";
+import { sin, cos, sqrt, floor, divi } from "@stdlib/math";
+
+import { sdl_clear, sdl_present, set_hint, read_pixels_rect, sdl_error,
+         FMT_ARGB8888, BLEND_NONE, BLEND_BLEND } from "../src/sdl.hml";
+import { engine_init, engine_handle, engine_shutdown, engine_register_tex } from "../src/engine.hml";
+import { v3, mat_mul, mat_perspective, mat_look_dir } from "../src/vec.hml";
+import { atlas_upload } from "../src/atlas.hml";
+import { mesh_set_mvp, mesh_set_viewport, mesh_set_near, mesh_set_guard,
+         mesh_set_cull, mesh_reset_counters, mesh_tris_emitted,
+         mesh_rej_near, mesh_rej_guard, mesh_rej_backface,
+         mesh_overflow_count, MESH_CULL_OFF } from "../src/mesh.hml";
+import { billboard_set_mvp, billboard_set_viewport, billboard_set_near,
+         billboard_set_proj_persp, billboard_set_uv, billboard_reset_counters,
+         billboard_tris_emitted, billboard_overflow_count } from "../src/billboard.hml";
+import { frustum_new, frustum_from_mvp } from "../src/frustum.hml";
+import { batch_new, batch_reset, batch_flush, batch_sort_flush, batch_count,
+         batch_overflow_count, batch_draw_calls,
+         LAYER_SKY, LAYER_WORLD } from "../src/batch.hml";
+import { quad_screen_uv } from "../src/quad.hml";
+import { target_new, target_begin, target_end, target_present,
+         target_set_border, target_set_shake } from "../src/target.hml";
+import { stat_frame_begin, stat_frame_end, stat_ms, stat_get,
+         STAT_T_FRAME, STAT_TRIS_DRAWN, STAT_DRAW_CALLS } from "../src/stats.hml";
+import { write_png } from "../src/png.hml";
+
+import { ground_h, yw_build_world, yw_build_shadow, yw_build_ground_atlas,
+         yw_build_foliage_atlas, yw_build_sky_atlas,
+         yw_emit_ground, yw_emit_decals, yw_emit_plants, yw_emit_trees,
+         yw_emit_canopy, yw_emit_background, yw_emit_props, yw_emit_shrub_rig,
+         yw_set_standin, yw_shade,
+         yw_cluster_count, yw_plant_count, yw_bg_count, yw_lawn_chunks,
+         yw_mesh_tris, yw_house_tris, yw_shrub_tris,
+         SHRUB_BB, SHRUB_CROSS, SHRUB_SOLID, SHRUB_PUFF,
+         UV_LEAF_A, UV_LEAF_B, UV_LEAF_C, UV_LEAF_D,
+         UV_BB_BALL, UV_FAR_TREE, UV_LOWSHRUB,
+         SKY_ZEN_R, SKY_ZEN_G, SKY_ZEN_B,
+         TREE_A_X, TREE_A_Z, TREE_B_X, TREE_B_Z } from "./house_world.hml";
+
+// ===========================================================================
+// SHAPE
+// ===========================================================================
+
+let TW: i32 = 320;
+let TH: i32 = 240;
+let SCALE: i32 = 4;
+let WW: i32 = 1280;
+let WH: i32 = 960;
+
+let ASPECT: f64 = 1.3333333333333333;
+let NEARZ: f64 = 0.06;
+let FARZ: f64 = 118.0;
+let GUARD: f64 = 480.0;
+
+let CAP_SKY: i32 = 16;
+let CAP_WORLD: i32 = 9000;
+
+// ===========================================================================
+// THE VIEWS
+// ===========================================================================
+// Each is (eye x, eye height above ground, eye z, yaw, pitch, fovy, rig?).
+// The hero is the photograph: on the lawn ~20 m out, slightly LEFT of the front
+// door, eye 1.60 m, looking up the slope, with the big trunk right of centre
+// and its canopy filling the top of the frame.
+
+let g_vn: array = ["hero", "right", "under", "street", "shrubs"];
+let g_vx: array<f64> = [0.0 - 3.60,  13.20,  0.0 - 0.10,  0.0 - 1.00,  1.10];
+let g_vh: array<f64> = [1.60,        1.62,   1.58,  1.62,        1.15];
+let g_vz: array<f64> = [20.50,       19.00,  17.90, 33.00,       13.60];
+let g_vy: array<f64> = [0.2150, 0.0 - 0.3600, 0.0 - 0.4200, 0.0400, 0.0000];
+let g_vp: array<f64> = [0.1650, 0.0800, 0.6200, 0.0650, 0.0 - 0.0350];
+let g_vf: array<f64> = [0.9800, 1.0400, 1.2600, 0.9000, 0.9800];
+let g_vr: array<i32> = [0, 0, 0, 0, 1];
+
+// ===========================================================================
+// STATE — g_ on every top-level, nothing allocated per frame
+// ===========================================================================
+
+let g_eng = null;
+let g_win = null;
+let g_target = null;
+let g_atl_g = null;
+let g_atl_f = null;
+let g_atl_s = null;
+let g_tex_g = ptr_null();
+let g_tex_f = ptr_null();
+let g_tex_s = ptr_null();
+let g_bsky = null;
+let g_bworld = null;
+let g_frustum: array<f64> = [];
+let g_mvp = [];
+let g_view: i32 = 0;
+
+let g_n_ground: i32 = 0;
+let g_n_decal: i32 = 0;
+let g_n_plant: i32 = 0;
+let g_n_tree: i32 = 0;
+let g_n_canopy: i32 = 0;
+let g_n_bg: i32 = 0;
+let g_n_prop: i32 = 0;
+
+// 3-decimal fixed formatting. Cold path only.
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    while (fs.length < 3) { fs = "0" + fs; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = "-" + s; }
+    let out: string = s;
+    return out;
+}
+
+fn argb_to_rgb24(p_src: ptr, p_dst: buffer, p_n: i32) {
+    let src: ptr = p_src;
+    let dst: ptr = buffer_ptr(p_dst);
+    let n: i32 = p_n;
+    for (let i = 0; i < n; i++) {
+        let v = ptr_deref_u32(ptr_offset(src, i * 4, 1));
+        ptr_write_u8(ptr_offset(dst, i * 3, 1), (v >> 16) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 1, 1), (v >> 8) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 2, 1), v & 255);
+    }
+}
+
+// Luminance range of the frame. A picture with nothing under 30 and nothing
+// over 220 reads as a toy; this is the cheapest possible check that the sun and
+// the shade are both actually present.
+fn lum_span(p_px: ptr, p_n: i32, p_which: i32): i32 {
+    let px: ptr = p_px;
+    let lo: i32 = 255;
+    let hi: i32 = 0;
+    for (let i = 0; i < p_n; i++) {
+        let v = ptr_deref_u32(ptr_offset(px, i * 4, 1));
+        let r: i32 = i32((v >> 16) & 255);
+        let g: i32 = i32((v >> 8) & 255);
+        let b: i32 = i32(v & 255);
+        let l: i32 = divi(r * 77 + g * 151 + b * 28, 256);
+        if (l < lo) { lo = l; }
+        if (l > hi) { hi = l; }
+    }
+    if (p_which == 0) { let a: i32 = lo; return a; }
+    let c: i32 = hi;
+    return c;
+}
+
+// ===========================================================================
+// THE SKY QUAD
+// ===========================================================================
+// A fullscreen card in LAYER_SKY, drawn before anything else, sampling a window
+// of the 512x256 panorama that pans with yaw and pitch. Nothing else in the
+// scene is allowed to leave a hole for it: the lawn skirt runs to 60 m and the
+// treeline closes the horizon.
+fn emit_sky(p_yaw: f64, p_pitch: f64) {
+    let uc: f64 = 0.50 + p_yaw * 0.170;
+    let vc: f64 = 0.400 - p_pitch * 0.480;
+    let uh: f64 = 0.300;
+    let vh: f64 = 0.230;
+    if (uc < uh) { uc = uh; }
+    if (uc > 1.0 - uh) { uc = 1.0 - uh; }
+    if (vc < vh) { vc = vh; }
+    if (vc > 1.0 - vh) { vc = 1.0 - vh; }
+    quad_screen_uv(g_bsky, g_tex_s, 0.0, 0.0, f64(TW), f64(TH),
+                   uc - uh, vc - vh, uc + uh, vc + vh,
+                   255, 255, 255, 255, FARZ);
+}
+
+// ===========================================================================
+// ONE FRAME
+// ===========================================================================
+
+fn frame_render(p_grab: i32, p_tgt: ptr) {
+    stat_frame_begin();
+
+    let v: i32 = g_view;
+    let ex: f64 = g_vx[v];
+    let ez: f64 = g_vz[v];
+    let ey: f64 = ground_h(ex, ez) + g_vh[v];
+    let yaw: f64 = g_vy[v];
+    let pitch: f64 = g_vp[v];
+    let fovy: f64 = g_vf[v];
+
+    let proj = mat_perspective(fovy, ASPECT, NEARZ, FARZ);
+    let view = mat_look_dir(v3(ex, ey, ez), yaw, pitch);
+    g_mvp = mat_mul(proj, view);
+    mesh_set_mvp(g_mvp);
+    billboard_set_mvp(g_mvp);
+    billboard_set_proj_persp(fovy, ASPECT, f64(TW), f64(TH));
+    frustum_from_mvp(g_frustum, g_mvp);
+
+    batch_reset(g_bsky);
+    batch_reset(g_bworld);
+    mesh_reset_counters();
+    billboard_reset_counters();
+
+    emit_sky(yaw, pitch);
+
+    // --- the world, all into ONE sorted batch ------------------------------
+    g_n_ground = yw_emit_ground(g_bworld, g_tex_g, g_frustum);
+    g_n_decal = yw_emit_decals(g_bworld, g_tex_g);
+    g_n_prop = yw_emit_props(g_bworld, g_tex_g, g_tex_f, g_frustum);
+    g_n_tree = yw_emit_trees(g_bworld, g_tex_g, g_tex_f, g_frustum, 0);
+
+    // background treeline: one uv rect, one pass
+    billboard_set_uv(UV_FAR_TREE[0], UV_FAR_TREE[1], UV_FAR_TREE[2], UV_FAR_TREE[3]);
+    g_n_bg = yw_emit_background(g_bworld, g_tex_f);
+
+    // the canopy, grouped by leaf card so the uv rect is bound four times a
+    // frame instead of once per cluster
+    let nc: i32 = 0;
+    billboard_set_uv(UV_LEAF_A[0], UV_LEAF_A[1], UV_LEAF_A[2], UV_LEAF_A[3]);
+    nc = nc + yw_emit_canopy(g_bworld, g_tex_f, 0, g_frustum);
+    billboard_set_uv(UV_LEAF_B[0], UV_LEAF_B[1], UV_LEAF_B[2], UV_LEAF_B[3]);
+    nc = nc + yw_emit_canopy(g_bworld, g_tex_f, 1, g_frustum);
+    billboard_set_uv(UV_LEAF_C[0], UV_LEAF_C[1], UV_LEAF_C[2], UV_LEAF_C[3]);
+    nc = nc + yw_emit_canopy(g_bworld, g_tex_f, 2, g_frustum);
+    billboard_set_uv(UV_LEAF_D[0], UV_LEAF_D[1], UV_LEAF_D[2], UV_LEAF_D[3]);
+    nc = nc + yw_emit_canopy(g_bworld, g_tex_f, 3, g_frustum);
+    g_n_canopy = nc;
+
+    // the planting. The low spreaders are billboard puffs, so their uv rect is
+    // bound here.
+    billboard_set_uv(UV_LOWSHRUB[0], UV_LOWSHRUB[1], UV_LOWSHRUB[2], UV_LOWSHRUB[3]);
+    if (g_vr[v] == 1) {
+        billboard_set_uv(UV_BB_BALL[0], UV_BB_BALL[1], UV_BB_BALL[2], UV_BB_BALL[3]);
+        g_n_plant = yw_emit_shrub_rig(g_bworld, g_tex_g, g_tex_f,
+                                      0.0 - 3.30, 4.20, 2.90, 1.35);
+    } else {
+        g_n_plant = yw_emit_plants(g_bworld, g_tex_g, g_tex_f, g_frustum);
+    }
+
+    // --- present -----------------------------------------------------------
+    target_begin(g_target);
+    sdl_clear(g_win, SKY_ZEN_R, SKY_ZEN_G, SKY_ZEN_B, 255);
+    batch_flush(g_win, g_bsky);
+    batch_sort_flush(g_win, g_bworld);
+
+    if (p_grab == 1) {
+        read_pixels_rect(g_win, 0, 0, TW, TH, FMT_ARGB8888, p_tgt, TW * 4);
+    }
+
+    target_end(g_target);
+    target_present(g_target);
+    sdl_present(g_win);
+    stat_frame_end();
+}
+
+// ===========================================================================
+// MAIN
+// ===========================================================================
+
+fn main() {
+    print("house_yard — the yard the house stands in");
+    print("");
+
+    // Pin the software renderer so the render is identical headless and on a
+    // real display, and kill filtering for every texture at once. Never
+    // SDL_SetTextureScaleMode — it segfaults on SDL's conversion textures.
+    set_hint("SDL_RENDER_DRIVER", "software");
+    set_hint("SDL_RENDER_SCALE_QUALITY", "0");
+
+    g_eng = engine_init("wobbleweed — the house", TW, TH, SCALE);
+    if (g_eng == null) {
+        print(`FAIL  engine_init: ${sdl_error()}`);
+        exit(1);
+    }
+    g_win = engine_handle(g_eng);
+    g_target = target_new(g_win, TW, TH, SCALE);
+    if (g_target == null) {
+        print(`FAIL  target_new: ${sdl_error()}`);
+        exit(1);
+    }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+
+    // --- assets, built once -------------------------------------------------
+    let t0: f64 = __clock();
+    g_atl_g = yw_build_ground_atlas();
+    g_atl_f = yw_build_foliage_atlas();
+    g_atl_s = yw_build_sky_atlas();
+    let t_atlas: f64 = (__clock() - t0) * 1000.0;
+
+    g_tex_g = atlas_upload(g_win, g_atl_g, BLEND_NONE);
+    g_tex_f = atlas_upload(g_win, g_atl_f, BLEND_BLEND);
+    g_tex_s = atlas_upload(g_win, g_atl_s, BLEND_NONE);
+    if (g_tex_g == ptr_null()) { print(`FAIL  ground atlas: ${sdl_error()}`); exit(1); }
+    if (g_tex_f == ptr_null()) { print(`FAIL  foliage atlas: ${sdl_error()}`); exit(1); }
+    if (g_tex_s == ptr_null()) { print(`FAIL  sky atlas: ${sdl_error()}`); exit(1); }
+    engine_register_tex(g_eng, g_tex_g);
+    engine_register_tex(g_eng, g_tex_f);
+    engine_register_tex(g_eng, g_tex_s);
+
+    let t1: f64 = __clock();
+    yw_build_shadow();
+    yw_build_world();
+    let t_world: f64 = (__clock() - t1) * 1000.0;
+
+    g_bsky = batch_new(CAP_SKY, FARZ, LAYER_SKY);
+    g_bworld = batch_new(CAP_WORLD, FARZ, LAYER_WORLD);
+    g_frustum = frustum_new();
+
+    mesh_set_viewport(f64(TW), f64(TH));
+    mesh_set_near(NEARZ);
+    mesh_set_guard(GUARD);
+    billboard_set_viewport(f64(TW), f64(TH));
+    billboard_set_near(NEARZ);
+
+    print(`assets   ${f3(t_atlas)} ms   world ${f3(t_world)} ms`);
+    print(`built    ${yw_mesh_tris()} mesh triangles in ${yw_lawn_chunks()} lawn chunks`);
+    print(`         ${yw_cluster_count()} canopy clusters, ${yw_plant_count()} plants, ${yw_bg_count()} background cards`);
+    print(`         house stand-in: ${yw_house_tris()} triangles (NOT the house half's work)`);
+    print("");
+
+    let npx: i32 = TW * TH;
+    let tgt = buffer(npx * 4);
+    let tgtp: ptr = buffer_ptr(tgt);
+    let win = buffer(WW * WH * 4);
+    let winp: ptr = buffer_ptr(win);
+    let png_t = buffer(npx * 3);
+    let png_w = buffer(WW * WH * 3);
+
+    print("view      tris   draws   frame ms   lum lo/hi   overflow");
+    print("------------------------------------------------------------");
+
+    for (let v = 0; v < 5; v++) {
+        g_view = v;
+        // warm once so the timing is not measuring first-touch page faults
+        frame_render(0, tgtp);
+        frame_render(1, tgtp);
+        let ms: f64 = stat_ms(STAT_T_FRAME);
+        let tris: i32 = batch_count(g_bworld) + batch_count(g_bsky);
+        let draws: i32 = batch_draw_calls(g_bworld) + batch_draw_calls(g_bsky);
+        let over: i32 = batch_overflow_count(g_bworld) + batch_overflow_count(g_bsky);
+        // take the best of five so a neighbour process cannot make this red
+        for (let k = 0; k < 4; k++) {
+            frame_render(0, tgtp);
+            let m2: f64 = stat_ms(STAT_T_FRAME);
+            if (m2 < ms) { ms = m2; }
+        }
+        frame_render(1, tgtp);
+        read_pixels_rect(g_win, 0, 0, WW, WH, FMT_ARGB8888, winp, WW * 4);
+
+        let lo: i32 = lum_span(tgtp, npx, 0);
+        let hi: i32 = lum_span(tgtp, npx, 1);
+        let nm: string = g_vn[v];
+        argb_to_rgb24(tgtp, png_t, npx);
+        write_png(`/tmp/house_yard_${nm}.png`, png_t, TW, TH);
+        argb_to_rgb24(winp, png_w, WW * WH);
+        write_png(`/tmp/house_yard_${nm}_up.png`, png_w, WW, WH);
+
+        print(`${nm}\t${tris}\t${draws}\t${f3(ms)}\t${lo}/${hi}\t${over}`);
+        print(`   ground ${g_n_ground}  decal ${g_n_decal}  props ${g_n_prop}  trees ${g_n_tree}  canopy ${g_n_canopy}  bg ${g_n_bg}  plants ${g_n_plant}`);
+    }
+
+    print("");
+    print(`shrub triangle cost: billboard ${yw_shrub_tris(SHRUB_BB)}  cross ${yw_shrub_tris(SHRUB_CROSS)}  solid ${yw_shrub_tris(SHRUB_SOLID)}  puff ${yw_shrub_tris(SHRUB_PUFF)}`);
+    print("wrote /tmp/house_yard_*.png");
+
+    engine_shutdown(g_eng);
+}
+
+main();

@@ -1,0 +1,440 @@
+// house_scene.hml — "u guys should make my house in wobbleweed lol"
+//
+// THE DEMO. The house half (examples/house_shell.hml) standing in the yard half
+// (examples/house_world.hml), in one frame, in one sorted batch.
+//
+// Neither builder produced this file. `examples/house.hml` renders the building
+// on a flat green placeholder; `examples/house_yard.hml` renders the yard around
+// a 103-triangle massing block. The photograph is a house UNDER A TREE ON A LAWN
+// and the two halves only answer it together, so this is the one to look at.
+//
+//   hemlockc -O1 examples/house_scene.hml -o /tmp/house_scene
+//   SDL_VIDEODRIVER=dummy /tmp/house_scene        # headless, writes the PNGs
+//   DISPLAY=:0            /tmp/house_scene        # on a real display
+//
+// Writes /tmp/house_scene_<view>.png at 320x240 (what the renderer produced)
+// and _up.png at 1280x960 (what the window showed, after the integer upscale).
+//
+// ---------------------------------------------------------------------------
+// WHAT JOINING THE TWO HALVES ACTUALLY COSTS
+// ---------------------------------------------------------------------------
+// FOUR TEXTURES, ONE SORT. The yard is an opaque ground atlas plus an alpha-cut
+// foliage atlas; the house adds a third opaque atlas of its own. They interleave
+// in depth — canopy in front of roof in front of leaves in front of siding — so
+// the run-length batcher breaks a draw call at every crossing. That is the price
+// of correct occlusion without a z-buffer and it is paid in draw calls, not in
+// triangles. It is measured in the table this prints.
+//
+// THE TRIM BIAS SURVIVES THE MOVE. house_shell's applied detail (windows,
+// shutters, casings, the garage door, the lantern) lies 5 cm proud of the wall
+// it belongs to, which is a tenth of a sort bucket and loses the coin flip.
+// house.hml fixed that by committing trim keys itself with TRIM_BIAS
+// subtracted. mesh_emit_yaw gives no such hook, so the same correction is
+// applied here after the fact with yw_depth_bias over the trim's key range —
+// the yard half's own answer to the same missing feature. Both halves needed a
+// depth bias and the engine has none: see the report.
+//
+// THE FOUNDATION LINE. house_world's lawn was flat only to z = +1.0, and the
+// garage front wall is at z = +3.05, so the real house floated 17 cm above the
+// real lawn at its right end. The pad is widened to cover the whole footprint —
+// the one contract change this file needed.
+
+import { exit } from "@stdlib/process";
+import { divi } from "@stdlib/math";
+
+import { sdl_clear, sdl_present, set_hint, read_pixels_rect, sdl_error,
+         FMT_ARGB8888, BLEND_NONE, BLEND_BLEND } from "../src/sdl.hml";
+import { engine_init, engine_handle, engine_shutdown,
+         engine_register_tex } from "../src/engine.hml";
+import { v3, mat_mul, mat_perspective, mat_look_dir } from "../src/vec.hml";
+import { atlas_upload } from "../src/atlas.hml";
+import { mesh_set_mvp, mesh_set_viewport, mesh_set_near, mesh_set_guard,
+         mesh_set_cull, mesh_reset_counters, mesh_emit_yaw,
+         mesh_overflow_count, MESH_CULL_OFF, MESH_CULL_NEG } from "../src/mesh.hml";
+import { billboard_set_mvp, billboard_set_viewport, billboard_set_near,
+         billboard_set_proj_persp, billboard_set_uv,
+         billboard_reset_counters } from "../src/billboard.hml";
+import { frustum_new, frustum_from_mvp } from "../src/frustum.hml";
+import { batch_new, batch_reset, batch_flush, batch_sort_flush, batch_count,
+         batch_overflow_count, batch_draw_calls,
+         LAYER_SKY, LAYER_WORLD } from "../src/batch.hml";
+import { quad_screen_uv } from "../src/quad.hml";
+import { target_new, target_begin, target_end, target_present,
+         target_set_border, target_set_shake } from "../src/target.hml";
+import { stat_frame_begin, stat_frame_end, stat_ms, STAT_T_FRAME } from "../src/stats.hml";
+import { write_png } from "../src/png.hml";
+
+import { hs_build_assets, hs_atlas, hs_build, hs_mesh_house, hs_mesh_trim,
+         hs_tris, hs_mass_tris, hs_trim_tris, HS_TRIM_BIAS } from "./house_shell.hml";
+
+import { ground_h, yw_build_world, yw_build_shadow, yw_build_ground_atlas,
+         yw_build_foliage_atlas, yw_build_sky_atlas,
+         yw_emit_ground, yw_emit_decals, yw_emit_plants, yw_emit_trees,
+         yw_emit_canopy, yw_emit_background, yw_emit_props,
+         yw_set_standin, yw_depth_bias,
+         yw_cluster_count, yw_plant_count, yw_bg_count, yw_lawn_chunks,
+         yw_mesh_tris,
+         UV_LEAF_A, UV_LEAF_B, UV_LEAF_C, UV_LEAF_D,
+         UV_BB_BALL, UV_FAR_TREE, UV_LOWSHRUB,
+         SKY_ZEN_R, SKY_ZEN_G, SKY_ZEN_B } from "./house_world.hml";
+
+// ===========================================================================
+// SHAPE
+// ===========================================================================
+
+let TW: i32 = 320;
+let TH: i32 = 240;
+let SCALE: i32 = 4;
+let WW: i32 = 1280;
+let WH: i32 = 960;
+
+let ASPECT: f64 = 1.3333333333333333;
+let NEARZ: f64 = 0.06;
+let FARZ: f64 = 118.0;
+let GUARD: f64 = 480.0;
+
+let CAP_SKY: i32 = 16;
+let CAP_WORLD: i32 = 11000;
+
+// ===========================================================================
+// THE VIEWS
+// ===========================================================================
+// (eye x, eye height above ground, eye z, yaw, pitch, fovy).
+//
+// `hero` IS THE PHOTOGRAPH and everything else exists to prove the hero is not
+// a lucky angle: `wide` opens the fov so the whole facade and both trees fit,
+// `drive` is the garage end from the driveway, `porch` walks up to the entry,
+// `under` looks up the trunk to check the canopy sorts against the roof.
+//
+// ---------------------------------------------------------------------------
+// SOLVING THE HERO, BECAUSE THE FIRST ONE HID THE CHIMNEY  [critic pass]
+// ---------------------------------------------------------------------------
+// The chimney is the second most important silhouette in the photograph after
+// the roof, and at the yard half's hero camera it was EXACTLY, TOTALLY behind
+// the foreground trunk. That is not a small miss and it is not visible from the
+// numbers: the trunk stands 3.8 m from the eye and the chimney 23 m, so a
+// half-metre of eye position swings one across the other. Worked in bearings
+// from the eye rather than by nudging:
+//
+//     eye (-3.60, 20.50)   trunk +0.336..+0.504   chimney +0.429..+0.474  HIDDEN
+//     eye (-3.70, 22.50)   trunk +0.243..+0.360   chimney +0.399..+0.442  clear
+//
+// The photograph has the trunk's right edge just touching the chimney's left
+// edge, which is what the second row gives.
+//
+// TWO MORE THINGS THE MOVE BUYS. Backing off from 3.8 m to 6.2 m from the trunk
+// puts the trunk at the width it has in the photograph — at 3.8 m it was a
+// third wider than the reference and it dominated the frame in a way the
+// reference does not. And composing on the bearings rather than by eye puts the
+// building where the photograph puts it: the facade+garage span 0.786 rad, the
+// reference gives that span 64 % of the frame width, so the horizontal fov is
+// 1.228 rad and the vertical is 0.99 — and the yaw that centres the span at
+// 0.55 of the frame (not 0.50; the photograph is composed slightly left) is
+// 0.256.
+//
+// The pitch is the one number that is a COMPROMISE and not a solve. The
+// photograph has the ridge at 0.19 of frame height AND canopy across the top,
+// which needs a wider vertical field than the house wants. 0.080 keeps the
+// canopy in the top corners, where the reference has it, and accepts the ridge
+// sitting at 0.30 instead of 0.19.
+
+let g_vn: array = ["hero", "wide", "drive", "porch", "under"];
+let g_vx: array<f64> = [0.0 - 3.70, 0.0 - 2.20, 12.60, 0.0 - 1.30, 0.0 - 0.10];
+let g_vh: array<f64> = [1.60,       1.62,       1.62,  1.58,       1.58];
+let g_vz: array<f64> = [22.50,      27.00,      17.50, 8.60,       17.90];
+let g_vy: array<f64> = [0.2560, 0.1250, 0.0 - 0.4300, 0.1400, 0.0 - 0.4200];
+let g_vp: array<f64> = [0.0800, 0.1000, 0.0900,       0.1000, 0.6200];
+let g_vf: array<f64> = [0.9900, 1.1400, 1.0000,       1.0300, 1.2600];
+
+// ===========================================================================
+// STATE — g_ on every top-level, nothing allocated per frame
+// ===========================================================================
+
+let g_eng = null;
+let g_win = null;
+let g_target = null;
+let g_tex_g = ptr_null();       // yard: opaque ground / bark / brick / asphalt
+let g_tex_f = ptr_null();       // yard: alpha-cut foliage
+let g_tex_s = ptr_null();       // yard: the sky panorama
+let g_tex_h = ptr_null();       // house: the building's own atlas
+let g_bsky = null;
+let g_bworld = null;
+let g_frustum: array<f64> = [];
+let g_mvp = [];
+let g_view: i32 = 0;
+
+let g_house = null;
+let g_trim = null;
+
+let g_n_house: i32 = 0;
+let g_n_yard: i32 = 0;
+
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    while (fs.length < 3) { fs = "0" + fs; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = "-" + s; }
+    let out: string = s;
+    return out;
+}
+
+fn argb_to_rgb24(p_src: ptr, p_dst: buffer, p_n: i32) {
+    let src: ptr = p_src;
+    let dst: ptr = buffer_ptr(p_dst);
+    let n: i32 = p_n;
+    for (let i = 0; i < n; i++) {
+        let v = ptr_deref_u32(ptr_offset(src, i * 4, 1));
+        ptr_write_u8(ptr_offset(dst, i * 3, 1), (v >> 16) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 1, 1), (v >> 8) & 255);
+        ptr_write_u8(ptr_offset(dst, i * 3 + 2, 1), v & 255);
+    }
+}
+
+fn lum_span(p_px: ptr, p_n: i32, p_which: i32): i32 {
+    let px: ptr = p_px;
+    let lo: i32 = 255;
+    let hi: i32 = 0;
+    for (let i = 0; i < p_n; i++) {
+        let v = ptr_deref_u32(ptr_offset(px, i * 4, 1));
+        let r: i32 = i32((v >> 16) & 255);
+        let g: i32 = i32((v >> 8) & 255);
+        let b: i32 = i32(v & 255);
+        let l: i32 = divi(r * 77 + g * 151 + b * 28, 256);
+        if (l < lo) { lo = l; }
+        if (l > hi) { hi = l; }
+    }
+    if (p_which == 0) { let a: i32 = lo; return a; }
+    let c: i32 = hi;
+    return c;
+}
+
+fn bcount(p_b): i32 { let o: i32 = p_b.n; return o; }
+
+// ===========================================================================
+// THE SKY
+// ===========================================================================
+
+fn emit_sky(p_yaw: f64, p_pitch: f64) {
+    let uc: f64 = 0.50 + p_yaw * 0.170;
+    let vc: f64 = 0.400 - p_pitch * 0.480;
+    let uh: f64 = 0.300;
+    let vh: f64 = 0.230;
+    if (uc < uh) { uc = uh; }
+    if (uc > 1.0 - uh) { uc = 1.0 - uh; }
+    if (vc < vh) { vc = vh; }
+    if (vc > 1.0 - vh) { vc = 1.0 - vh; }
+    quad_screen_uv(g_bsky, g_tex_s, 0.0, 0.0, f64(TW), f64(TH),
+                   uc - uh, vc - vh, uc + uh, vc + vh,
+                   255, 255, 255, 255, FARZ);
+}
+
+// ===========================================================================
+// THE HOUSE, INTO THE YARD'S BATCH
+// ===========================================================================
+// Two meshes, one texture, and the trim's keys pulled forward afterwards. The
+// house is authored in world coordinates already (house_world.hml copied its
+// footprint), so the transform is identity: no offset, no yaw, unit scale.
+
+fn emit_house(): i32 {
+    mesh_set_cull(MESH_CULL_NEG);
+    let n0: i32 = mesh_emit_yaw(g_house, g_bworld, g_tex_h,
+                                0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    let k0: i32 = bcount(g_bworld);
+    let n1: i32 = mesh_emit_yaw(g_trim, g_bworld, g_tex_h,
+                                0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    yw_depth_bias(g_bworld, k0, bcount(g_bworld), HS_TRIM_BIAS);
+    let out: i32 = n0 + n1;
+    return out;
+}
+
+// ===========================================================================
+// ONE FRAME
+// ===========================================================================
+
+fn frame_render(p_grab: i32, p_tgt: ptr) {
+    stat_frame_begin();
+
+    let v: i32 = g_view;
+    let ex: f64 = g_vx[v];
+    let ez: f64 = g_vz[v];
+    let ey: f64 = ground_h(ex, ez) + g_vh[v];
+    let yaw: f64 = g_vy[v];
+    let pitch: f64 = g_vp[v];
+    let fovy: f64 = g_vf[v];
+
+    let proj = mat_perspective(fovy, ASPECT, NEARZ, FARZ);
+    let view = mat_look_dir(v3(ex, ey, ez), yaw, pitch);
+    g_mvp = mat_mul(proj, view);
+    mesh_set_mvp(g_mvp);
+    billboard_set_mvp(g_mvp);
+    billboard_set_proj_persp(fovy, ASPECT, f64(TW), f64(TH));
+    frustum_from_mvp(g_frustum, g_mvp);
+
+    batch_reset(g_bsky);
+    batch_reset(g_bworld);
+    mesh_reset_counters();
+    billboard_reset_counters();
+
+    emit_sky(yaw, pitch);
+
+    // --- the yard ----------------------------------------------------------
+    let ny: i32 = 0;
+    ny = ny + yw_emit_ground(g_bworld, g_tex_g, g_frustum);
+    ny = ny + yw_emit_decals(g_bworld, g_tex_g);
+    ny = ny + yw_emit_props(g_bworld, g_tex_g, g_tex_f, g_frustum);
+
+    // --- the house, before the foliage so the shrubs and the canopy sort
+    //     against a real building rather than against a hole ----------------
+    g_n_house = emit_house();
+
+    ny = ny + yw_emit_trees(g_bworld, g_tex_g, g_tex_f, g_frustum, 0);
+
+    billboard_set_uv(UV_FAR_TREE[0], UV_FAR_TREE[1], UV_FAR_TREE[2], UV_FAR_TREE[3]);
+    ny = ny + yw_emit_background(g_bworld, g_tex_f);
+
+    billboard_set_uv(UV_LEAF_A[0], UV_LEAF_A[1], UV_LEAF_A[2], UV_LEAF_A[3]);
+    ny = ny + yw_emit_canopy(g_bworld, g_tex_f, 0, g_frustum);
+    billboard_set_uv(UV_LEAF_B[0], UV_LEAF_B[1], UV_LEAF_B[2], UV_LEAF_B[3]);
+    ny = ny + yw_emit_canopy(g_bworld, g_tex_f, 1, g_frustum);
+    billboard_set_uv(UV_LEAF_C[0], UV_LEAF_C[1], UV_LEAF_C[2], UV_LEAF_C[3]);
+    ny = ny + yw_emit_canopy(g_bworld, g_tex_f, 2, g_frustum);
+    billboard_set_uv(UV_LEAF_D[0], UV_LEAF_D[1], UV_LEAF_D[2], UV_LEAF_D[3]);
+    ny = ny + yw_emit_canopy(g_bworld, g_tex_f, 3, g_frustum);
+
+    billboard_set_uv(UV_LOWSHRUB[0], UV_LOWSHRUB[1], UV_LOWSHRUB[2], UV_LOWSHRUB[3]);
+    ny = ny + yw_emit_plants(g_bworld, g_tex_g, g_tex_f, g_frustum);
+    g_n_yard = ny;
+
+    // --- present -----------------------------------------------------------
+    target_begin(g_target);
+    sdl_clear(g_win, SKY_ZEN_R, SKY_ZEN_G, SKY_ZEN_B, 255);
+    batch_flush(g_win, g_bsky);
+    batch_sort_flush(g_win, g_bworld);
+
+    if (p_grab == 1) {
+        read_pixels_rect(g_win, 0, 0, TW, TH, FMT_ARGB8888, p_tgt, TW * 4);
+    }
+
+    target_end(g_target);
+    target_present(g_target);
+    sdl_present(g_win);
+    stat_frame_end();
+}
+
+// ===========================================================================
+// MAIN
+// ===========================================================================
+
+fn main() {
+    print("house_scene — the house, in its yard");
+    print("");
+
+    set_hint("SDL_RENDER_DRIVER", "software");
+    set_hint("SDL_RENDER_SCALE_QUALITY", "0");
+
+    g_eng = engine_init("wobbleweed — the house", TW, TH, SCALE);
+    if (g_eng == null) { print(`FAIL  engine_init: ${sdl_error()}`); exit(1); }
+    g_win = engine_handle(g_eng);
+    g_target = target_new(g_win, TW, TH, SCALE);
+    if (g_target == null) { print(`FAIL  target_new: ${sdl_error()}`); exit(1); }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+
+    // --- assets -------------------------------------------------------------
+    let t0: f64 = __clock();
+    let atl_g = yw_build_ground_atlas();
+    let atl_f = yw_build_foliage_atlas();
+    let atl_s = yw_build_sky_atlas();
+    hs_build_assets();
+    let t_atlas: f64 = (__clock() - t0) * 1000.0;
+
+    g_tex_g = atlas_upload(g_win, atl_g, BLEND_NONE);
+    g_tex_f = atlas_upload(g_win, atl_f, BLEND_BLEND);
+    g_tex_s = atlas_upload(g_win, atl_s, BLEND_NONE);
+    g_tex_h = atlas_upload(g_win, hs_atlas(), BLEND_NONE);
+    if (g_tex_g == ptr_null() || g_tex_f == ptr_null()
+        || g_tex_s == ptr_null() || g_tex_h == ptr_null()) {
+        print(`FAIL  atlas_upload: ${sdl_error()}`); exit(1);
+    }
+    engine_register_tex(g_eng, g_tex_g);
+    engine_register_tex(g_eng, g_tex_f);
+    engine_register_tex(g_eng, g_tex_s);
+    engine_register_tex(g_eng, g_tex_h);
+
+    // --- the world ----------------------------------------------------------
+    let t1: f64 = __clock();
+    yw_set_standin(0);              // the real building replaces the massing block
+    yw_build_shadow();
+    yw_build_world();
+    hs_build();
+    g_house = hs_mesh_house();
+    g_trim = hs_mesh_trim();
+    let t_world: f64 = (__clock() - t1) * 1000.0;
+
+    g_bsky = batch_new(CAP_SKY, FARZ, LAYER_SKY);
+    g_bworld = batch_new(CAP_WORLD, FARZ, LAYER_WORLD);
+    g_frustum = frustum_new();
+
+    mesh_set_viewport(f64(TW), f64(TH));
+    mesh_set_near(NEARZ);
+    mesh_set_guard(GUARD);
+    billboard_set_viewport(f64(TW), f64(TH));
+    billboard_set_near(NEARZ);
+
+    print(`assets   ${f3(t_atlas)} ms    world ${f3(t_world)} ms`);
+    print(`house    ${hs_tris()} triangles (${hs_mass_tris()} mass + ${hs_trim_tris()} trim)`);
+    print(`yard     ${yw_mesh_tris()} mesh triangles in ${yw_lawn_chunks()} lawn chunks,`);
+    print(`         ${yw_cluster_count()} canopy clusters, ${yw_plant_count()} plants, ${yw_bg_count()} background cards`);
+    print("");
+
+    let npx: i32 = TW * TH;
+    let tgt = buffer(npx * 4);
+    let tgtp: ptr = buffer_ptr(tgt);
+    let win = buffer(WW * WH * 4);
+    let winp: ptr = buffer_ptr(win);
+    let png_t = buffer(npx * 3);
+    let png_w = buffer(WW * WH * 3);
+
+    print("view      tris   draws   frame ms   house/yard   lum lo/hi   over");
+    print("---------------------------------------------------------------------");
+
+    let nv: i32 = g_vn.length;
+    for (let v = 0; v < nv; v++) {
+        g_view = v;
+        frame_render(0, tgtp);
+        frame_render(1, tgtp);
+        let ms: f64 = stat_ms(STAT_T_FRAME);
+        for (let k = 0; k < 4; k++) {
+            frame_render(0, tgtp);
+            let m2: f64 = stat_ms(STAT_T_FRAME);
+            if (m2 < ms) { ms = m2; }
+        }
+        frame_render(1, tgtp);
+        let tris: i32 = batch_count(g_bworld) + batch_count(g_bsky);
+        let draws: i32 = batch_draw_calls(g_bworld) + batch_draw_calls(g_bsky);
+        let over: i32 = batch_overflow_count(g_bworld) + mesh_overflow_count();
+        read_pixels_rect(g_win, 0, 0, WW, WH, FMT_ARGB8888, winp, WW * 4);
+
+        let lo: i32 = lum_span(tgtp, npx, 0);
+        let hi: i32 = lum_span(tgtp, npx, 1);
+        let nm: string = g_vn[v];
+        argb_to_rgb24(tgtp, png_t, npx);
+        write_png(`/tmp/house_scene_${nm}.png`, png_t, TW, TH);
+        argb_to_rgb24(winp, png_w, WW * WH);
+        write_png(`/tmp/house_scene_${nm}_up.png`, png_w, WW, WH);
+
+        print(`${nm}\t${tris}\t${draws}\t${f3(ms)}\t${g_n_house}/${g_n_yard}\t${lo}/${hi}\t${over}`);
+    }
+
+    print("");
+    print("wrote /tmp/house_scene_*.png");
+    engine_shutdown(g_eng);
+}
+
+main();

@@ -1,0 +1,2431 @@
+// house_world.hml — THE YARD.
+//
+// Shared world module for the "my house" demo. Exports only: no top-level side
+// effects, so `examples/house_yard.hml` (the runnable demo) and whatever the
+// house half ends up being can both import it.
+//
+// ---------------------------------------------------------------------------
+// THE COORDINATE CONVENTION — the contract with the house half
+// ---------------------------------------------------------------------------
+//   Metres. Y up. The camera looks down -Z at yaw 0 (engine convention).
+//   +X is to the viewer's RIGHT: garage at +X, neighbour outbuilding at -X.
+//
+//   ORIGIN (0,0,0) is the point on the ground at the FRONT DOOR THRESHOLD,
+//   centre of the entry porch. The outer face of the front wall of the main
+//   block is the plane z = 0; the house extends into NEGATIVE z.
+//   Ground level at the facade is y = 0 all along the house pad.
+//
+//   The lawn is a flat pad at y = 0 for z <= HOUSE_PAD_Z, then falls away
+//   toward the camera by YARD_DROP metres over YARD_RUN metres. So the viewer
+//   is standing BELOW the front step and looking up the slope, as in the photo.
+//   `ground_h(x, z)` is the single authority on ground height and both halves
+//   must use it.
+//
+// ---------------------------------------------------------------------------
+// WHAT LIVES HERE
+// ---------------------------------------------------------------------------
+//   the ground and its mowing stripes      the two big deciduous trees
+//   the shade gradient under the canopy    foundation shrubs + arborvitae
+//   the driveway, the mulch bed            the mailbox
+//   the neighbouring outbuilding           the background treeline
+//   the sky                                every contact shadow
+//
+// ---------------------------------------------------------------------------
+// ENGINE NOTES THAT SHAPED THE CODE
+// ---------------------------------------------------------------------------
+//  * Vertex colour MULTIPLIES the texture. Every texture in here is authored at
+//    its FULL-SUN value and everything else darkens from there. The lawn is the
+//    clearest case: the grass tile is the colour of the sunlit grass beside the
+//    house, and the whole foreground shade gradient is vertex colour.
+//  * There is no z-buffer. Ground decals (driveway, mulch, contact shadows) are
+//    coplanar with the lawn and CANNOT be ordered against it by geometry, so
+//    they are emitted and then their depth keys are pulled toward the camera by
+//    hand — see `yw_depth_bias`. mesh.hml has no depth-bias parameter; that is
+//    reported as a gap, not fixed here.
+//  * One SDL_RenderGeometry per texture RUN, so everything opaque shares ONE
+//    atlas and everything alpha-cut shares ONE more. Two textures for the whole
+//    yard.
+//  * Ground quads are 2 m. Bigger and the affine warp stops being charming.
+// ---------------------------------------------------------------------------
+
+import { sin, cos, sqrt, floor, divi } from "@stdlib/math";
+import { atlas_new, atlas_px, atlas_rect_uv, atlas_base } from "../src/atlas.hml";
+import { mesh_new, mesh_begin, mesh_vert, mesh_tri, mesh_end,
+         mesh_tri_count, mesh_radius } from "../src/mesh.hml";
+import { mesh_set_cull, mesh_emit_yaw,
+         MESH_CULL_OFF, MESH_CULL_POS } from "../src/mesh.hml";
+import { billboard_world } from "../src/billboard.hml";
+import { frustum_sphere } from "../src/frustum.hml";
+
+// ===========================================================================
+// THE WORLD CONTRACT
+// ===========================================================================
+
+export let HOUSE_PAD_Z: f64 = 3.45;    // lawn is dead flat at y=0 for z <= this
+export let YARD_DROP: f64 = 2.05;       // metres the lawn falls toward the camera
+export let YARD_RUN: f64 = 24.0;        // over this many metres of z
+
+// THE HOUSE FOOTPRINT, TAKEN FROM examples/house.hml.
+// The house half owns these; they are copied here so the planting, the
+// driveway apron and the foundation shade band land against the real building
+// and not against a guess. Its published front faces, front to back, are
+//     z = +3.05  garage front,  x  +8.60 .. +13.00
+//     z = +1.80  entry stoop,   x  -1.50 ..  +1.50
+//     z = +1.35  cross gable    x  +1.75 ..  +6.10  and link  +6.10 .. +8.60
+//     z =  0.00  main facade,   x  -5.40 ..  +1.75
+// Nothing of the house exists outside x [-5.64, +13.12], z [-8.74, +3.39].
+export let HOUSE_X0: f64 = 0.0 - 5.40;  // main block front wall, left end
+export let HOUSE_X1: f64 = 6.10;        // main block front wall, right end
+export let HOUSE_EAVE: f64 = 5.55;      // house.hml MB_EAVE
+export let HOUSE_RIDGE: f64 = 7.95;     // house.hml MB_RIDGE_Y
+export let HOUSE_DEPTH: f64 = 8.4;      // extends to z = -HOUSE_DEPTH
+export let GAR_X0: f64 = 8.60;
+export let GAR_X1: f64 = 13.00;
+export let GAR_Z: f64 = 3.05;           // garage projects FORWARD of the facade
+export let GAR_EAVE: f64 = 2.88;
+export let GAR_RIDGE: f64 = 4.88;
+export let CHIM_X: f64 = 6.74;          // house.hml chimney, x 6.14 .. 7.34
+
+// The two trees. The near one is the whole composition: it stands about five
+// metres in front of the eye, so its trunk is a major object and its canopy is
+// overhead. Everything about the framing follows from these two numbers — see
+// the note on the hero camera in house_yard.hml.
+export let TREE_A_X: f64 = 0.0 - 1.86;  // foreground tree, right of frame centre
+export let TREE_A_Z: f64 = 16.60;
+export let TREE_B_X: f64 = 0.0 - 8.00;  // second tree, at the left frame edge
+export let TREE_B_Z: f64 = 9.60;
+
+// Sun: high, slightly behind and to the LEFT of the camera. Points TOWARD the
+// light, normalised. Everything in the yard bakes against this one vector.
+export let SUN_X: f64 = 0.0 - 0.36;
+export let SUN_Y: f64 = 0.72;
+export let SUN_Z: f64 = 0.59;
+
+// ===========================================================================
+// GROUND
+// ===========================================================================
+
+// THE single authority on ground height. Flat pad at the house, a smoothstep
+// fall toward the camera, and a small undulation that is scaled to zero at the
+// pad so the house foundation line stays perfectly level.
+export fn ground_h(p_x: f64, p_z: f64): f64 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    if (z <= HOUSE_PAD_Z) { let flat: f64 = 0.0; return flat; }
+    let s: f64 = (z - HOUSE_PAD_Z) / YARD_RUN;
+    if (s > 1.0) { s = 1.0; }
+    let e: f64 = s * s * (3.0 - 2.0 * s);
+    let und: f64 = 0.055 * sin(x * 0.31) + 0.045 * cos(z * 0.27 + x * 0.11)
+                 + 0.030 * sin((x - z) * 0.19);
+    let out: f64 = 0.0 - YARD_DROP * e + und * s;
+    return out;
+}
+
+// Behind the house the same flat pad runs on to the treeline, and a flat plane
+// meeting a row of billboards produces a RULER-EDGE HORIZON straight across the
+// frame — the single most obvious "this is a plane" tell there is. This lifts
+// and rumples everything past z = -10, which is well clear of the house
+// footprint (z = 0 .. -9), so the foundation line is untouched.
+export fn ground_far(p_x: f64, p_z: f64): f64 {
+    let z: f64 = p_z;
+    if (z > 0.0 - 10.0) { let flat: f64 = 0.0; return flat; }
+    let t: f64 = (0.0 - 10.0 - z) / 22.0;
+    if (t > 1.0) { t = 1.0; }
+    let e: f64 = t * t * (3.0 - 2.0 * t);
+    let r: f64 = 1.35 * e
+               + (0.42 * sin(p_x * 0.11 + z * 0.07) + 0.26 * cos(p_x * 0.19)) * e;
+    let out: f64 = r;
+    return out;
+}
+
+// ===========================================================================
+// DETERMINISM AND NOISE — xorshift64 + a texel hash. @stdlib/random is never
+// used, so every render of this scene is byte-identical.
+// ===========================================================================
+
+let g_rs: u64 = 0x9E3779B97F4A7C15;
+
+export fn yw_seed(p_s: u64) { g_rs = p_s; }
+
+export fn yw_rnd(): f64 {
+    let x: u64 = g_rs;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    g_rs = x;
+    let m: u64 = x % 1000003;
+    let out: f64 = f64(m) / 1000003.0;
+    return out;
+}
+
+// Symmetric random in [-1, 1].
+export fn yw_rnds(): f64 { let out: f64 = yw_rnd() * 2.0 - 1.0; return out; }
+
+// All mixing in u64 with an explicit 32-bit mask (i32 * throws on overflow).
+fn hash2(p_x: i32, p_y: i32): u64 {
+    let hx: u64 = u64(p_x & 4095);
+    let hy: u64 = u64(p_y & 4095);
+    let h: u64 = (hx * 73856093) ^ (hy * 19349663);
+    h = ((h ^ (h >> 13)) * 1274126177) & 4294967295;
+    let out: u64 = h;
+    return out;
+}
+fn h01(p_x: i32, p_y: i32): f64 {
+    let out: f64 = f64(hash2(p_x, p_y)) * 2.3283064365386963e-10;
+    return out;
+}
+export fn yw_h01(p_x: i32, p_y: i32): f64 { let o: f64 = h01(p_x, p_y); return o; }
+
+// Ordered 4x4 Bayer — the single most period-authentic technique available.
+// Used as a +/- offset at EVERY ramp boundary. Banding in a 60%-sky frame is
+// the most visible failure this renderer has.
+let g_bayer: array<i32> = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+fn bayer4(p_x: i32, p_y: i32): i32 {
+    let out: i32 = g_bayer[(p_y & 3) * 4 + (p_x & 3)];
+    return out;
+}
+
+// Bilinear value noise on a 2^shift lattice. Never finer than 3 texels.
+fn vnoise(p_x: i32, p_y: i32, p_shift: i32): f64 {
+    let sh: i32 = p_shift;
+    let cell: i32 = 1 << sh;
+    let gx: i32 = p_x >> sh;
+    let gy: i32 = p_y >> sh;
+    let fx: f64 = f64(p_x - gx * cell) / f64(cell);
+    let fy: f64 = f64(p_y - gy * cell) / f64(cell);
+    let sx: f64 = fx * fx * (3.0 - 2.0 * fx);
+    let sy: f64 = fy * fy * (3.0 - 2.0 * fy);
+    let a: f64 = h01(gx, gy);
+    let b: f64 = h01(gx + 1, gy);
+    let c: f64 = h01(gx, gy + 1);
+    let d: f64 = h01(gx + 1, gy + 1);
+    let top: f64 = a + (b - a) * sx;
+    let bot: f64 = c + (d - c) * sx;
+    let out: f64 = top + (bot - top) * sy;
+    return out;
+}
+
+fn cl255(p_v: i32): i32 {
+    let v: i32 = p_v;
+    if (v < 0) { v = 0; }
+    if (v > 255) { v = 255; }
+    let out: i32 = v;
+    return out;
+}
+fn cl01(p_v: f64): f64 {
+    let v: f64 = p_v;
+    if (v < 0.0) { v = 0.0; }
+    if (v > 1.0) { v = 1.0; }
+    let out: f64 = v;
+    return out;
+}
+fn smoothst(p_t: f64): f64 {
+    let t: f64 = cl01(p_t);
+    let out: f64 = t * t * (3.0 - 2.0 * t);
+    return out;
+}
+
+// ===========================================================================
+// THE GROUND ATLAS — 128x128, everything opaque in the yard.
+// ===========================================================================
+// One atlas means one texture run means ONE draw call for the whole sorted
+// opaque world. Regions are hand-placed rather than cell-aligned; the uv rects
+// live in g_uv_* below.
+//
+// Authoring rule: every one of these is the FULL-SUN colour. Nothing in the
+// scene is ever brighter than what is painted here.
+
+export let GA_W: i32 = 128;
+export let GA_H: i32 = 128;
+
+// uv rects, [u0 v0 u1 v1] each
+export let UV_GRASS_A: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_GRASS_B: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_ASPHALT: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_MULCH:   array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_BARK:    array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_SHRUB:   array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_CONE:    array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_CLAP:    array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_SHINGLE: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_WHITE:   array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_DARK:    array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_BRICK:   array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_EDGE:    array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+fn ramp(p_lo: i32, p_hi: i32, p_t: f64): i32 {
+    let out: i32 = i32(f64(p_lo) + (f64(p_hi) - f64(p_lo)) * p_t + 0.5);
+    return out;
+}
+
+// --- grass ----------------------------------------------------------------
+// FULL SUN. This is the colour of the mown grass right beside the house on a
+// bright day: olive, never a pure hue.
+//
+// THE MOWING PATCHES LIVE HERE, NOT IN THE GEOMETRY. In the reference the lawn
+// is a checker of patches about 0.8 m across. A lawn cell is 2 m and maps one
+// whole 32-texel tile, so 0.8 m is 13 texels — small enough that subdividing
+// the mesh to get it would cost four times the triangles for something a
+// texture does for free. The per-cell mower pass in mow_tone() then rides on
+// top of this at 2 m, and the two scales together are what stops the lawn
+// reading as one flat plate (which is the fastest way to look like a tech demo).
+fn paint_grass(p_a: object, p_ox: i32, p_oy: i32, p_phase: i32) {
+    let a = p_a;
+    let ph: i32 = p_phase;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let sx: i32 = x + ph * 53;
+            let sy: i32 = y + ph * 97;
+
+            // ===============================================================
+            // [critic pass] THIS IS THE BIGGEST SINGLE PIXEL AREA IN THE FRAME
+            // AND IT WAS NOISE WHERE THE REFERENCE IS STRUCTURE.
+            //
+            // Measured over the same patch of foreground lawn, reference vs
+            // render: the reference's luminance standard deviation is 7.3 and
+            // the render's was 18.1 — the render had two and a half times the
+            // contrast and it was all in the wrong place. The reference lawn is
+            // a grid of flat, hard-edged patches in four or five discrete
+            // greens, with NO per-texel variation inside a patch at all. The old
+            // recipe here was four octaves of value noise down to a
+            // 0.8-texel lattice, plus a white-noise term, plus a +/-8 "blade
+            // grain", plus a 3.8 % fleck — five separate per-texel terms, and
+            // the block structure was a 0.52-amplitude modulation riding on top
+            // of all of it. At 320x240, one texel of that lawn is under a pixel:
+            // every one of those terms is below the sampling rate and lands as
+            // shimmer. It read as green television static, which is exactly the
+            // "per-texel noise instead of structure" failure.
+            //
+            // Rebuilt the other way round. The BLOCK is the thing; there are
+            // exactly six tones; nothing varies within a block except a single
+            // dither step to break the quantisation on the ramp. The result has
+            // less contrast and far more information.
+            // ===============================================================
+
+            // 8-texel blocks = 0.5 m of lawn. The mower's own alternation is the
+            // (bx+by) parity term; the hash on top of it makes the patches
+            // cluster into the irregular 1-2 m runs the photograph has rather
+            // than a clean chequerboard.
+            let bx: i32 = divi(x, 8) + ph * 3;
+            let by: i32 = divi(y, 8) + ph * 5;
+            let stripe: f64 = 0.32;
+            if (((bx + by) & 1) == 1) { stripe = 0.58; }
+            // The jitter has to be COMPARABLE TO the parity step or the lawn
+            // comes out as a clean chessboard. It is a mown lawn, not a
+            // chequerboard: neighbouring passes overlap, some blocks match
+            // their neighbour and some runs go three deep. 0.44 against a 0.26
+            // parity step flips roughly a third of the blocks out of parity,
+            // which is what the photograph's clustering looks like.
+            let jit: f64 = (h01(bx * 19 + ph * 7, by * 23 + 5) - 0.5) * 0.44;
+            // ONE soft octave, at block scale, so a run of same-parity blocks
+            // is not perfectly uniform across ten metres. Lattice 2^3 = 8 texels
+            // sampled at 1x, i.e. the block size — never finer.
+            let broad: f64 = (vnoise(sx, sy, 3) - 0.5) * 0.16;
+
+            // QUANTISE TO SIX TONES. Hard steps are the point: they are what
+            // makes a patch a patch instead of a gradient, and they are what the
+            // reference's retro treatment did to the real grass.
+            let raw: f64 = cl01(stripe + jit + broad);
+            let lv: i32 = i32(raw * 5.999);
+            let tt: f64 = f64(lv) * 0.2;
+
+            // A single ordered-dither step, worth one sixth of one tone. Without
+            // it the six levels band visibly across a 20 m run of lawn; with it
+            // they break up along the boundary only.
+            let d: i32 = 0;
+            if (bayer4(x, y) > 11) { d = 4; }
+            // THE RAMP IS ALSO THE CONTRAST CONTROL. 84..168 spread the six
+            // tones over 84 levels, which is three times the patch-to-patch
+            // step the photograph has; the lawn came out as a bold chequerboard
+            // where the reference is a quiet one. 102..170 gives a 13-level
+            // step between neighbouring patches, which is what it measures, and
+            // lifts the midtone to the reference's olive at the same time.
+            let r: i32 = cl255(ramp(102, 170, tt) + d);
+            let g: i32 = cl255(ramp(118, 188, tt) + d);
+            let b: i32 = cl255(ramp(33, 62, tt) + divi(d, 3));
+            atlas_px(a, p_ox + x, p_oy + y, r, g, b, 255);
+        }
+    }
+}
+
+// --- asphalt --------------------------------------------------------------
+fn paint_asphalt(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let n: f64 = vnoise(x * 3 + 400, y * 3 + 400, 3) * 0.6
+                       + vnoise(x * 6 + 91, y * 6 + 17, 2) * 0.4;
+            let d: f64 = (f64(bayer4(x, y)) - 7.5) * 0.018;
+            let t: f64 = cl01(n + d);
+            let gr: i32 = i32(h01(x * 11 + 41, y * 19 + 7) * 20.0) - 10;
+            let r: i32 = cl255(ramp(64, 101, t) + gr);
+            let g: i32 = cl255(ramp(64, 100, t) + gr);
+            let b: i32 = cl255(ramp(68, 104, t) + gr);
+            // aggregate: a few light chips, period-correct chunky
+            if (h01(x * 23 + 3, y * 29 + 13) > 0.94) { r = cl255(r + 30); g = cl255(g + 30); b = cl255(b + 28); }
+            atlas_px(a, p_ox + x, p_oy + y, r, g, b, 255);
+        }
+    }
+}
+
+// --- mulch ----------------------------------------------------------------
+fn paint_mulch(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            // chips: short horizontal-ish runs, so stretch the noise in x
+            let n: f64 = vnoise(x * 2 + 700, y * 6 + 300, 3) * 0.65
+                       + vnoise(x * 5 + 13, y * 9 + 61, 2) * 0.35;
+            let d: f64 = (f64(bayer4(x, y)) - 7.5) * 0.020;
+            let t: f64 = cl01(n + d);
+            let gr: i32 = i32(h01(x * 13 + 9, y * 7 + 23) * 22.0) - 11;
+            let r: i32 = cl255(ramp(70, 121, t) + gr);
+            let g: i32 = cl255(ramp(50, 88, t) + gr);
+            let b: i32 = cl255(ramp(36, 62, t) + divi(gr, 2));
+            atlas_px(a, p_ox + x, p_oy + y, r, g, b, 255);
+        }
+    }
+}
+
+// --- bark, 32 x 64 --------------------------------------------------------
+// Rough grey-brown, VERTICAL fissures. The trunk is half a metre across and a
+// few metres from the eye, so this is the most closely inspected texture in the
+// frame and it gets twice the height of everything else.
+fn paint_bark(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 32; x++) {
+            // fissures: noise squashed hard in y so it runs vertically
+            let f1: f64 = vnoise(x * 6, y, 3);
+            let f2: f64 = vnoise(x * 12 + 55, y * 2 + 9, 2);
+            let f3: f64 = vnoise(x * 3 + 201, y + 77, 4);
+            let v: f64 = f1 * 0.45 + f2 * 0.25 + f3 * 0.30;
+            // hard-edge the deep fissures: bark is not a smooth gradient
+            let deep: f64 = 0.0;
+            if (v < 0.34) { deep = (0.34 - v) * 3.0; }
+            if (deep > 1.0) { deep = 1.0; }
+            let d: f64 = (f64(bayer4(x, y)) - 7.5) * 0.016;
+            let t: f64 = cl01(v * 1.15 + d);
+            let gr: i32 = i32(h01(x * 17 + 5, y * 11 + 31) * 18.0) - 9;
+            let r: i32 = ramp(112, 205, t);
+            let g: i32 = ramp(106, 196, t);
+            let b: i32 = ramp(97, 180, t);
+            r = i32(f64(r) * (1.0 - 0.46 * deep));
+            g = i32(f64(g) * (1.0 - 0.47 * deep));
+            b = i32(f64(b) * (1.0 - 0.48 * deep));
+            // lichen: pale grey-green patches, the thing that makes bark read
+            let li: f64 = vnoise(x * 4 + 900, y * 4 + 500, 4);
+            if (li > 0.70) {
+                let k: f64 = cl01((li - 0.70) * 4.0) * 0.55;
+                r = i32(f64(r) + (172.0 - f64(r)) * k);
+                g = i32(f64(g) + (180.0 - f64(g)) * k);
+                b = i32(f64(b) + (156.0 - f64(b)) * k);
+            }
+            atlas_px(a, p_ox + x, p_oy + y, cl255(r + gr), cl255(g + gr), cl255(b + gr), 255);
+        }
+    }
+}
+
+// --- shrub / evergreen surface -------------------------------------------
+// Opaque foliage: mottled, chunky, hard-edged clumps. Boxwood is much yellower
+// than an arborvitae, which is blue-green, so they get separate tiles.
+fn paint_foliage_solid(p_a: object, p_ox: i32, p_oy: i32,
+                       p_r0: i32, p_g0: i32, p_b0: i32,
+                       p_r1: i32, p_g1: i32, p_b1: i32, p_seed: i32) {
+    let a = p_a;
+    let sd: i32 = p_seed;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let n: f64 = vnoise(x * 3 + sd, y * 3 + sd * 2, 2) * 0.5
+                       + vnoise(x * 6 + sd * 3, y * 6 + sd, 2) * 0.3
+                       + h01(x + sd, y + sd * 5) * 0.2;
+            // quantise: leaf clumps are chunky, not a smooth gradient
+            let q: f64 = f64(i32(n * 5.0)) / 4.0;
+            let d: f64 = (f64(bayer4(x, y)) - 7.5) * 0.022;
+            let t: f64 = cl01(q * 0.8 + n * 0.2 + d);
+            let gr: i32 = i32(h01(x * 5 + sd * 7, y * 3 + sd) * 16.0) - 8;
+            atlas_px(a, p_ox + x, p_oy + y,
+                     cl255(ramp(p_r0, p_r1, t) + gr),
+                     cl255(ramp(p_g0, p_g1, t) + gr),
+                     cl255(ramp(p_b0, p_b1, t) + divi(gr, 2)), 255);
+        }
+    }
+}
+
+// --- white clapboard, grey shingle, brick, flats -------------------------
+fn paint_clap(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let band: i32 = y & 1;
+            let t: f64 = 0.80 + vnoise(x * 2 + 33, y + 7, 3) * 0.18;
+            t = t + (f64(bayer4(x, y)) - 7.5) * 0.012;
+            let r: i32 = cl255(ramp(206, 255, cl01(t)));
+            let g: i32 = cl255(ramp(205, 253, cl01(t)));
+            let b: i32 = cl255(ramp(198, 246, cl01(t)));
+            // the shadow under each course lap: one dark texel, one soft
+            if (band == 0) { r = cl255(r - 46); g = cl255(g - 45); b = cl255(b - 41); }
+            atlas_px(a, p_ox + x, p_oy + y, r, g, b, 255);
+        }
+    }
+}
+fn paint_shingle(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let course: i32 = (y >> 2) & 1;
+            let tab: i32 = ((x + course * 4) >> 3) & 1;
+            let t: f64 = vnoise(x * 4 + 71, y * 4 + 19, 2) * 0.7 + 0.25;
+            t = t + (f64(bayer4(x, y)) - 7.5) * 0.020;
+            let r: i32 = cl255(ramp(56, 104, cl01(t)));
+            let g: i32 = cl255(ramp(58, 106, cl01(t)));
+            let b: i32 = cl255(ramp(62, 110, cl01(t)));
+            if ((y & 3) == 0) { r = cl255(r - 22); g = cl255(g - 22); b = cl255(b - 20); }
+            if (tab == 1) { r = cl255(r + 8); g = cl255(g + 8); b = cl255(b + 8); }
+            atlas_px(a, p_ox + x, p_oy + y, r, g, b, 255);
+        }
+    }
+}
+fn paint_brick(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let course: i32 = y >> 2;                 // 4-texel courses
+            let off: i32 = (course & 1) * 4;
+            let mortar: i32 = 0;
+            if ((y & 3) == 3) { mortar = 1; }
+            if (((x + off) & 7) == 7) { mortar = 1; }
+            let t: f64 = vnoise(x * 5 + 300, y * 5 + 120, 2) * 0.8 + 0.15;
+            t = t + (f64(bayer4(x, y)) - 7.5) * 0.020;
+            let bh: f64 = h01(divi(x + off, 8) * 13 + 1, course * 7 + 3);
+            let r: i32 = cl255(ramp(112, 178, cl01(t)) + i32(bh * 30.0) - 15);
+            let g: i32 = cl255(ramp(58, 96, cl01(t)) + i32(bh * 18.0) - 9);
+            let b: i32 = cl255(ramp(48, 78, cl01(t)) + i32(bh * 14.0) - 7);
+            if (mortar == 1) { r = 164; g = 156; b = 146; }
+            atlas_px(a, p_ox + x, p_oy + y, r, g, b, 255);
+        }
+    }
+}
+fn paint_flat(p_a: object, p_ox: i32, p_oy: i32, p_w: i32, p_h: i32,
+              p_r: i32, p_g: i32, p_b: i32, p_jit: i32) {
+    let a = p_a;
+    for (let y = 0; y < p_h; y++) {
+        for (let x = 0; x < p_w; x++) {
+            let j: i32 = 0;
+            if (p_jit > 0) { j = i32(h01(x + p_ox, y + p_oy) * f64(p_jit * 2)) - p_jit; }
+            atlas_px(a, p_ox + x, p_oy + y, cl255(p_r + j), cl255(p_g + j), cl255(p_b + j), 255);
+        }
+    }
+}
+
+// Build the whole opaque atlas and fill in the uv rects.
+export fn yw_build_ground_atlas(): object {
+    let a = atlas_new(GA_W, GA_H, 1, 1);
+    paint_grass(a, 0, 0, 0);
+    paint_grass(a, 32, 0, 3);
+    paint_asphalt(a, 64, 0);
+    paint_mulch(a, 96, 0);
+    paint_bark(a, 0, 32);
+    paint_foliage_solid(a, 32, 32, 38, 58, 14, 122, 152, 48, 5);    // boxwood, yellow-green
+    paint_foliage_solid(a, 64, 32, 28, 54, 22, 92, 128, 56, 11);    // arborvitae, blue-green
+    paint_clap(a, 96, 32);
+    paint_shingle(a, 0, 96);
+    paint_flat(a, 32, 96, 16, 16, 246, 244, 236, 4);                // white trim
+    paint_flat(a, 48, 96, 16, 16, 30, 32, 36, 3);                   // near-black
+    paint_brick(a, 64, 96);
+    paint_flat(a, 96, 96, 32, 32, 92, 74, 52, 12);                  // bed edge / bare dirt
+
+    atlas_rect_uv(a, 0, 0, 32, 32, UV_GRASS_A, 0);
+    atlas_rect_uv(a, 32, 0, 32, 32, UV_GRASS_B, 0);
+    atlas_rect_uv(a, 64, 0, 32, 32, UV_ASPHALT, 0);
+    atlas_rect_uv(a, 96, 0, 32, 32, UV_MULCH, 0);
+    atlas_rect_uv(a, 0, 32, 32, 64, UV_BARK, 0);
+    atlas_rect_uv(a, 32, 32, 32, 32, UV_SHRUB, 0);
+    atlas_rect_uv(a, 64, 32, 32, 32, UV_CONE, 0);
+    atlas_rect_uv(a, 96, 32, 32, 32, UV_CLAP, 0);
+    atlas_rect_uv(a, 0, 96, 32, 32, UV_SHINGLE, 0);
+    atlas_rect_uv(a, 34, 98, 12, 12, UV_WHITE, 0);
+    atlas_rect_uv(a, 50, 98, 12, 12, UV_DARK, 0);
+    atlas_rect_uv(a, 64, 96, 32, 32, UV_BRICK, 0);
+    atlas_rect_uv(a, 96, 96, 32, 32, UV_EDGE, 0);
+    let out: object = a;
+    return out;
+}
+
+// ===========================================================================
+// THE FOLIAGE ATLAS — 128x128 RGBA, alpha-CUT (0 or 255), BLEND_BLEND.
+// ===========================================================================
+// SDL_RenderGeometry has no alpha test, only alpha blend. Binary alpha through
+// a blended texture gives a hard cutout edge — which is exactly the chunky
+// silhouette the reference has — and the painter's sort composites the cards
+// back to front for free. A soft alpha ramp would mush; it is deliberately not
+// used except for the contact-shadow blob, which wants to be soft.
+
+export let FA_W: i32 = 128;
+export let FA_H: i32 = 128;
+
+export let UV_LEAF_A: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_LEAF_B: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_LEAF_C: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_LEAF_D: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_BB_BALL: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_BB_CONE: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_SHADOW: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_FAR_TREE: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_LOWSHRUB: array<f64> = [0.0, 0.0, 0.0, 0.0];
+export let UV_TUFT: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+// A leaf-mass card: a blobby cutout with a ragged edge and internal light/dark
+// clumps, lit from the top-left. `p_fill` sets how solid it is.
+fn paint_leaf(p_a: object, p_ox: i32, p_oy: i32, p_seed: i32, p_fill: f64,
+              p_r0: i32, p_g0: i32, p_b0: i32, p_r1: i32, p_g1: i32, p_b1: i32) {
+    let a = p_a;
+    let sd: i32 = p_seed;
+    let c: f64 = 15.5;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let dx: f64 = (f64(x) - c) / 15.5;
+            let dy: f64 = (f64(y) - c) / 15.5;
+            let d: f64 = sqrt(dx * dx + dy * dy);
+            // ragged edge: perturb the radius with 3-4 texel noise
+            let rag: f64 = vnoise(x * 4 + sd * 37, y * 4 + sd * 11, 2) - 0.5;
+            let clump: f64 = vnoise(x * 3 + sd * 5, y * 3 + sd * 19, 3);
+            let edge: f64 = d + rag * 0.40 - clump * 0.26;
+            let al: i32 = 0;
+            if (edge < p_fill) { al = 255; }
+            // INTERIOR HOLES. A canopy that is opaque reads as a green cloud;
+            // the reference has blue showing through everywhere between the
+            // clumps, and that is most of what makes it read as foliage.
+            if (clump < 0.30) { al = 0; }
+            if (vnoise(x * 7 + sd * 3, y * 7 + sd * 23, 2) < 0.24) { al = 0; }
+            if (al == 0) {
+                atlas_px(a, p_ox + x, p_oy + y, 0, 0, 0, 0);
+            } else {
+                // lit from up-left: the top-left of each card is the sunlit face
+                let lit: f64 = cl01(0.58 - dx * 0.42 - dy * 0.52);
+                let t: f64 = cl01(lit * 0.72 + clump * 0.42
+                                  + (f64(bayer4(x, y)) - 7.5) * 0.022);
+                let gr: i32 = i32(h01(x * 9 + sd, y * 7 + sd * 3) * 20.0) - 10;
+                atlas_px(a, p_ox + x, p_oy + y,
+                         cl255(ramp(p_r0, p_r1, t) + gr),
+                         cl255(ramp(p_g0, p_g1, t) + gr),
+                         cl255(ramp(p_b0, p_b1, t) + divi(gr, 2)), 255);
+            }
+        }
+    }
+}
+
+// A shrub billboard: a solid ball with a slightly ragged edge, shaded from the
+// upper left, with a darker underside. This is approach A in the shrub bake-off.
+fn paint_ball(p_a: object, p_ox: i32, p_oy: i32, p_seed: i32, p_squash: f64,
+              p_r0: i32, p_g0: i32, p_b0: i32, p_r1: i32, p_g1: i32, p_b1: i32) {
+    let a = p_a;
+    let sd: i32 = p_seed;
+    let c: f64 = 15.5;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let dx: f64 = (f64(x) - c) / 15.0;
+            let dy: f64 = (f64(y) - c) / (15.0 * p_squash);
+            let d: f64 = sqrt(dx * dx + dy * dy);
+            let rag: f64 = (vnoise(x * 5 + sd * 23, y * 5 + sd * 41, 2) - 0.5) * 0.20;
+            if (d + rag > 0.98) { atlas_px(a, p_ox + x, p_oy + y, 0, 0, 0, 0); }
+            else {
+                // sphere normal -> N.L with the light up and to the left
+                let nz: f64 = sqrt(cl01(1.0 - d * d));
+                let ndl: f64 = cl01(0.0 - dx * 0.46 - dy * 0.62 + nz * 0.64);
+                let clump: f64 = vnoise(x * 4 + sd * 13, y * 4 + sd * 7, 2);
+                let t: f64 = cl01(ndl * 0.86 + clump * 0.30 - 0.10
+                                  + (f64(bayer4(x, y)) - 7.5) * 0.024);
+                let gr: i32 = i32(h01(x * 11 + sd, y * 5 + sd * 2) * 18.0) - 9;
+                atlas_px(a, p_ox + x, p_oy + y,
+                         cl255(ramp(p_r0, p_r1, t) + gr),
+                         cl255(ramp(p_g0, p_g1, t) + gr),
+                         cl255(ramp(p_b0, p_b1, t) + divi(gr, 2)), 255);
+            }
+        }
+    }
+}
+
+// A narrow conical evergreen card.
+fn paint_conecard(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let ty: f64 = f64(y) / 31.0;             // 0 at the tip
+            let halfw: f64 = 1.5 + ty * 9.5;
+            let dx: f64 = f64(x) - 15.5;
+            let ax: f64 = dx; if (ax < 0.0) { ax = 0.0 - ax; }
+            let rag: f64 = (vnoise(x * 6 + 77, y * 3 + 13, 2) - 0.5) * 3.4;
+            if (ax + rag > halfw) { atlas_px(a, p_ox + x, p_oy + y, 0, 0, 0, 0); }
+            else {
+                let lit: f64 = cl01(0.62 - dx / (halfw + 1.0) * 0.55);
+                let clump: f64 = vnoise(x * 4 + 5, y * 8 + 31, 2);
+                let t: f64 = cl01(lit * 0.72 + clump * 0.40 - 0.06
+                                  + (f64(bayer4(x, y)) - 7.5) * 0.024);
+                let gr: i32 = i32(h01(x * 7 + 3, y * 13 + 9) * 16.0) - 8;
+                atlas_px(a, p_ox + x, p_oy + y,
+                         cl255(ramp(26, 84, t) + gr),
+                         cl255(ramp(50, 122, t) + gr),
+                         cl255(ramp(18, 52, t) + divi(gr, 2)), 255);
+            }
+        }
+    }
+}
+
+// The contact-shadow blob. THE highest value-per-triangle spend in the scene:
+// two triangles of darkening under every prop is the difference between a yard
+// and objects floating on a plane. Soft alpha here on purpose.
+fn paint_shadow(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    let c: f64 = 15.5;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let dx: f64 = (f64(x) - c) / 15.5;
+            let dy: f64 = (f64(y) - c) / 15.5;
+            let d: f64 = sqrt(dx * dx + dy * dy);
+            let k: f64 = cl01(1.0 - d);
+            k = k * k * 1.25;
+            if (k > 1.0) { k = 1.0; }
+            let dith: f64 = (f64(bayer4(x, y)) - 7.5) * 0.020;
+            let al: i32 = cl255(i32((k + dith) * 196.0));
+            atlas_px(a, p_ox + x, p_oy + y, 16, 20, 12, al);
+        }
+    }
+}
+
+// A distant tree mass — a whole crown as one card, dark and slightly hazy.
+fn paint_fartree(p_a: object, p_ox: i32, p_oy: i32) {
+    let a = p_a;
+    let c: f64 = 15.5;
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            let dx: f64 = (f64(x) - c) / 15.0;
+            let dy: f64 = (f64(y) - c) / 15.0;
+            // taller than wide, and pinched at the bottom so the silhouette
+            // has a crown rather than being a green ball on the grass
+            let pinch: f64 = 1.0 + cl01(dy) * 1.30;
+            let d: f64 = sqrt(dx * dx * pinch * pinch + dy * dy * 0.72);
+            let rag: f64 = (vnoise(x * 5 + 313, y * 5 + 97, 2) - 0.5) * 0.46
+                         + (vnoise(x * 9 + 41, y * 9 + 7, 2) - 0.5) * 0.26;
+            if (d + rag > 0.96) { atlas_px(a, p_ox + x, p_oy + y, 0, 0, 0, 0); }
+            else {
+                let lit: f64 = cl01(0.50 - dx * 0.34 - dy * 0.56);
+                let clump: f64 = vnoise(x * 4 + 601, y * 4 + 11, 2);
+                let t: f64 = cl01(lit * 0.70 + clump * 0.40
+                                  + (f64(bayer4(x, y)) - 7.5) * 0.024);
+                let gr: i32 = i32(h01(x * 3 + 61, y * 17 + 5) * 14.0) - 7;
+                atlas_px(a, p_ox + x, p_oy + y,
+                         cl255(ramp(34, 100, t) + gr),
+                         cl255(ramp(52, 128, t) + gr),
+                         cl255(ramp(20, 52, t) + divi(gr, 2)), 255);
+            }
+        }
+    }
+}
+
+export fn yw_build_foliage_atlas(): object {
+    let a = atlas_new(FA_W, FA_H, 1, 1);
+    // canopy cards: four densities, all authored at FULL SUN — the brightest
+    // leaf in the frame is the top end of these ramps and nothing can exceed it
+    paint_leaf(a, 0, 0, 3, 0.88, 40, 58, 16, 150, 176, 62);
+    paint_leaf(a, 32, 0, 7, 0.80, 36, 54, 15, 138, 162, 57);
+    paint_leaf(a, 64, 0, 13, 0.70, 44, 64, 18, 158, 184, 66);
+    paint_leaf(a, 96, 0, 21, 0.92, 28, 44, 12, 104, 126, 44);  // dark understory
+    paint_ball(a, 0, 32, 5, 0.92, 30, 48, 12, 122, 150, 46);   // boxwood card
+    paint_conecard(a, 32, 32);
+    paint_shadow(a, 64, 32);
+    paint_fartree(a, 96, 32);
+    paint_ball(a, 0, 64, 17, 0.52, 26, 44, 12, 108, 132, 42);  // low spreading shrub
+    paint_leaf(a, 32, 64, 29, 0.60, 54, 72, 30, 140, 162, 80); // grass tuft / weed clump
+
+    atlas_rect_uv(a, 0, 0, 32, 32, UV_LEAF_A, 0);
+    atlas_rect_uv(a, 32, 0, 32, 32, UV_LEAF_B, 0);
+    atlas_rect_uv(a, 64, 0, 32, 32, UV_LEAF_C, 0);
+    atlas_rect_uv(a, 96, 0, 32, 32, UV_LEAF_D, 0);
+    atlas_rect_uv(a, 0, 32, 32, 32, UV_BB_BALL, 0);
+    atlas_rect_uv(a, 32, 32, 32, 32, UV_BB_CONE, 0);
+    atlas_rect_uv(a, 64, 32, 32, 32, UV_SHADOW, 0);
+    atlas_rect_uv(a, 96, 32, 32, 32, UV_FAR_TREE, 0);
+    atlas_rect_uv(a, 0, 64, 32, 32, UV_LOWSHRUB, 0);
+    atlas_rect_uv(a, 32, 64, 32, 32, UV_TUFT, 0);
+    let out: object = a;
+    return out;
+}
+
+// ===========================================================================
+// THE SKY — 512 x 256, sampled as a 320x240 window that pans with the camera.
+// ===========================================================================
+// Deep blue with FLAT HORIZONTAL BANDS of white cloud, exactly as the reference
+// has them: not puffy, not soft. Every ramp row is Bayer-dithered; the sky is
+// most of the upper half of the frame and banding there would be the first
+// thing anyone sees.
+
+// 640x400 so the 320x240 window it is sampled through maps ONE TEXEL PER PIXEL
+// with room left over to pan. That matters more than it sounds: at 2:1 the
+// Bayer dither of the gradient stretches into a visible moire lattice and the
+// cloud bands double in thickness, which is exactly what "flat banded, not
+// puffy" is not.
+export let SKY_W: i32 = 640;
+export let SKY_H: i32 = 400;
+
+export let SKY_ZEN_R: i32 = 24;  export let SKY_ZEN_G: i32 = 54;  export let SKY_ZEN_B: i32 = 142;
+export let SKY_HOR_R: i32 = 152; export let SKY_HOR_G: i32 = 190; export let SKY_HOR_B: i32 = 231;
+
+// Cloud bands: centre v, half-thickness in v, coverage threshold, and how much
+// of the band's length survives. Half-thicknesses of 0.004-0.010 are 1.6 to 4
+// texels, i.e. 2 to 8 pixels of a 240-line frame. Thin, flat, stacked — the
+// bands in the photograph are streaks, not clouds.
+let g_band_v: array<f64> = [0.062, 0.079, 0.131, 0.148, 0.161, 0.222, 0.268,
+                            0.281, 0.336, 0.352, 0.397, 0.441, 0.454, 0.489,
+                            0.523, 0.536, 0.571, 0.598, 0.611, 0.640, 0.667,
+                            0.681, 0.702, 0.719, 0.736];
+// [critic pass] SCALED UP 1.45x. The sky quad shows a 0.46-tall window of this
+// atlas across 240 scanlines, so one v unit is 521 lines and a band's visible
+// height is about 1980 * t lines. At the old thicknesses half the bands were
+// under two scanlines tall — below the resolution they are being drawn at, so
+// they alternated between present and absent along their length no matter how
+// clean the horizontal profile was. The photograph's bands measure 1.4 to 2.8
+// per cent of frame height, which is 3.3 to 6.6 lines here.
+let g_band_t: array<f64> = [0.0058, 0.0023, 0.0070, 0.0019, 0.0029, 0.0045, 0.0062,
+                            0.0020, 0.0052, 0.0025, 0.0039, 0.0055, 0.0017, 0.0035,
+                            0.0046, 0.0017, 0.0030, 0.0041, 0.0016, 0.0026, 0.0035,
+                            0.0015, 0.0023, 0.0030, 0.0015];
+// [critic pass] EVERY THRESHOLD DROPPED 0.16. `hn` is a 0.70/0.20/0.10 weighted
+// average of three noises, so it is far more tightly clustered about 0.5 than
+// any one of them: it reaches 0.75 on a few per cent of columns and 0.79 almost
+// never. Nine of these twenty-five bands were therefore drawing nothing at all
+// and the rest were drawing a handful of columns each, which is why the sky
+// came out as clear blue with two streaks in it. The photograph's sky is about
+// HALF cloud below the zenith — a stack of broad hard-edged white slabs — and
+// that is what these numbers now ask for.
+// The first five sit at v 0.06..0.16, which is the ZENITH end of the panorama.
+// The photograph has clean deep blue there and its cloud starts a third of the
+// way down, so those five keep the high thresholds and stay nearly empty; the
+// drop applies to the bands the frame actually shows cloud in.
+let g_band_c: array<f64> = [0.700, 0.760, 0.680, 0.770, 0.720, 0.465, 0.415,
+                            0.600, 0.435, 0.570, 0.490, 0.425, 0.610, 0.535,
+                            0.445, 0.615, 0.550, 0.465, 0.620, 0.560, 0.480,
+                            0.625, 0.570, 0.490, 0.630];
+// per-band brightness: the highest bands are thin and pale, the mid ones solid
+let g_band_b: array<f64> = [1.00, 0.72, 1.00, 0.66, 0.80, 0.95, 1.00,
+                            0.68, 0.98, 0.74, 0.90, 1.00, 0.64, 0.82,
+                            0.96, 0.62, 0.78, 0.92, 0.60, 0.76, 0.88,
+                            0.58, 0.72, 0.86, 0.56];
+
+export fn yw_build_sky_atlas(): object {
+    let a = atlas_new(SKY_W, SKY_H, 1, 1);
+    let nb: i32 = g_band_v.length;
+
+    // PRECOMPUTE THE HORIZONTAL PROFILE, ONCE PER (COLUMN, BAND).
+    // Nothing in the band model varies with y except the distance to the band
+    // centre, so evaluating the noise inside the pixel loop cost 640 x 400 x 25
+    // x 4 = 25.6 million vnoise calls and eleven seconds of startup. Hoisting it
+    // to 640 x 25 x 4 = 64 000 calls takes the whole sky to about 90 ms. Same
+    // image, two orders of magnitude.
+    let wob: array<f64> = [];
+    let hv: array<f64> = [];
+    for (let x = 0; x < SKY_W; x++) {
+        for (let k = 0; k < nb; k++) {
+            // [critic pass] LATTICE 2^8 = 256 TEXELS IS WIDER THAN THE SKY
+            // QUAD SHOWS. The visible u window is 384 texels, so one and a half
+            // lattice cells covered the whole frame and the "wobble" was very
+            // nearly a straight line with a slight tilt: every band came out as
+            // a ruler-straight stripe from edge to edge and the sky read as
+            // scanlines. 2^6 = 64 texels is about 53 screen pixels, so a band
+            // now rises and falls six or seven times across the frame, which is
+            // the stepped, blocky stack the photograph has.
+            let w: f64 = (vnoise(x + k * 431, k * 71, 6) - 0.5) * 0.026
+                       + (vnoise(x * 2 + k * 89, k * 37, 5) - 0.5) * 0.010;
+            wob.push(w);
+            // ONE lattice at 128 texels gives streaks 60-200 px long, which is
+            // the length the bands in the photograph run; the finer terms only
+            // gnaw the ends so they do not all start and stop together.
+            //
+            // [critic pass] THE THIRD OCTAVE USED TO ALIAS. It was
+            // `vnoise(x * 6 + ..., 4)`: lattice 2^4 = 16 texels sampled at 6x,
+            // so its real period was 16/6 = 2.7 TEXELS. The sky quad shows 384
+            // texels of this atlas across 320 pixels with nearest sampling, so a
+            // 2.7-texel feature lands on 2.2 pixels and beats against the pixel
+            // grid. On screen the cloud bands broke into a row of dots and
+            // parentheses — the one thing in the frame that looked like a
+            // corrupt texture rather than like a retro renderer. Every octave
+            // here now has a period of 20 texels or more, i.e. at least 17
+            // screen pixels, which is above the Nyquist limit of the sampling
+            // by a wide margin and reads as cloud again.
+            let hn: f64 = vnoise(x + k * 977, k * 211, 7) * 0.70
+                        + vnoise(x * 2 + k * 53, k * 29, 6) * 0.20
+                        + vnoise(x * 3 + k * 17, k * 7, 6) * 0.10;
+            // A slope of 6.5 took a band from nothing to full in a fortieth of
+            // its own length: square ends, and square ends of a 2-pixel-tall
+            // band are indistinguishable from noise. 3.2 tapers them — and then
+            // SMOOTHSTEP puts the core back at full white, because a taper on
+            // its own only produced a faint blue-grey smear the whole length of
+            // the band. The photograph's clouds are SOLID at the middle and
+            // feathered at the ends; that is two separate properties and the
+            // ramp alone gives you neither.
+            let v: f64 = 0.0;
+            if (hn > g_band_c[k]) { v = smoothst(cl01((hn - g_band_c[k]) * 3.2)); }
+            hv.push(v);
+        }
+    }
+
+    for (let y = 0; y < SKY_H; y++) {
+        let fy: f64 = f64(y) / f64(SKY_H);
+        // ease the gradient: a compact deep zenith, a wide pale horizon
+        let e: f64 = smoothst(fy * 1.04);
+        e = e * 0.66 + fy * 0.34;
+        for (let x = 0; x < SKY_W; x++) {
+            // DITHER EVERY RAMP ROW. The zenith-to-horizon ramp moves about half
+            // a level per row; without this it is visible banding across the
+            // largest single area in the frame.
+            let d: f64 = (f64(bayer4(x, y)) - 7.5) * (1.0 / 255.0) * 3.8;
+            let ee: f64 = cl01(e + d);
+            let r: i32 = ramp(SKY_ZEN_R, SKY_HOR_R, ee);
+            let g: i32 = ramp(SKY_ZEN_G, SKY_HOR_G, ee);
+            let b: i32 = ramp(SKY_ZEN_B, SKY_HOR_B, ee);
+
+            let base: i32 = x * nb;
+            let best: f64 = 0.0;
+            let lit: f64 = 0.0;
+            for (let k = 0; k < nb; k++) {
+                let hvv: f64 = hv[base + k];
+                if (hvv <= 0.0) { continue; }
+                // WAVE THE BAND. A band held at a constant v is a perfectly
+                // straight line the full width of the sky, which reads as a
+                // scanline artefact rather than as cloud.
+                let dv: f64 = fy - (g_band_v[k] + wob[base + k]);
+                let ad: f64 = dv; if (ad < 0.0) { ad = 0.0 - ad; }
+                let th: f64 = g_band_t[k];
+                if (ad > th * 2.0) { continue; }
+                // vertical profile: FLAT core, one-texel shoulder. A soft ramp
+                // here is what turns a streak into a puff.
+                let prof: f64 = 1.0;
+                if (ad > th) { prof = cl01(1.0 - (ad - th) / (th * 0.9)); }
+                let v: f64 = prof * hvv * g_band_b[k];
+                if (v > best) {
+                    best = v;
+                    lit = 0.0;
+                    if (dv < 0.0) { lit = 1.0; }        // top edge catches the sun
+                }
+            }
+            if (best > 0.0) {
+                let kk: f64 = cl01(best + (f64(bayer4(x, y)) - 7.5) * 0.034);
+                // [critic pass] the photograph's cloud runs 172..218 red at
+                // the pale end and 200..232 where the sun catches the top edge
+                let cr: f64 = 188.0 + 40.0 * lit;
+                let cg: f64 = 202.0 + 34.0 * lit;
+                let cb: f64 = 222.0 + 22.0 * lit;
+                r = i32(f64(r) + (cr - f64(r)) * kk);
+                g = i32(f64(g) + (cg - f64(g)) * kk);
+                b = i32(f64(b) + (cb - f64(b)) * kk);
+            }
+            atlas_px(a, x, y, cl255(r), cl255(g), cl255(b), 255);
+        }
+    }
+    let out: object = a;
+    return out;
+}
+
+// ===========================================================================
+// SHADE — the gradient that carries most of the depth in the photograph
+// ===========================================================================
+// The foreground is UNDER the tree and is markedly darker than the grass near
+// the house. Vertex colour can only darken, so 1.0 is "sunlit grass beside the
+// house" and everything else scales down from it.
+
+// Two shade pools, one per tree, plus a global fall-off toward the camera.
+fn shade_pool(p_x: f64, p_z: f64, p_cx: f64, p_cz: f64, p_r: f64, p_deep: f64): f64 {
+    let dx: f64 = p_x - p_cx;
+    let dz: f64 = p_z - p_cz;
+    let d: f64 = sqrt(dx * dx + dz * dz) / p_r;
+    if (d >= 1.0) { let one: f64 = 1.0; return one; }
+    let k: f64 = smoothst(1.0 - d);
+    let out: f64 = 1.0 - p_deep * k;
+    return out;
+}
+
+// The whole ground-shade model, in one place, so the lawn, the driveway, the
+// mulch and every prop tint agree.
+export fn yw_shade(p_x: f64, p_z: f64): f64 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    // A GENTLE global fall toward the viewer. Measured off the photograph the
+    // ratio is about 1.15 : 1, not 2 : 1 — see the calibration note above.
+    // The absolute level is EXPOSURE, and it belongs here rather than in the
+    // grass tile: the tile stays authored at the albedo of grass in full sun,
+    // and this is the one number that says how bright that sun is in this
+    // photograph. Measured, the open lawn wants ~0.50 and the band along the
+    // foundation ~0.36.
+    let t: f64 = cl01((z + 2.0) / 28.0);
+    let s: f64 = 0.575 - 0.075 * t * t;
+    // The two canopy pools. Strictly the sun is high and behind-left so the
+    // cast shadow lands on the far side of each trunk — but the photograph is
+    // unambiguous that the FOREGROUND is the dark part, because the viewer is
+    // standing under the crown and the whole near lawn is out of the sky's
+    // light. The pools are therefore offset toward the camera, which is what
+    // the picture does, not what a shadow ray would do.
+    s = s * shade_pool(x, z, TREE_A_X + 1.2, TREE_A_Z + 4.6, 17.0, 0.09);
+    s = s * shade_pool(x, z, TREE_B_X + 1.2, TREE_B_Z + 3.4, 10.0, 0.07);
+    // THE FOUNDATION BAND. This is the one place the photograph's lawn is
+    // clearly darker than the rest — (40,48,17) against (54,62,20) — and it is
+    // the shade the house and its planting throw. Narrow and deep, not wide
+    // and shallow.
+    s = s * shade_pool(x, z, 0.0 - 2.0, 0.0 - 0.4, 5.0, 0.30);
+    s = s * shade_pool(x, z, 4.4, 0.95, 5.0, 0.28);
+    s = s * shade_pool(x, z, GAR_X0 + 2.2, GAR_Z - 0.4, 4.6, 0.24);
+    let out: f64 = s;
+    if (out < 0.20) { out = 0.20; }
+    return out;
+}
+
+// Dappled light: only appears where there IS shade, which is what makes it read
+// as light through leaves rather than as noise.
+fn dapple(p_x: f64, p_z: f64, p_shade: f64): f64 {
+    let ix: i32 = i32(floor(p_x * 0.72));
+    let iz: i32 = i32(floor(p_z * 0.72));
+    let n: f64 = h01(ix * 3 + 17, iz * 5 + 29) - 0.5;
+    let amp: f64 = (1.0 - p_shade) * 0.20 + 0.035;
+    let out: f64 = n * amp;
+    return out;
+}
+
+// ===========================================================================
+// THE LAWN
+// ===========================================================================
+// Uniform 2 m cells, chunked so the frustum can throw away what is behind the
+// camera. Each cell gets FOUR fresh vertices, which is what makes both a hard
+// per-cell mowing tone AND a smooth per-vertex shade gradient possible at once:
+// the stripe is flat across the quad, the shade interpolates across it.
+
+export let LAWN_CELL: f64 = 2.0;
+export let LAWN_CX: i32 = 8;            // cells per chunk
+export let LAWN_CZ: i32 = 8;
+export let LAWN_NX: i32 = 4;            // chunks
+export let LAWN_NZ: i32 = 3;
+export let LAWN_X0: f64 = 0.0 - 30.0;   // near-field lawn origin
+export let LAWN_Z0: f64 = 0.0 - 18.0;
+
+let g_lawn: array = [];
+let g_lawn_cx: array<f64> = [];
+let g_lawn_cy: array<f64> = [];
+let g_lawn_cz: array<f64> = [];
+let g_lawn_r: array<f64> = [];
+let g_skirt = null;
+
+// The mowing pattern. The reference is not long stripes: it is a CHECKER of
+// slightly lighter and darker patches about a mower's width across, with a
+// per-patch drift on top. `(cx + cz) & 1` gives the diagonal checker; the hash
+// gives the drift; a third, coarser term gives the "this pass was cut on a
+// different day" bands that stop it reading as a chessboard.
+fn mow_tone(p_cx: i32, p_cz: i32): f64 {
+    let alt: i32 = (p_cx + p_cz) & 1;
+    let t: f64 = 1.0;
+    if (alt == 1) { t = 0.805; }
+    t = t + (h01(p_cx * 7 + 13, p_cz * 11 + 3) - 0.5) * 0.115;
+    // coarse mower passes, 4 cells (8 m) wide, running across the slope
+    let pass: i32 = divi(p_cz + 64, 4) & 1;
+    if (pass == 1) { t = t * 0.945; }
+    let out: f64 = cl01(t);
+    return out;
+}
+
+// One lawn vertex: shade x mow tone, with a cool cast in the shadow (the
+// shadowed grass in the photo is bluer, not just darker) and dapple at the
+// edges of the canopy pools.
+fn lawn_vert(p_m, p_x: f64, p_z: f64, p_u: f64, p_v: f64, p_tone: f64): i32 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let s: f64 = yw_shade(x, z);
+    let d: f64 = dapple(x, z, s);
+    let k: f64 = cl01(s + d) * p_tone;
+    // cool shadow: pull red down faster than blue as k falls
+    let cool: f64 = 1.0 - (1.0 - k) * 0.09;
+    let r: i32 = cl255(i32(255.0 * k * cool));
+    let g: i32 = cl255(i32(255.0 * k * (1.0 - (1.0 - k) * 0.02)));
+    let b: i32 = cl255(i32(255.0 * k * (1.0 + (1.0 - k) * 0.05)));
+    let out: i32 = mesh_vert(p_m, x, ground_h(x, z) + ground_far(x, z), z,
+                             p_u, p_v, r, g, b);
+    return out;
+}
+
+fn build_lawn_chunk(p_ix: i32, p_iz: i32) {
+    let cw: f64 = LAWN_CELL;
+    let bx: f64 = LAWN_X0 + f64(p_ix * LAWN_CX) * cw;
+    let bz: f64 = LAWN_Z0 + f64(p_iz * LAWN_CZ) * cw;
+    let m = mesh_new(LAWN_CX * LAWN_CZ * 2);
+    mesh_begin(m);
+    let sy: f64 = 0.0;
+    for (let j = 0; j < LAWN_CZ; j++) {
+        for (let i = 0; i < LAWN_CX; i++) {
+            let cxi: i32 = p_ix * LAWN_CX + i;
+            let czi: i32 = p_iz * LAWN_CZ + j;
+            let x0: f64 = bx + f64(i) * cw;
+            let z0: f64 = bz + f64(j) * cw;
+            let x1: f64 = x0 + cw;
+            let z1: f64 = z0 + cw;
+            let tone: f64 = mow_tone(cxi, czi);
+            // alternate the grass tile so adjacent patches do not tile visibly
+            let uv = UV_GRASS_A;
+            if (((cxi * 3 + czi * 5) & 3) < 2) { uv = UV_GRASS_B; }
+            let u0: f64 = uv[0]; let v0: f64 = uv[1];
+            let u1: f64 = uv[2]; let v1: f64 = uv[3];
+            // rotate the tile by quarter turns per cell — four orientations out
+            // of two tiles is enough that the eye never finds the repeat
+            let rot: i32 = (cxi * 5 + czi * 3) & 3;
+            let ia: i32 = 0; let ib: i32 = 0; let ic: i32 = 0; let id: i32 = 0;
+            if (rot == 0) {
+                ia = lawn_vert(m, x0, z0, u0, v0, tone);
+                ib = lawn_vert(m, x1, z0, u1, v0, tone);
+                ic = lawn_vert(m, x1, z1, u1, v1, tone);
+                id = lawn_vert(m, x0, z1, u0, v1, tone);
+            }
+            if (rot == 1) {
+                ia = lawn_vert(m, x0, z0, u1, v0, tone);
+                ib = lawn_vert(m, x1, z0, u1, v1, tone);
+                ic = lawn_vert(m, x1, z1, u0, v1, tone);
+                id = lawn_vert(m, x0, z1, u0, v0, tone);
+            }
+            if (rot == 2) {
+                ia = lawn_vert(m, x0, z0, u1, v1, tone);
+                ib = lawn_vert(m, x1, z0, u0, v1, tone);
+                ic = lawn_vert(m, x1, z1, u0, v0, tone);
+                id = lawn_vert(m, x0, z1, u1, v0, tone);
+            }
+            if (rot == 3) {
+                ia = lawn_vert(m, x0, z0, u0, v1, tone);
+                ib = lawn_vert(m, x1, z0, u0, v0, tone);
+                ic = lawn_vert(m, x1, z1, u1, v0, tone);
+                id = lawn_vert(m, x0, z1, u1, v1, tone);
+            }
+            // split the quad along the shorter diagonal of the SHADE, so the
+            // gradient does not develop a visible seam across every cell
+            mesh_tri(m, ia, ib, ic);
+            mesh_tri(m, ia, ic, id);
+            sy = sy + ground_h(x0, z0);
+        }
+    }
+    mesh_end(m);
+    g_lawn.push(m);
+    let half: f64 = f64(LAWN_CX) * cw * 0.5;
+    g_lawn_cx.push(bx + half);
+    g_lawn_cy.push(sy / f64(LAWN_CX * LAWN_CZ));
+    g_lawn_cz.push(bz + f64(LAWN_CZ) * cw * 0.5);
+    g_lawn_r.push(half * 1.5 + 2.0);
+}
+
+// The far skirt: coarse 8 m cells out to 60 m so the lawn reaches the treeline
+// and no sky ever shows under the horizon. Warp does not matter out here.
+fn build_lawn_skirt() {
+    let m = mesh_new(300);
+    mesh_begin(m);
+    let step: f64 = 8.0;
+    let inx0: f64 = LAWN_X0;
+    let inx1: f64 = LAWN_X0 + f64(LAWN_NX * LAWN_CX) * LAWN_CELL;
+    let inz0: f64 = LAWN_Z0;
+    let inz1: f64 = LAWN_Z0 + f64(LAWN_NZ * LAWN_CZ) * LAWN_CELL;
+    let n: i32 = 0;
+    for (let j = 0; j < 18; j++) {
+        for (let i = 0; i < 18; i++) {
+            let x0: f64 = 0.0 - 72.0 + f64(i) * step;
+            let z0: f64 = 0.0 - 66.0 + f64(j) * step;
+            let x1: f64 = x0 + step;
+            let z1: f64 = z0 + step;
+            // skip anything the fine lawn already covers
+            if (x1 > inx0) { if (x0 < inx1) { if (z1 > inz0) { if (z0 < inz1) { continue; } } } }
+            if (n >= 290) { continue; }
+            n++;
+            let tone: f64 = mow_tone(i * 4, j * 4) * 0.96;
+            let uv = UV_GRASS_A;
+            if (((i + j) & 1) == 1) { uv = UV_GRASS_B; }
+            let ia: i32 = lawn_vert(m, x0, z0, uv[0], uv[1], tone);
+            let ib: i32 = lawn_vert(m, x1, z0, uv[2], uv[1], tone);
+            let ic: i32 = lawn_vert(m, x1, z1, uv[2], uv[3], tone);
+            let id: i32 = lawn_vert(m, x0, z1, uv[0], uv[3], tone);
+            mesh_tri(m, ia, ib, ic);
+            mesh_tri(m, ia, ic, id);
+        }
+    }
+    mesh_end(m);
+    g_skirt = m;
+}
+
+// ===========================================================================
+// GROUND DECALS — driveway, mulch bed, bed edges
+// ===========================================================================
+// Coplanar with the lawn. Lifted 4 cm so they never poke through a lawn vertex,
+// and then ORDERED by hand at emit time (see yw_depth_bias in the demo): a 4 cm
+// lift is worth about a tenth of a sort bucket, which is not ordering.
+
+let g_drive = null;
+let g_mulch = null;
+
+let DECAL_LIFT: f64 = 0.04;
+
+fn decal_vert(p_m, p_x: f64, p_z: f64, p_u: f64, p_v: f64,
+              p_k: f64, p_r: i32, p_g: i32, p_b: i32): i32 {
+    let s: f64 = yw_shade(p_x, p_z) * p_k;
+    let r: i32 = cl255(i32(f64(p_r) * s));
+    let g: i32 = cl255(i32(f64(p_g) * s));
+    let b: i32 = cl255(i32(f64(p_b) * s));
+    let out: i32 = mesh_vert(p_m, p_x, ground_h(p_x, p_z) + ground_far(p_x, p_z) + DECAL_LIFT, p_z,
+                             p_u, p_v, r, g, b);
+    return out;
+}
+
+// The driveway: a curve of quads from the right edge of the frame in to the
+// garage apron, widening as it arrives. Built as a swept strip so the curve is
+// real geometry rather than a rectangle pretending.
+// Placed so the visible wedge of it enters at the RIGHT EDGE of the hero frame
+// at about mid height and runs in to the garage apron, which is where the
+// photograph puts it. (At 20 m out with a 74 degree horizontal field, the right
+// edge of the frame is at x = 8.5 when z = 10 and x = 20 when z = 0 — the
+// driveway has to hug that line or it is simply not in the picture.)
+let g_dv_x: array<f64> = [18.8, 16.6, 14.6, 13.0, 11.9, 11.2, 11.1];
+let g_dv_z: array<f64> = [12.8, 10.2, 7.8, 6.0, 4.6, 3.6, 3.05];
+let g_dv_w: array<f64> = [2.20, 2.20, 2.20, 2.10, 1.85, 1.55, 1.40];
+
+fn build_driveway() {
+    let n: i32 = g_dv_x.length;
+    let m = mesh_new((n - 1) * 3 * 2 + 8);
+    mesh_begin(m);
+    for (let i = 0; i < n - 1; i++) {
+        // segment normal in the ground plane
+        let dx: f64 = g_dv_x[i + 1] - g_dv_x[i];
+        let dz: f64 = g_dv_z[i + 1] - g_dv_z[i];
+        let l: f64 = sqrt(dx * dx + dz * dz);
+        let nx: f64 = 0.0 - dz / l;
+        let nz: f64 = dx / l;
+        // three lanes across so the affine warp stays small on a 4 m-wide strip
+        for (let k = 0; k < 3; k++) {
+            let f0: f64 = 0.0 - 1.0 + f64(k) * 0.6666666666666666;
+            let f1: f64 = f0 + 0.6666666666666666;
+            let ax: f64 = g_dv_x[i] + nx * g_dv_w[i] * f0;
+            let az: f64 = g_dv_z[i] + nz * g_dv_w[i] * f0;
+            let bx: f64 = g_dv_x[i] + nx * g_dv_w[i] * f1;
+            let bz: f64 = g_dv_z[i] + nz * g_dv_w[i] * f1;
+            let cx: f64 = g_dv_x[i + 1] + nx * g_dv_w[i + 1] * f1;
+            let cz: f64 = g_dv_z[i + 1] + nz * g_dv_w[i + 1] * f1;
+            let dx2: f64 = g_dv_x[i + 1] + nx * g_dv_w[i + 1] * f0;
+            let dz2: f64 = g_dv_z[i + 1] + nz * g_dv_w[i + 1] * f0;
+            let u0: f64 = UV_ASPHALT[0]; let v0: f64 = UV_ASPHALT[1];
+            let u1: f64 = UV_ASPHALT[2]; let v1: f64 = UV_ASPHALT[3];
+            // the outer lanes are grubbier where grass creeps in
+            let edge: f64 = 1.0;
+            if (k == 0) { edge = 0.86; }
+            if (k == 2) { edge = 0.88; }
+            let ia: i32 = decal_vert(m, ax, az, u0, v0, edge, 255, 255, 255);
+            let ib: i32 = decal_vert(m, bx, bz, u1, v0, 1.0, 255, 255, 255);
+            let ic: i32 = decal_vert(m, cx, cz, u1, v1, 1.0, 255, 255, 255);
+            let id: i32 = decal_vert(m, dx2, dz2, u0, v1, edge, 255, 255, 255);
+            mesh_tri(m, ia, ib, ic);
+            mesh_tri(m, ia, ic, id);
+        }
+    }
+    mesh_end(m);
+    g_drive = m;
+}
+
+// The mulch bed, lower right: an irregular fan around a centre so the outline is
+// a curve and not a rectangle. Dark brown, with a darker rim where it is cut in.
+// Bottom-right corner of the hero frame: near the camera and to its right.
+let MULCH_X: f64 = 1.35;
+let MULCH_Z: f64 = 15.90;
+
+fn build_mulch() {
+    let segs: i32 = 11;
+    let m = mesh_new(segs * 2 + 4);
+    mesh_begin(m);
+    let cx: f64 = MULCH_X;
+    let cz: f64 = MULCH_Z;
+    let ic: i32 = decal_vert(m, cx, cz, (UV_MULCH[0] + UV_MULCH[2]) * 0.5,
+                             (UV_MULCH[1] + UV_MULCH[3]) * 0.5, 1.0, 255, 255, 255);
+    let first: i32 = 0;
+    let prev: i32 = 0;
+    for (let s = 0; s <= segs; s++) {
+        let th: f64 = f64(s) * 6.283185307179586 / f64(segs);
+        let rr: f64 = 1.30 + 0.42 * sin(th * 2.0 + 0.7) + 0.20 * sin(th * 3.0);
+        let x: f64 = cx + cos(th) * rr * 1.30;
+        let z: f64 = cz + sin(th) * rr * 0.86;
+        let u: f64 = UV_MULCH[0] + (UV_MULCH[2] - UV_MULCH[0]) * (0.5 + cos(th) * 0.5);
+        let v: f64 = UV_MULCH[1] + (UV_MULCH[3] - UV_MULCH[1]) * (0.5 + sin(th) * 0.5);
+        let iv: i32 = decal_vert(m, x, z, u, v, 0.72, 255, 255, 255);
+        if (s == 0) { first = iv; }
+        else { mesh_tri(m, ic, prev, iv); }
+        prev = iv;
+    }
+    mesh_end(m);
+    g_mulch = m;
+}
+
+// ===========================================================================
+// THE FOREGROUND TREE — the strongest object in the picture
+// ===========================================================================
+// The viewer is standing UNDER it. The trunk is about 0.62 m across at the root
+// flare and passes within a few metres of the eye, so it is the one piece of
+// geometry in this scene that has to survive being looked at closely: a real
+// taper, a root flare, a lean, per-side cylindrical shading, and a fork.
+
+let g_trunk_a = null;
+let g_trunk_b = null;
+
+// Trunk profile: y, radius, and a lean offset in x/z. Nine sides — an odd count
+// so no facet ever presents itself flat-on and turns the trunk into a plank.
+let TRUNK_SIDES: i32 = 9;
+
+fn trunk_ring_x(p_y: f64, p_lean: f64): f64 { let o: f64 = p_lean * p_y * p_y * 0.016; return o; }
+
+fn build_trunk(p_h: f64, p_r0: f64, p_lean: f64, p_seed: i32, p_dark: f64) {
+    let sides: i32 = TRUNK_SIDES;
+    let rings: i32 = 6;
+    let ry: array<f64> = [0.0, 0.30, 1.15, 2.45, 3.95, 5.40];
+    let rr: array<f64> = [1.00, 0.66, 0.556, 0.508, 0.468, 0.418];
+    let m = mesh_new(sides * (rings - 1) * 2 + sides * 2 + 200);
+    mesh_begin(m);
+    let u0: f64 = UV_BARK[0]; let v0: f64 = UV_BARK[1];
+    let u1: f64 = UV_BARK[2]; let v1: f64 = UV_BARK[3];
+    // per-(ring, side) radius jitter, cached so the two triangles of a face agree
+    let idx: array<i32> = [];
+    for (let r = 0; r < rings; r++) {
+        let y: f64 = ry[r] * (p_h / 5.40);
+        let rad: f64 = rr[r] * p_r0;
+        let lx: f64 = trunk_ring_x(y, p_lean);
+        let lz: f64 = trunk_ring_x(y, p_lean * 0.36);
+        // the vertical span of bark this ring maps to
+        let vv: f64 = v0 + (v1 - v0) * (f64(r & 1));
+        for (let s = 0; s <= sides; s++) {
+            let si: i32 = s % sides;
+            let th: f64 = f64(si) * 6.283185307179586 / f64(sides);
+            let jit: f64 = 1.0 + (h01(si * 13 + p_seed, r * 7 + 3) - 0.5) * 0.16;
+            // the root flare is lumpier than the rest
+            if (r == 0) { jit = jit + (h01(si * 29 + p_seed, 91) - 0.4) * 0.34; }
+            let cth: f64 = cos(th);
+            let sth: f64 = sin(th);
+            let x: f64 = lx + cth * rad * jit;
+            let z: f64 = lz + sth * rad * jit;
+            // CYLINDRICAL SHADING. The sun is high and behind-left of the eye,
+            // so the left flank of the trunk is lit and the right is nearly
+            // black. This is what makes a nine-sided tube read as round, and it
+            // has to use the FULL range: the earlier version squared N.L and
+            // spent the whole trunk between 0.20 and 0.56, which rendered as a
+            // flat brown pole.
+            let raw: f64 = cth * SUN_X + sth * SUN_Z;
+            let nd: f64 = 0.0;
+            if (raw > 0.0) { nd = raw / 0.69115845; }   // |(SUN_X, SUN_Z)|
+            let k: f64 = (0.26 + 0.86 * nd) * p_dark;
+            // ambient occlusion at the base and where the canopy shades it
+            let ao: f64 = 0.68 + 0.32 * cl01(y / (p_h * 0.45));
+            if (y > p_h * 0.72) { ao = ao * (1.0 - 0.18 * cl01((y - p_h * 0.72) / (p_h * 0.3))); }
+            let kk: f64 = cl01(k * ao);
+            let cr: i32 = cl255(i32(255.0 * kk));
+            let cg: i32 = cl255(i32(252.0 * kk));
+            let cb: i32 = cl255(i32(246.0 * kk * (1.0 + (1.0 - kk) * 0.10)));
+            // u walks around the trunk; flipping every other face stops the
+            // bark tile reading as nine identical strips
+            let uu: f64 = u0;
+            if ((si & 1) == 1) { uu = u1; }
+            let vi: i32 = mesh_vert(m, x, y, z, uu, vv, cr, cg, cb);
+            idx.push(vi);
+        }
+    }
+    let per: i32 = sides + 1;
+    for (let r = 0; r < rings - 1; r++) {
+        for (let s = 0; s < sides; s++) {
+            let a: i32 = idx[r * per + s];
+            let b: i32 = idx[r * per + s + 1];
+            let c: i32 = idx[(r + 1) * per + s + 1];
+            let d: i32 = idx[(r + 1) * per + s];
+            mesh_tri(m, a, b, c);
+            mesh_tri(m, a, c, d);
+        }
+    }
+
+    // THE FORK. The reference has an unmistakable split about a third of the
+    // way up, and without it a trunk is a telegraph pole. Four primaries and
+    // three secondaries, all inside the same mesh so the tree stays ONE
+    // instance and one contiguous run of triangles.
+    let h: f64 = p_h;
+    let rb: f64 = p_r0;
+    let lx0: f64 = trunk_ring_x(h * 0.60, p_lean);
+    let lz0: f64 = trunk_ring_x(h * 0.60, p_lean * 0.36);
+    let lx1: f64 = trunk_ring_x(h * 0.80, p_lean);
+    let lz1: f64 = trunk_ring_x(h * 0.80, p_lean * 0.36);
+    let lxT: f64 = trunk_ring_x(h, p_lean);
+    let lzT: f64 = trunk_ring_x(h, p_lean * 0.36);
+    // the big up-left primary — the one that reads as the fork
+    add_limb(m, lx0, h * 0.60, lz0, lx0 - 2.55 * rb * 6.0, h + 2.30, lz0 - 1.10 * rb * 6.0,
+             rb * 0.46, rb * 0.20, p_seed + 3, p_dark);
+    // up-right
+    add_limb(m, lx0 + rb * 0.2, h * 0.66, lz0, lx0 + 2.30 * rb * 6.0, h + 1.85, lz0 + 1.60 * rb * 6.0,
+             rb * 0.40, rb * 0.17, p_seed + 9, p_dark);
+    // back-right, into the depth of the crown
+    add_limb(m, lx1, h * 0.80, lz1, lx1 + 1.30 * rb * 6.0, h + 2.75, lz1 - 2.35 * rb * 6.0,
+             rb * 0.34, rb * 0.15, p_seed + 15, p_dark);
+    // the leader: the trunk carrying on up
+    add_limb(m, lxT, h * 0.97, lzT, lxT - 0.55 * rb * 6.0, h + 3.30, lzT + 0.65 * rb * 6.0,
+             rb * 0.40, rb * 0.16, p_seed + 21, p_dark);
+    // secondaries off the two big primaries
+    add_limb(m, lx0 - 1.30 * rb * 6.0, h + 0.95, lz0 - 0.55 * rb * 6.0,
+             lx0 - 2.90 * rb * 6.0, h + 2.90, lz0 + 0.80 * rb * 6.0,
+             rb * 0.22, rb * 0.10, p_seed + 27, p_dark);
+    add_limb(m, lx0 + 1.20 * rb * 6.0, h + 0.80, lz0 + 0.85 * rb * 6.0,
+             lx0 + 2.10 * rb * 6.0, h + 2.95, lz0 + 0.10 * rb * 6.0,
+             rb * 0.20, rb * 0.09, p_seed + 33, p_dark);
+    add_limb(m, lxT - 0.30 * rb * 6.0, h + 1.60, lzT + 0.35 * rb * 6.0,
+             lxT + 1.20 * rb * 6.0, h + 3.60, lzT + 1.40 * rb * 6.0,
+             rb * 0.18, rb * 0.08, p_seed + 39, p_dark);
+
+    mesh_end(m);
+    let out = m;
+    return out;
+}
+
+// A tapered limb: a 5-sided tube from (x0,y0,z0) to (x1,y1,z1).
+fn add_limb(p_m, p_x0: f64, p_y0: f64, p_z0: f64,
+            p_x1: f64, p_y1: f64, p_z1: f64,
+            p_r0: f64, p_r1: f64, p_seed: i32, p_dark: f64) {
+    let m = p_m;
+    let sides: i32 = 5;
+    let dx: f64 = p_x1 - p_x0; let dy: f64 = p_y1 - p_y0; let dz: f64 = p_z1 - p_z0;
+    let l: f64 = sqrt(dx * dx + dy * dy + dz * dz);
+    let ax: f64 = dx / l; let ay: f64 = dy / l; let az: f64 = dz / l;
+    // any two vectors perpendicular to the axis
+    let ux: f64 = 0.0 - ay; let uy: f64 = ax; let uz: f64 = 0.0;
+    let ul: f64 = sqrt(ux * ux + uy * uy + uz * uz);
+    if (ul < 0.001) { ux = 1.0; uy = 0.0; uz = 0.0; ul = 1.0; }
+    ux = ux / ul; uy = uy / ul; uz = uz / ul;
+    let wx: f64 = ay * uz - az * uy;
+    let wy: f64 = az * ux - ax * uz;
+    let wz: f64 = ax * uy - ay * ux;
+    let u0: f64 = UV_BARK[0]; let v0: f64 = UV_BARK[1];
+    let u1: f64 = UV_BARK[2]; let v1: f64 = UV_BARK[3];
+    let ring0: array<i32> = [];
+    let ring1: array<i32> = [];
+    for (let s = 0; s <= sides; s++) {
+        let si: i32 = s % sides;
+        let th: f64 = f64(si) * 6.283185307179586 / f64(sides);
+        let ct: f64 = cos(th); let st: f64 = sin(th);
+        let ox: f64 = ux * ct + wx * st;
+        let oy: f64 = uy * ct + wy * st;
+        let oz: f64 = uz * ct + wz * st;
+        let ndl: f64 = ox * SUN_X + oy * SUN_Y + oz * SUN_Z;
+        if (ndl < 0.0) { ndl = 0.0; }
+        let uu: f64 = u0; if ((si & 1) == 1) { uu = u1; }
+        for (let e = 0; e < 2; e++) {
+            let rad: f64 = p_r0; let px: f64 = p_x0; let py: f64 = p_y0; let pz: f64 = p_z0;
+            if (e == 1) { rad = p_r1; px = p_x1; py = p_y1; pz = p_z1; }
+            let jit: f64 = 1.0 + (h01(si * 17 + p_seed, e * 5 + 1) - 0.5) * 0.22;
+            let k: f64 = cl01((0.18 + 0.88 * ndl * ndl) * p_dark);
+            let cr: i32 = cl255(i32(255.0 * k));
+            let cg: i32 = cl255(i32(250.0 * k));
+            let cb: i32 = cl255(i32(242.0 * k));
+            let vv: f64 = v0; if (e == 1) { vv = v1; }
+            let vi: i32 = mesh_vert(m, px + ox * rad * jit, py + oy * rad * jit,
+                                    pz + oz * rad * jit, uu, vv, cr, cg, cb);
+            if (e == 0) { ring0.push(vi); } else { ring1.push(vi); }
+        }
+    }
+    for (let s = 0; s < sides; s++) {
+        mesh_tri(m, ring0[s], ring0[s + 1], ring1[s + 1]);
+        mesh_tri(m, ring0[s], ring1[s + 1], ring1[s]);
+    }
+}
+
+// Trunk + limbs for one tree, in ONE mesh so it is one instance.
+fn build_tree_wood(p_h: f64, p_r0: f64, p_lean: f64, p_seed: i32, p_dark: f64,
+                   p_nlimb: i32) {
+    let m = build_trunk(p_h, p_r0, p_lean, p_seed, p_dark);
+    let out = m;
+    return out;
+}
+
+// ===========================================================================
+// CANOPY — leaf-cluster billboards on an ellipsoid shell
+// ===========================================================================
+// Camera-facing cards. The viewer is under the canopy, so the cards nearest the
+// eye are metres across and fill the top of the frame; the far side of the
+// crown is small and dark. That parallax IS the canopy.
+
+let g_cl_x: array<f64> = [];
+let g_cl_y: array<f64> = [];
+let g_cl_z: array<f64> = [];
+let g_cl_s: array<f64> = [];
+let g_cl_t: array<f64> = [];        // tint 0..1
+let g_cl_k: array<i32> = [];        // which leaf card
+
+// The SHELL distribution above leaves the inside of the crown empty, which is
+// right when you are standing under it — you see the underside and the sky
+// through the gaps. From the street, though, the limbs reach out past the shell
+// and stick out of the foliage as bare sticks. This fills the volume the limbs
+// occupy without hand-placing a cluster on every branch tip.
+fn add_canopy_fill(p_cx: f64, p_cy: f64, p_cz: f64,
+                   p_rx: f64, p_ry: f64, p_rz: f64,
+                   p_n: i32, p_smin: f64, p_smax: f64, p_bright: f64) {
+    for (let i = 0; i < p_n; i++) {
+        let u: f64 = yw_rnd() * 6.283185307179586;
+        let v: f64 = yw_rnd() * 2.0 - 1.0;
+        let sxy: f64 = sqrt(1.0 - v * v);
+        let rad: f64 = 0.14 + yw_rnd() * 0.86;
+        let nx: f64 = sxy * cos(u);
+        let ny: f64 = v;
+        let nz: f64 = sxy * sin(u);
+        let x: f64 = p_cx + nx * p_rx * rad;
+        let y: f64 = p_cy + ny * p_ry * rad;
+        let z: f64 = p_cz + nz * p_rz * rad;
+        let s: f64 = p_smin + yw_rnd() * (p_smax - p_smin);
+        let ndl: f64 = nx * SUN_X + ny * SUN_Y + nz * SUN_Z;
+        if (ndl < 0.0) { ndl = 0.0; }
+        // interior foliage is shaded by the crown above it
+        let t: f64 = p_bright * (0.40 + 0.58 * ndl) * (0.78 + 0.30 * yw_rnd())
+                   * (0.74 + 0.26 * rad);
+        if (t > 1.0) { t = 1.0; }
+        g_cl_x.push(x); g_cl_y.push(y); g_cl_z.push(z);
+        g_cl_s.push(s); g_cl_t.push(t);
+        let kk: i32 = i32(yw_rnd() * 3.999);
+        if (rad < 0.55) { kk = 3; }
+        g_cl_k.push(kk);
+    }
+}
+
+fn add_canopy(p_cx: f64, p_cy: f64, p_cz: f64,
+              p_rx: f64, p_ry: f64, p_rz: f64,
+              p_n: i32, p_smin: f64, p_smax: f64, p_bright: f64) {
+    for (let i = 0; i < p_n; i++) {
+        // a point in the shell, biased outward so the crown is hollow-ish
+        let u: f64 = yw_rnd() * 6.283185307179586;
+        let v: f64 = yw_rnd() * 2.0 - 1.0;
+        let sxy: f64 = sqrt(1.0 - v * v);
+        let rad: f64 = 0.58 + yw_rnd() * 0.42;
+        let nx: f64 = sxy * cos(u);
+        let ny: f64 = v;
+        let nz: f64 = sxy * sin(u);
+        let x: f64 = p_cx + nx * p_rx * rad;
+        let y: f64 = p_cy + ny * p_ry * rad;
+        let z: f64 = p_cz + nz * p_rz * rad;
+        let s: f64 = p_smin + yw_rnd() * (p_smax - p_smin);
+        // SUNLIT TOPS. The crown is dark except where a cluster faces up-left
+        // into the sun. The ambient floor is high on purpose: leaves are
+        // translucent and a crown seen from underneath is lit THROUGH, not
+        // merely bounced into. With a low floor the whole canopy came out as a
+        // black cloud, which is the single most common way low-poly foliage
+        // fails.
+        let ndl: f64 = nx * SUN_X + ny * SUN_Y + nz * SUN_Z;
+        if (ndl < 0.0) { ndl = 0.0; }
+        let t: f64 = p_bright * (0.46 + 0.72 * ndl) * (0.80 + 0.34 * yw_rnd());
+        if (t > 1.0) { t = 1.0; }
+        g_cl_x.push(x); g_cl_y.push(y); g_cl_z.push(z);
+        g_cl_s.push(s); g_cl_t.push(t);
+        let kk: i32 = i32(yw_rnd() * 3.999);
+        // only the true underside of the crown gets the dark card
+        if (ny < 0.0 - 0.62) { kk = 3; }
+        g_cl_k.push(kk);
+    }
+}
+
+// ===========================================================================
+// SHRUBS — the bake-off
+// ===========================================================================
+// Four approaches, all built, so the demo can render them side by side:
+//   SHRUB_BB    1 camera-facing card                          2 tris
+//   SHRUB_CROSS 3 intersecting alpha planes                   6 tris
+//   SHRUB_SOLID a 7-sided x 3-ring opaque lump, jittered     42 tris
+//   SHRUB_PUFF  5 small cards clustered into a ball          10 tris
+// The chosen one for the foundation planting is recorded in yw_emit_shrubs.
+
+export let SHRUB_BB: i32 = 0;
+export let SHRUB_CROSS: i32 = 1;
+export let SHRUB_SOLID: i32 = 2;
+export let SHRUB_PUFF: i32 = 3;
+
+let g_shrub_cross = null;
+let g_shrub_solid = null;
+let g_cone_solid = null;
+
+// Profiles: height fraction, radius fraction. Boxwood first, arborvitae second.
+let YB_RY: array<f64> = [0.00, 0.28, 0.56, 0.80, 1.00];
+let YB_RR: array<f64> = [0.84, 1.00, 0.95, 0.70, 0.15];
+let YC_RY: array<f64> = [0.00, 0.20, 0.42, 0.62, 0.82, 1.00];
+let YC_RR: array<f64> = [0.78, 1.00, 0.92, 0.74, 0.48, 0.09];
+
+// Three intersecting alpha planes, unit size (1 m tall, centred on its base).
+fn build_shrub_cross() {
+    let m = mesh_new(8);
+    mesh_begin(m);
+    let u0: f64 = UV_BB_BALL[0]; let v0: f64 = UV_BB_BALL[1];
+    let u1: f64 = UV_BB_BALL[2]; let v1: f64 = UV_BB_BALL[3];
+    let h: f64 = 0.5;
+    for (let p = 0; p < 3; p++) {
+        let th: f64 = f64(p) * 1.0471975511965976;    // 60 degrees apart
+        let cx: f64 = cos(th) * h;
+        let cz: f64 = sin(th) * h;
+        // vertex colour: the plane facing the sun is brighter
+        let ndl: f64 = 0.0 - sin(th) * SUN_X + cos(th) * SUN_Z;
+        if (ndl < 0.0) { ndl = 0.0 - ndl; }
+        let k: f64 = cl01(0.58 + 0.42 * ndl);
+        let cr: i32 = cl255(i32(255.0 * k));
+        let cg: i32 = cl255(i32(255.0 * k));
+        let cb: i32 = cl255(i32(255.0 * k));
+        let ia: i32 = mesh_vert(m, 0.0 - cx, 1.0, 0.0 - cz, u0, v0, cr, cg, cb);
+        let ib: i32 = mesh_vert(m, cx, 1.0, cz, u1, v0, cr, cg, cb);
+        let ic: i32 = mesh_vert(m, cx, 0.0, cz, u1, v1, cl255(cr - 60), cl255(cg - 60), cl255(cb - 60));
+        let id: i32 = mesh_vert(m, 0.0 - cx, 0.0, 0.0 - cz, u0, v1, cl255(cr - 60), cl255(cg - 60), cl255(cb - 60));
+        mesh_tri(m, ia, ib, ic);
+        mesh_tri(m, ia, ic, id);
+    }
+    mesh_end(m);
+    g_shrub_cross = m;
+}
+
+// An opaque lump, built from an EXPLICIT profile — a list of (height fraction,
+// radius fraction) rings, closing to a point at the top. The first version used
+// an analytic squashed sphere and produced two defects at once: a pointed apex,
+// and an open top, because nothing capped the last ring. A profile table costs
+// nothing and is the only way to say "widest at 30 % of its height, and closed".
+//
+// Per-vertex radius jitter breaks the facet silhouette; baked N.L makes it
+// round; the AO term at the base is what makes it sit ON the lawn.
+fn build_blob(p_sides: i32, p_ry: array<f64>, p_rr: array<f64>,
+              p_rad: f64, p_hgt: f64,
+              p_jit: f64, p_seed: i32, p_uv: array<f64>) {
+    let sides: i32 = p_sides;
+    let rings: i32 = p_ry.length - 1;
+    let m = mesh_new(sides * rings * 2 + sides * 2 + 8);
+    mesh_begin(m);
+    let u0: f64 = p_uv[0]; let v0: f64 = p_uv[1];
+    let u1: f64 = p_uv[2]; let v1: f64 = p_uv[3];
+    let idx: array<i32> = [];
+    for (let r = 0; r <= rings; r++) {
+        let t: f64 = p_ry[r];
+        let y: f64 = t * p_hgt;
+        let prof: f64 = p_rr[r];
+        let rad: f64 = p_rad * prof;
+        for (let s = 0; s <= sides; s++) {
+            let si: i32 = s % sides;
+            let th: f64 = f64(si) * 6.283185307179586 / f64(sides)
+                        + f64(r) * 0.31;            // twist the rings apart
+            let jit: f64 = 1.0 + (h01(si * 23 + p_seed, r * 11 + 5) - 0.5) * p_jit;
+            let ct: f64 = cos(th); let st: f64 = sin(th);
+            let x: f64 = ct * rad * jit;
+            let z: f64 = st * rad * jit;
+            // the surface normal of a lump: mostly radial, more vertical on top
+            let ny: f64 = t * 1.5 - 0.25;
+            if (ny > 1.0) { ny = 1.0; }
+            let nl: f64 = sqrt(1.0 + ny * ny);
+            let ndl: f64 = (ct * SUN_X + ny * SUN_Y + st * SUN_Z) / nl;
+            if (ndl < 0.0) { ndl = 0.0; }
+            // AO: the bottom of a shrub is nearly black, and that is the single
+            // strongest cue that it is sitting ON something
+            let ao: f64 = 0.40 + 0.60 * smoothst(t * 1.25);
+            let k: f64 = cl01((0.32 + 0.80 * ndl) * ao);
+            let cr: i32 = cl255(i32(255.0 * k));
+            let cg: i32 = cl255(i32(254.0 * k));
+            let cb: i32 = cl255(i32(250.0 * k));
+            let uu: f64 = u0 + (u1 - u0) * (f64(si) / f64(sides));
+            let vv: f64 = v1 + (v0 - v1) * t;
+            let vi: i32 = mesh_vert(m, x, y, z, uu, vv, cr, cg, cb);
+            idx.push(vi);
+        }
+    }
+    let per: i32 = sides + 1;
+    for (let r = 0; r < rings; r++) {
+        for (let s = 0; s < sides; s++) {
+            let a: i32 = idx[r * per + s];
+            let b: i32 = idx[r * per + s + 1];
+            let c: i32 = idx[(r + 1) * per + s + 1];
+            let d: i32 = idx[(r + 1) * per + s];
+            mesh_tri(m, a, b, c);
+            mesh_tri(m, a, c, d);
+        }
+    }
+    mesh_end(m);
+    let out = m;
+    return out;
+}
+
+// ===========================================================================
+// PROPS — mailbox, neighbouring outbuilding, house massing stand-in
+// ===========================================================================
+
+let g_mailbox = null;
+let g_outbuilding = null;
+let g_outb_trim = null;
+let g_house = null;
+
+// A world-space box face with an explicit shade, four corners given.
+fn face4(p_m, p_ax: f64, p_ay: f64, p_az: f64,
+         p_bx: f64, p_by: f64, p_bz: f64,
+         p_cx: f64, p_cy: f64, p_cz: f64,
+         p_dx: f64, p_dy: f64, p_dz: f64,
+         p_uv: array<f64>, p_k: f64) {
+    let m = p_m;
+    let k: f64 = cl01(p_k);
+    let cr: i32 = cl255(i32(255.0 * k));
+    let cg: i32 = cl255(i32(255.0 * k));
+    let cb: i32 = cl255(i32(255.0 * k));
+    let u0: f64 = p_uv[0]; let v0: f64 = p_uv[1];
+    let u1: f64 = p_uv[2]; let v1: f64 = p_uv[3];
+    let ia: i32 = mesh_vert(m, p_ax, p_ay, p_az, u0, v1, cr, cg, cb);
+    let ib: i32 = mesh_vert(m, p_bx, p_by, p_bz, u1, v1, cr, cg, cb);
+    let ic: i32 = mesh_vert(m, p_cx, p_cy, p_cz, u1, v0, cr, cg, cb);
+    let id: i32 = mesh_vert(m, p_dx, p_dy, p_dz, u0, v0, cr, cg, cb);
+    mesh_tri(m, ia, ib, ic);
+    mesh_tri(m, ia, ic, id);
+}
+
+// Shade of an axis-aligned face given its outward normal — one place, so every
+// box in the yard is lit by the same sun.
+fn face_k(p_nx: f64, p_ny: f64, p_nz: f64, p_amb: f64): f64 {
+    let ndl: f64 = p_nx * SUN_X + p_ny * SUN_Y + p_nz * SUN_Z;
+    if (ndl < 0.0) { ndl = 0.0; }
+    let out: f64 = cl01(p_amb + (1.0 - p_amb) * ndl);
+    return out;
+}
+
+// An axis-aligned box, local coords, all six faces.
+fn add_box(p_m, p_x0: f64, p_y0: f64, p_z0: f64,
+           p_x1: f64, p_y1: f64, p_z1: f64,
+           p_uv: array<f64>, p_amb: f64, p_gain: f64) {
+    let x0: f64 = p_x0; let y0: f64 = p_y0; let z0: f64 = p_z0;
+    let x1: f64 = p_x1; let y1: f64 = p_y1; let z1: f64 = p_z1;
+    let g: f64 = p_gain;
+    face4(p_m, x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, p_uv, face_k(0.0, 0.0, 1.0, p_amb) * g);
+    face4(p_m, x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, p_uv, face_k(0.0, 0.0, 0.0 - 1.0, p_amb) * g);
+    face4(p_m, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, p_uv, face_k(1.0, 0.0, 0.0, p_amb) * g);
+    face4(p_m, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, p_uv, face_k(0.0 - 1.0, 0.0, 0.0, p_amb) * g);
+    face4(p_m, x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, p_uv, face_k(0.0, 1.0, 0.0, p_amb) * g);
+}
+
+fn build_mailbox() {
+    let m = mesh_new(40);
+    mesh_begin(m);
+    // post
+    add_box(m, 0.0 - 0.045, 0.0, 0.0 - 0.045, 0.045, 1.06, 0.045, UV_DARK, 0.34, 1.0);
+    // box, long axis along x (facing the street)
+    add_box(m, 0.0 - 0.11, 1.06, 0.0 - 0.24, 0.11, 1.32, 0.24, UV_WHITE, 0.36, 0.94);
+    // little arm
+    add_box(m, 0.0 - 0.14, 1.10, 0.20, 0.0 - 0.10, 1.24, 0.24, UV_DARK, 0.34, 1.0);
+    mesh_end(m);
+    g_mailbox = m;
+}
+
+// The neighbour's white outbuilding, far left, mostly hidden behind foliage.
+// Gable end toward the camera, grey roof, two black shutters. It only has to
+// survive being 30 m away and half occluded.
+fn build_outbuilding() {
+    let m = mesh_new(70);
+    mesh_begin(m);
+    let w: f64 = 3.1;
+    let d: f64 = 4.2;
+    let e: f64 = 2.55;
+    let rg: f64 = 3.85;
+    add_box(m, 0.0 - w, 0.0, 0.0 - d, w, e, d, UV_CLAP, 0.42, 1.0);
+    // gable ends (front +z, back -z)
+    let kg: f64 = face_k(0.0, 0.0, 1.0, 0.42);
+    let cr: i32 = cl255(i32(255.0 * kg));
+    let ia: i32 = mesh_vert(m, 0.0 - w, e, d, UV_CLAP[0], UV_CLAP[3], cr, cr, cr);
+    let ib: i32 = mesh_vert(m, w, e, d, UV_CLAP[2], UV_CLAP[3], cr, cr, cr);
+    let ic: i32 = mesh_vert(m, 0.0, rg, d, (UV_CLAP[0] + UV_CLAP[2]) * 0.5, UV_CLAP[1], cr, cr, cr);
+    mesh_tri(m, ia, ib, ic);
+    let kg2: f64 = face_k(0.0, 0.0, 0.0 - 1.0, 0.42);
+    let cr2: i32 = cl255(i32(255.0 * kg2));
+    let ja: i32 = mesh_vert(m, w, e, 0.0 - d, UV_CLAP[0], UV_CLAP[3], cr2, cr2, cr2);
+    let jb: i32 = mesh_vert(m, 0.0 - w, e, 0.0 - d, UV_CLAP[2], UV_CLAP[3], cr2, cr2, cr2);
+    let jc: i32 = mesh_vert(m, 0.0, rg, 0.0 - d, (UV_CLAP[0] + UV_CLAP[2]) * 0.5, UV_CLAP[1], cr2, cr2, cr2);
+    mesh_tri(m, ja, jb, jc);
+    // two roof slopes, with a small eave overhang
+    let ov: f64 = 0.24;
+    face4(m, 0.0 - w - ov, e - 0.08, d + ov, 0.0, rg, d + ov, 0.0, rg, 0.0 - d - ov,
+          0.0 - w - ov, e - 0.08, 0.0 - d - ov, UV_SHINGLE, face_k(0.0 - 0.66, 0.75, 0.0, 0.36));
+    face4(m, 0.0, rg, d + ov, w + ov, e - 0.08, d + ov, w + ov, e - 0.08, 0.0 - d - ov,
+          0.0, rg, 0.0 - d - ov, UV_SHINGLE, face_k(0.66, 0.75, 0.0, 0.36));
+    mesh_end(m);
+    g_outbuilding = m;
+
+    // ---- the openings, IN THEIR OWN MESH  [critic pass] ------------------
+    // These were in the mesh above, 9 cm proud of the gable end, and they were
+    // NOT SURVIVING THE SORT: the door came out as a black boomerang with a
+    // bite taken out of it and one of the two shutters vanished entirely.
+    //
+    // 9 cm is 1.6 sort buckets (the quantum is 118/2048 = 5.8 cm), so the
+    // offset itself was fine. What is not fine is that the key is the
+    // TRIANGLE CENTROID's view-space w, and the gable end is a 6.2 m wall cut
+    // into two big triangles: seen from 20 degrees off, one of those centroids
+    // is nearly two metres nearer the eye than the decal lying on it. The wall
+    // then sorts in FRONT of its own door over part of its area, and which part
+    // depends on where the bucket boundary falls — which is exactly the
+    // diagonal-bite shape it produced.
+    //
+    // Same disease as house_shell's applied trim, same cure: a separate mesh,
+    // emitted separately, with its keys pulled toward the camera by more than
+    // the worst centroid error. THE ENGINE HAS NO DEPTH BIAS; this is the third
+    // place in this demo that has had to invent one. See the report.
+    let t = mesh_new(24);
+    mesh_begin(t);
+    face4(t, 0.0 - 1.55, 1.05, d + 0.09, 0.0 - 1.20, 1.05, d + 0.09,
+          0.0 - 1.20, 1.85, d + 0.09, 0.0 - 1.55, 1.85, d + 0.09, UV_DARK, 0.72);
+    face4(t, 0.0 - 0.62, 1.05, d + 0.09, 0.0 - 0.28, 1.05, d + 0.09,
+          0.0 - 0.28, 1.85, d + 0.09, 0.0 - 0.62, 1.85, d + 0.09, UV_DARK, 0.72);
+    face4(t, 0.0 - 1.18, 1.05, d + 0.13, 0.0 - 0.66, 1.05, d + 0.13,
+          0.0 - 0.66, 1.88, d + 0.13, 0.0 - 1.18, 1.88, d + 0.13, UV_WHITE, 0.80);
+    face4(t, 0.72, 0.0, d + 0.09, 1.92, 0.0, d + 0.09,
+          1.92, 1.95, d + 0.09, 0.72, 1.95, d + 0.09, UV_DARK, 0.55);
+    mesh_end(t);
+    g_outb_trim = t;
+}
+
+// ---------------------------------------------------------------------------
+// THE HOUSE MASSING STAND-IN
+// ---------------------------------------------------------------------------
+// NOT MY HALF. This exists only so the yard can be judged in context and so the
+// painter's sort can be verified against something the tree actually crosses.
+// It is deliberately crude: correct silhouette, correct materials, no window
+// detail beyond dark rectangles. `yw_set_standin(0)` turns it off the moment
+// the house half has a real emitter.
+fn build_house_standin() {
+    let m = mesh_new(220);
+    mesh_begin(m);
+    let x0: f64 = HOUSE_X0; let x1: f64 = HOUSE_X1;
+    let z1: f64 = 0.0; let z0: f64 = 0.0 - HOUSE_DEPTH;
+    let brick: f64 = 1.70;
+    // brick wainscot across the bottom of the front wall
+    face4(m, x0, 0.0, z1, x1, 0.0, z1, x1, brick, z1, x0, brick, z1,
+          UV_BRICK, face_k(0.0, 0.0, 1.0, 0.44));
+    // white clapboard above it
+    face4(m, x0, brick, z1, x1, brick, z1, x1, HOUSE_EAVE, z1, x0, HOUSE_EAVE, z1,
+          UV_CLAP, face_k(0.0, 0.0, 1.0, 0.46));
+    // sides and back
+    face4(m, x1, 0.0, z1, x1, 0.0, z0, x1, HOUSE_EAVE, z0, x1, HOUSE_EAVE, z1,
+          UV_CLAP, face_k(1.0, 0.0, 0.0, 0.42));
+    face4(m, x0, 0.0, z0, x0, 0.0, z1, x0, HOUSE_EAVE, z1, x0, HOUSE_EAVE, z0,
+          UV_CLAP, face_k(0.0 - 1.0, 0.0, 0.0, 0.42));
+    face4(m, x1, 0.0, z0, x0, 0.0, z0, x0, HOUSE_EAVE, z0, x1, HOUSE_EAVE, z0,
+          UV_CLAP, face_k(0.0, 0.0, 0.0 - 1.0, 0.40));
+    // gable triangles + the two roof slopes, ridge along X
+    let zc: f64 = (z0 + z1) * 0.5;
+    let kgL: f64 = face_k(1.0, 0.0, 0.0, 0.44);
+    let cL: i32 = cl255(i32(255.0 * kgL));
+    let ga: i32 = mesh_vert(m, x1, HOUSE_EAVE, z1, UV_CLAP[0], UV_CLAP[3], cL, cL, cL);
+    let gb: i32 = mesh_vert(m, x1, HOUSE_EAVE, z0, UV_CLAP[2], UV_CLAP[3], cL, cL, cL);
+    let gc: i32 = mesh_vert(m, x1, HOUSE_RIDGE, zc, (UV_CLAP[0] + UV_CLAP[2]) * 0.5, UV_CLAP[1], cL, cL, cL);
+    mesh_tri(m, ga, gb, gc);
+    let kgR: f64 = face_k(0.0 - 1.0, 0.0, 0.0, 0.44);
+    let cR: i32 = cl255(i32(255.0 * kgR));
+    let ha: i32 = mesh_vert(m, x0, HOUSE_EAVE, z0, UV_CLAP[0], UV_CLAP[3], cR, cR, cR);
+    let hb: i32 = mesh_vert(m, x0, HOUSE_EAVE, z1, UV_CLAP[2], UV_CLAP[3], cR, cR, cR);
+    let hc: i32 = mesh_vert(m, x0, HOUSE_RIDGE, zc, (UV_CLAP[0] + UV_CLAP[2]) * 0.5, UV_CLAP[1], cR, cR, cR);
+    mesh_tri(m, ha, hb, hc);
+    let ov: f64 = 0.36;
+    face4(m, x0 - ov, HOUSE_EAVE - 0.10, z1 + ov, x1 + ov, HOUSE_EAVE - 0.10, z1 + ov,
+          x1 + ov, HOUSE_RIDGE, zc, x0 - ov, HOUSE_RIDGE, zc,
+          UV_SHINGLE, face_k(0.0, 0.80, 0.60, 0.34));
+    face4(m, x1 + ov, HOUSE_EAVE - 0.10, z0 - ov, x0 - ov, HOUSE_EAVE - 0.10, z0 - ov,
+          x0 - ov, HOUSE_RIDGE, zc, x1 + ov, HOUSE_RIDGE, zc,
+          UV_SHINGLE, face_k(0.0, 0.80, 0.0 - 0.60, 0.34));
+    // four upper windows with black shutters, two lower ones
+    for (let i = 0; i < 4; i++) {
+        let cx: f64 = x0 + 1.9 + f64(i) * 3.05;
+        face4(m, cx - 0.44, 3.60, z1 + 0.13, cx + 0.44, 3.60, z1 + 0.13,
+              cx + 0.44, 5.30, z1 + 0.13, cx - 0.44, 5.30, z1 + 0.13, UV_DARK, 0.82);
+        face4(m, cx - 0.74, 3.55, z1 + 0.09, cx - 0.46, 3.55, z1 + 0.09,
+              cx - 0.46, 5.35, z1 + 0.09, cx - 0.74, 5.35, z1 + 0.09, UV_DARK, 0.44);
+        face4(m, cx + 0.46, 3.55, z1 + 0.09, cx + 0.74, 3.55, z1 + 0.09,
+              cx + 0.74, 5.35, z1 + 0.09, cx + 0.46, 5.35, z1 + 0.09, UV_DARK, 0.44);
+    }
+    face4(m, x0 + 1.0, 1.85, z1 + 0.13, x0 + 3.6, 1.85, z1 + 0.13,
+          x0 + 3.6, 3.30, z1 + 0.13, x0 + 1.0, 3.30, z1 + 0.13, UV_DARK, 0.86);
+    face4(m, 2.15, 1.95, z1 + 0.13, 3.35, 1.95, z1 + 0.13,
+          3.35, 3.30, z1 + 0.13, 2.15, 3.30, z1 + 0.13, UV_DARK, 0.84);
+    // entry: a dark recess and two white posts under a shed roof
+    face4(m, 0.0 - 0.60, 0.0, z1 + 0.09, 0.60, 0.0, z1 + 0.09,
+          0.60, 2.35, z1 + 0.09, 0.0 - 0.60, 2.35, z1 + 0.09, UV_DARK, 0.30);
+    add_box(m, 0.0 - 1.34, 0.0, z1 + 1.15, 0.0 - 1.18, 2.62, z1 + 1.31, UV_WHITE, 0.50, 1.0);
+    add_box(m, 1.18, 0.0, z1 + 1.15, 1.34, 2.62, z1 + 1.31, UV_WHITE, 0.50, 1.0);
+    face4(m, 0.0 - 1.52, 2.62, z1 + 1.48, 1.52, 2.62, z1 + 1.48,
+          1.52, 2.94, z1, 0.0 - 1.52, 2.94, z1, UV_SHINGLE, face_k(0.0, 0.86, 0.5, 0.36));
+    // chimney: red brick, exterior, past the ridge. Second most important
+    // silhouette in the photograph after the roof.
+    add_box(m, CHIM_X - 0.56, 0.0, 0.0 - 1.20, CHIM_X + 0.56, 10.05, 0.20, UV_BRICK, 0.40, 1.0);
+    face4(m, CHIM_X - 0.66, 10.05, 0.0 - 1.30, CHIM_X + 0.66, 10.05, 0.0 - 1.30,
+          CHIM_X + 0.66, 10.05, 0.30, CHIM_X - 0.66, 10.05, 0.30, UV_WHITE, 0.62);
+    // garage: projecting forward and right, its own gable, lower ridge
+    let gz1: f64 = GAR_Z; let gz0: f64 = 0.0 - 4.6;
+    let gzc: f64 = (gz0 + gz1) * 0.5;
+    face4(m, GAR_X0, 0.0, gz1, GAR_X1, 0.0, gz1, GAR_X1, 1.55, gz1, GAR_X0, 1.55, gz1,
+          UV_BRICK, face_k(0.0, 0.0, 1.0, 0.44));
+    face4(m, GAR_X0, 1.55, gz1, GAR_X1, 1.55, gz1, GAR_X1, GAR_EAVE, gz1, GAR_X0, GAR_EAVE, gz1,
+          UV_CLAP, face_k(0.0, 0.0, 1.0, 0.46));
+    face4(m, GAR_X1, 0.0, gz1, GAR_X1, 0.0, gz0, GAR_X1, GAR_EAVE, gz0, GAR_X1, GAR_EAVE, gz1,
+          UV_CLAP, face_k(1.0, 0.0, 0.0, 0.42));
+    let kg3: f64 = face_k(0.0, 0.0, 1.0, 0.44);
+    let c3: i32 = cl255(i32(255.0 * kg3));
+    let qa: i32 = mesh_vert(m, GAR_X0, GAR_EAVE, gz1, UV_CLAP[0], UV_CLAP[3], c3, c3, c3);
+    let qb: i32 = mesh_vert(m, GAR_X1, GAR_EAVE, gz1, UV_CLAP[2], UV_CLAP[3], c3, c3, c3);
+    let qc: i32 = mesh_vert(m, (GAR_X0 + GAR_X1) * 0.5, GAR_RIDGE, gz1,
+                            (UV_CLAP[0] + UV_CLAP[2]) * 0.5, UV_CLAP[1], c3, c3, c3);
+    mesh_tri(m, qa, qb, qc);
+    face4(m, GAR_X0 - 0.3, GAR_EAVE - 0.08, gz1 + 0.3, (GAR_X0 + GAR_X1) * 0.5, GAR_RIDGE, gz1 + 0.3,
+          (GAR_X0 + GAR_X1) * 0.5, GAR_RIDGE, gz0, GAR_X0 - 0.3, GAR_EAVE - 0.08, gz0,
+          UV_SHINGLE, face_k(0.0 - 0.6, 0.78, 0.0, 0.34));
+    face4(m, (GAR_X0 + GAR_X1) * 0.5, GAR_RIDGE, gz1 + 0.3, GAR_X1 + 0.3, GAR_EAVE - 0.08, gz1 + 0.3,
+          GAR_X1 + 0.3, GAR_EAVE - 0.08, gz0, (GAR_X0 + GAR_X1) * 0.5, GAR_RIDGE, gz0,
+          UV_SHINGLE, face_k(0.6, 0.78, 0.0, 0.34));
+    // one wide white garage door + a carriage lantern above and left of it
+    face4(m, GAR_X0 + 0.70, 0.06, gz1 + 0.13, GAR_X1 - 0.70, 0.06, gz1 + 0.13,
+          GAR_X1 - 0.70, 2.55, gz1 + 0.13, GAR_X0 + 0.70, 2.55, gz1 + 0.13, UV_WHITE, 0.74);
+    add_box(m, GAR_X0 + 0.22, 2.70, gz1 + 0.09, GAR_X0 + 0.40, 3.02, gz1 + 0.22, UV_DARK, 0.40, 1.0);
+    mesh_end(m);
+    g_house = m;
+}
+
+// ===========================================================================
+// SCENE ASSEMBLY
+// ===========================================================================
+
+// foundation planting: x, z, kind (0 boxwood, 1 arborvitae, 2 low spreader),
+// scale, yaw
+let g_pl_x: array<f64> = [];
+let g_pl_z: array<f64> = [];
+let g_pl_k: array<i32> = [];
+let g_pl_s: array<f64> = [];
+let g_pl_y: array<f64> = [];
+
+fn plant(p_x: f64, p_z: f64, p_k: i32, p_s: f64) {
+    g_pl_x.push(p_x); g_pl_z.push(p_z); g_pl_k.push(p_k); g_pl_s.push(p_s);
+    g_pl_y.push(yw_rnd() * 6.283185307179586);
+}
+
+// the background treeline / mid-ground trees: x, y, z, size, tint
+let g_bg_x: array<f64> = [];
+let g_bg_y: array<f64> = [];
+let g_bg_z: array<f64> = [];
+let g_bg_s: array<f64> = [];
+let g_bg_t: array<f64> = [];
+
+let g_standin: i32 = 1;
+export fn yw_set_standin(p_on: i32) { g_standin = p_on; }
+export fn yw_standin(): i32 { let o: i32 = g_standin; return o; }
+
+// TREE_A_R is the RADIUS at the root flare: 0.36 m gives a 0.72 m trunk, which
+// is the "roughly 0.5-0.7 m across" of the reference. It stands 4.7 m from the
+// eye, so this number is the most closely inspected dimension in the scene.
+export let TREE_A_H: f64 = 6.40;
+export let TREE_A_R: f64 = 0.36;
+export let TREE_B_H: f64 = 5.60;
+export let TREE_B_R: f64 = 0.30;
+
+// Everything is built ONCE, here. Nothing in the frame path allocates.
+export fn yw_build_world() {
+    yw_seed(0x2545F4914F6CDD1D);
+
+    for (let iz = 0; iz < LAWN_NZ; iz++) {
+        for (let ix = 0; ix < LAWN_NX; ix++) { build_lawn_chunk(ix, iz); }
+    }
+    build_lawn_skirt();
+    build_driveway();
+    build_mulch();
+
+    // --- the two trees ----------------------------------------------------
+    g_trunk_a = build_trunk(TREE_A_H, TREE_A_R, 0.9, 11, 1.0);
+    g_trunk_b = build_trunk(TREE_B_H, TREE_B_R, 0.0 - 1.4, 29, 0.92);
+
+    // --- shrub meshes: all four approaches ---------------------------------
+    // Boxwood: 8 sides x 4 rings = 64 triangles, widest at 30 % of its height,
+    // wider than it is tall (height 0.80 against a unit diameter), closed on top.
+    // Arborvitae: narrow, 0.38 unit diameter against unit height, so a scale of
+    // 2.6 gives a 2.6 m spire 1.0 m across — which is what an arborvitae is.
+    build_shrub_cross();
+    g_shrub_solid = build_blob(8, YB_RY, YB_RR, 0.50, 0.80, 0.22, 41, UV_SHRUB);
+    g_cone_solid = build_blob(7, YC_RY, YC_RR, 0.19, 1.00, 0.30, 67, UV_CONE);
+
+    build_mailbox();
+    build_outbuilding();
+    build_house_standin();
+
+    // --- canopies ----------------------------------------------------------
+    // Tree A: the viewer stands UNDER this one, four or five metres from the
+    // trunk, so its near clusters are two or three metres from the eye. Card
+    // SIZE is the whole argument here: at 2.3 m a card covered a quarter of the
+    // frame and 170 of them merged into one black cloud. At 1.1-2.2 m with
+    // twice as many, the gaps survive and the crown has depth.
+    // GEOMETRY OF BEING UNDERNEATH IT. With a 63 degree vertical field pitched
+    // up 10 degrees, the top of the frame is at about 42 degrees of elevation,
+    // so a leaf 7 m above the eye is only in shot if it is 8 m or more AWAY.
+    // A crown centred neatly over its own trunk 4 m in front of the camera is
+    // therefore entirely above the picture — which is exactly what the first
+    // attempt produced. The crown has to be LOW (its underside at 5 m, not 8)
+    // and it has to reach BACK OVER the viewer (rz 9.5, centred at z 14.5, so
+    // it spans z = 5 to 24 and the camera at z = 20.5 is inside it).
+    add_canopy(TREE_A_X - 0.5, 8.10, TREE_A_Z - 2.1, 8.4, 3.1, 9.5, 206, 1.32, 2.65, 1.0);
+    add_canopy(TREE_A_X + 0.7, 10.90, TREE_A_Z - 2.6, 6.4, 2.3, 6.4, 84, 1.27, 2.30, 1.12);
+    // the low skirt: the underside of the crown, and the part that is actually
+    // in the top of the hero frame
+    add_canopy(TREE_A_X - 0.2, 6.30, TREE_A_Z - 1.2, 7.0, 1.4, 8.4, 74, 1.21, 2.24, 0.80);
+    // A LOW OVERHANGING BRANCH dipping into the top of the frame right above the
+    // eye. The reference has exactly this and it is what sells "you are standing
+    // under a tree" rather than "there is a tree over there".
+    add_canopy(TREE_A_X + 1.4, 5.60, TREE_A_Z + 4.6, 3.6, 0.9, 3.4, 41, 0.98, 1.84, 0.86);
+    // A LIMB REACHING LEFT, bridging the two crowns. Without it the two trees
+    // leave a hole of open sky directly over the roof and the canopy stops
+    // reading as a ceiling.
+    add_canopy(TREE_A_X - 4.6, 9.40, TREE_A_Z - 1.8, 4.6, 1.7, 4.2, 65, 1.21, 2.30, 0.92);
+    add_canopy(TREE_A_X + 4.4, 8.90, TREE_A_Z - 0.6, 3.8, 1.5, 3.6, 48, 1.15, 2.19, 0.98);
+    // Tree B: frame left, canopy across the top-left corner
+    add_canopy(TREE_B_X, 8.30, TREE_B_Z + 0.6, 6.8, 3.0, 7.0, 125, 1.38, 2.70, 0.94);
+    add_canopy(TREE_B_X + 0.5, 10.60, TREE_B_Z, 5.2, 2.1, 5.0, 53, 1.32, 2.36, 1.04);
+    add_canopy(TREE_B_X, 6.40, TREE_B_Z + 1.0, 5.4, 1.3, 5.6, 41, 1.21, 2.13, 0.76);
+    add_canopy(TREE_B_X + 2.6, 5.90, TREE_B_Z + 5.2, 3.2, 0.9, 3.2, 31, 0.98, 1.78, 0.82);
+    // and the filled interior over the limbs of each tree
+    add_canopy_fill(TREE_A_X, TREE_A_H + 1.5, TREE_A_Z, 6.8, 2.7, 6.6, 104, 1.25, 2.30, 0.90);
+    add_canopy_fill(TREE_B_X, TREE_B_H + 1.4, TREE_B_Z, 5.4, 2.3, 5.2, 70, 1.25, 2.20, 0.86);
+
+    // --- foundation planting -----------------------------------------------
+    // Six boxwood balls along the facade, two narrow arborvitae standing taller
+    // (one by the entry, one by the garage), a larger shrub mass at the left
+    // corner, and a low spreader in the mulch bed.
+    // `scale` is the WIDTH in metres for a boxwood (the mesh is a unit diameter
+    // 0.80 tall) and the HEIGHT for an arborvitae (unit height, 0.38 across).
+    // against the main facade (z = 0)
+    plant(0.0 - 5.00, 0.62, 0, 2.55);           // big mass, left corner
+    plant(0.0 - 3.85, 0.58, 0, 1.45);
+    plant(0.0 - 2.80, 0.64, 0, 1.28);
+    plant(0.0 - 1.95, 0.56, 0, 1.15);           // left of the stoop
+    // against the cross gable and the link (z = +1.35)
+    plant(2.05, 1.95, 1, 2.95);                 // arborvitae by the entry
+    plant(3.20, 1.92, 0, 1.36);
+    plant(4.35, 1.96, 0, 1.24);
+    plant(5.45, 1.90, 0, 1.40);
+    plant(6.80, 1.93, 0, 1.20);
+    // against the garage (z = +3.05)
+    plant(8.85, 3.62, 1, 2.60);                 // arborvitae by the garage
+    plant(13.25, 2.70, 0, 1.55);                // garage right corner
+    plant(MULCH_X - 0.85, MULCH_Z + 0.20, 2, 1.05);
+    plant(MULCH_X + 0.80, MULCH_Z - 0.30, 2, 0.85);
+    plant(MULCH_X + 0.05, MULCH_Z + 0.62, 2, 0.72);
+
+    // --- background treeline ------------------------------------------------
+    // Closes the horizon so no sky ever appears under it, and gives the mid
+    // ground the dark mass the photograph has behind the roof.
+    // A BAND, not a ring. The first version swept an arc of radius 34-56 m
+    // about a point 12 m behind the house, which put 14 m cards at x = +/- 67
+    // and z = -15: right beside the camera, filling both frame edges with a
+    // wall of dark green. A treeline belongs behind the house and nowhere else.
+    for (let i = 0; i < 40; i++) {
+        let x: f64 = 0.0 - 58.0 + f64(i) * 2.95 + yw_rnds() * 1.8;
+        let z: f64 = 0.0 - 40.0 - yw_rnd() * 26.0;
+        let s: f64 = 5.0 + yw_rnd() * 9.0;
+        g_bg_x.push(x);
+        g_bg_y.push(ground_h(x, z) + ground_far(x, z) + s * 0.34);
+        g_bg_z.push(z);
+        g_bg_s.push(s);
+        g_bg_t.push(0.30 + yw_rnd() * 0.20);
+    }
+    // a second, deeper row so the band is not one card thick where it thins out
+    for (let i = 0; i < 22; i++) {
+        let x: f64 = 0.0 - 54.0 + f64(i) * 5.2 + yw_rnds() * 2.6;
+        let z: f64 = 0.0 - 66.0 - yw_rnd() * 16.0;
+        let s: f64 = 7.0 + yw_rnd() * 9.0;
+        g_bg_x.push(x);
+        g_bg_y.push(ground_h(x, z) + ground_far(x, z) + s * 0.32);
+        g_bg_z.push(z);
+        g_bg_s.push(s);
+        g_bg_t.push(0.26 + yw_rnd() * 0.14);
+    }
+    // four closer trees the eye can actually resolve: behind the garage, at the
+    // right edge past the driveway, behind the outbuilding, and one at far left
+    g_bg_x.push(19.5);  g_bg_z.push(0.0 - 16.0); g_bg_s.push(11.0);
+    g_bg_y.push(ground_h(19.5, 0.0 - 16.0) + ground_far(19.5, 0.0 - 16.0) + 5.8); g_bg_t.push(0.52);
+    g_bg_x.push(29.0);  g_bg_z.push(0.0 - 6.0);  g_bg_s.push(12.5);
+    g_bg_y.push(ground_h(29.0, 0.0 - 6.0) + 6.6); g_bg_t.push(0.58);
+    g_bg_x.push(0.0 - 29.0); g_bg_z.push(0.0 - 18.0); g_bg_s.push(12.0);
+    g_bg_y.push(ground_h(0.0 - 29.0, 0.0 - 18.0) + ground_far(0.0 - 29.0, 0.0 - 18.0) + 6.4); g_bg_t.push(0.44);
+    g_bg_x.push(0.0 - 15.0); g_bg_z.push(0.0 - 14.0); g_bg_s.push(8.0);
+    g_bg_y.push(ground_h(0.0 - 15.0, 0.0 - 14.0) + ground_far(0.0 - 15.0, 0.0 - 14.0) + 4.4); g_bg_t.push(0.50);
+
+    // A LOW HEDGE LINE along the far edge of the lawn, left and right of the
+    // house. Without it the flat pad meets the treeline in a ruler-straight
+    // horizon across half the frame, which no amount of texture detail hides.
+    for (let i = 0; i < 26; i++) {
+        let x: f64 = 0.0 - 34.0 + f64(i) * 2.6 + yw_rnds() * 0.9;
+        if (x > 0.0 - 8.5) { if (x < 14.5) { continue; } }
+        let z: f64 = 0.0 - 8.0 - yw_rnd() * 7.0;
+        let s: f64 = 2.4 + yw_rnd() * 2.6;
+        g_bg_x.push(x);
+        g_bg_y.push(ground_h(x, z) + ground_far(x, z) + s * 0.36);
+        g_bg_z.push(z);
+        g_bg_s.push(s);
+        g_bg_t.push(0.50 + yw_rnd() * 0.24);
+    }
+}
+
+// ===========================================================================
+// COUNTS — for the report
+// ===========================================================================
+export fn yw_cluster_count(): i32 { let o: i32 = g_cl_x.length; return o; }
+export fn yw_plant_count(): i32 { let o: i32 = g_pl_x.length; return o; }
+export fn yw_bg_count(): i32 { let o: i32 = g_bg_x.length; return o; }
+export fn yw_lawn_chunks(): i32 { let o: i32 = g_lawn.length; return o; }
+export fn yw_mesh_tris(): i32 {
+    let n: i32 = 0;
+    for (let i = 0; i < g_lawn.length; i++) { n = n + mesh_tri_count(g_lawn[i]); }
+    n = n + mesh_tri_count(g_skirt) + mesh_tri_count(g_drive) + mesh_tri_count(g_mulch);
+    n = n + mesh_tri_count(g_trunk_a) + mesh_tri_count(g_trunk_b);
+    n = n + mesh_tri_count(g_shrub_solid) + mesh_tri_count(g_cone_solid);
+    n = n + mesh_tri_count(g_shrub_cross) + mesh_tri_count(g_mailbox);
+    n = n + mesh_tri_count(g_outbuilding) + mesh_tri_count(g_outb_trim) + mesh_tri_count(g_house);
+    let o: i32 = n;
+    return o;
+}
+export fn yw_house_tris(): i32 { let o: i32 = mesh_tri_count(g_house); return o; }
+export fn yw_shrub_tris(p_kind: i32): i32 {
+    if (p_kind == SHRUB_BB) { let a: i32 = 2; return a; }
+    if (p_kind == SHRUB_CROSS) { let b: i32 = mesh_tri_count(g_shrub_cross); return b; }
+    if (p_kind == SHRUB_SOLID) { let c: i32 = mesh_tri_count(g_shrub_solid); return c; }
+    let d: i32 = 10;
+    return d;
+}
+
+// ===========================================================================
+// EMIT
+// ===========================================================================
+// Everything goes into ONE world batch and is bucket-sorted together, so the
+// tree in front of the house, the shrubs against the wall and the shadow under
+// the mailbox all resolve against each other with no z-buffer.
+//
+// WINDING. Every closed solid here is wound so that, viewed from OUTSIDE in the
+// world (Y up, right-handed), the outward face runs a -> b -> c anticlockwise.
+// Screen y points DOWN, which flips the handedness, so on screen those faces
+// have a NEGATIVE signed area and the correct cull mode is MESH_CULL_POS
+// ("drop triangles whose screen signed area >= 0"), not MESH_CULL_NEG.
+// Getting this backwards is not a subtle defect and it does not look like one:
+// the front wall of the house was being culled and the BACK roof slope drawn
+// through the hole, which reads as "the roof is too big" rather than as a
+// winding bug. It cost a careful projection of three points by hand to find.
+//
+// Order of emission does not matter (the sort owns it) EXCEPT for the ground
+// decals, whose depth keys are pulled toward the camera afterwards.
+
+// Pull the depth keys of triangles [from, to) toward the camera. THE ENGINE HAS
+// NO OTHER WAY TO ORDER A COPLANAR DECAL: mesh.hml computes the key itself from
+// the transformed w and takes no bias parameter, and a geometric lift of 4 cm
+// is worth about a tenth of a sort bucket. Reported as a gap.
+// SIZING THE BIAS. A lawn cell is 2 m, so the centroid of the lawn triangle a
+// shadow lies on can be a metre nearer or farther than the shadow's own
+// centroid. A bias smaller than that loses the coin flip some of the time and
+// the shadow disappears under the grass — which is exactly the failure the
+// contact shadow exists to prevent. 1.4 m clears one whole cell.
+export fn yw_depth_bias(p_b, p_from: i32, p_to: i32, p_k: f64) {
+    let d: array<f64> = p_b.depth;
+    let k: f64 = p_k;
+    let i: i32 = p_from;
+    let n: i32 = p_to;
+    while (i < n) {
+        let v: f64 = d[i] - k;
+        if (v < 0.05) { v = 0.05; }
+        d[i] = v;
+        i++;
+    }
+}
+
+fn bcount(p_b): i32 { let o: i32 = p_b.n; return o; }
+
+// --- ground ---------------------------------------------------------------
+export fn yw_emit_ground(p_b, p_tex, p_frustum: array<f64>): i32 {
+    mesh_set_cull(MESH_CULL_OFF);
+    let n: i32 = 0;
+    for (let i = 0; i < g_lawn.length; i++) {
+        if (frustum_sphere(p_frustum, g_lawn_cx[i], g_lawn_cy[i], g_lawn_cz[i], g_lawn_r[i]) == 0) {
+            continue;
+        }
+        n = n + mesh_emit_yaw(g_lawn[i], p_b, p_tex, 0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    }
+    n = n + mesh_emit_yaw(g_skirt, p_b, p_tex, 0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    let out: i32 = n;
+    return out;
+}
+
+// --- decals: driveway + mulch, ordered by hand ----------------------------
+export fn yw_emit_decals(p_b, p_tex): i32 {
+    mesh_set_cull(MESH_CULL_OFF);
+    let k0: i32 = bcount(p_b);
+    let n: i32 = mesh_emit_yaw(g_drive, p_b, p_tex, 0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    n = n + mesh_emit_yaw(g_mulch, p_b, p_tex, 0.0, 0.0, 0.0, 0.0, 1.0, 255, 255, 255, 255);
+    yw_depth_bias(p_b, k0, bcount(p_b), 1.10);
+    let out: i32 = n;
+    return out;
+}
+
+// --- contact shadows ------------------------------------------------------
+// Two triangles of darkening where every object meets the ground. This is the
+// highest value-per-triangle spend in the whole scene and its absence is
+// instantly readable as "objects placed on a plane".
+fn shadow_at(p_b, p_tex, p_x: f64, p_z: f64, p_r: f64, p_a: i32): i32 {
+    let y: f64 = ground_h(p_x, p_z) + 0.05;
+    // a ground-hugging card, so it is a billboard only in size, not in facing:
+    // billboards face the camera, and a shadow must lie flat. Emitted as a quad
+    // through the batch directly would need another mesh; instead the shadow
+    // mesh is a unit disc scaled per instance.
+    let out: i32 = 0;
+    return out;
+}
+
+// The shadow disc mesh: a flat unit-radius fan on y = 0, alpha-blended.
+let g_shadow = null;
+fn build_shadow_disc() {
+    let segs: i32 = 8;
+    let m = mesh_new(segs + 2);
+    mesh_begin(m);
+    let uc: f64 = (UV_SHADOW[0] + UV_SHADOW[2]) * 0.5;
+    let vc: f64 = (UV_SHADOW[1] + UV_SHADOW[3]) * 0.5;
+    let ic: i32 = mesh_vert(m, 0.0, 0.0, 0.0, uc, vc, 255, 255, 255);
+    let prev: i32 = 0;
+    for (let s = 0; s <= segs; s++) {
+        let th: f64 = f64(s) * 6.283185307179586 / f64(segs);
+        let ct: f64 = cos(th); let st: f64 = sin(th);
+        let u: f64 = UV_SHADOW[0] + (UV_SHADOW[2] - UV_SHADOW[0]) * (0.5 + ct * 0.5);
+        let v: f64 = UV_SHADOW[1] + (UV_SHADOW[3] - UV_SHADOW[1]) * (0.5 + st * 0.5);
+        let iv: i32 = mesh_vert(m, ct, 0.0, st * 1.55, u, v, 255, 255, 255);
+        if (s > 0) { mesh_tri(m, ic, prev, iv); }
+        prev = iv;
+    }
+    mesh_end(m);
+    g_shadow = m;
+}
+export fn yw_build_shadow() { build_shadow_disc(); }
+
+// Emit one contact shadow. The sun is high and behind-left, so the pool is
+// offset a little toward +x / -z and squashed along the light.
+fn emit_shadow(p_b, p_tex, p_x: f64, p_z: f64, p_r: f64, p_a: i32): i32 {
+    let x: f64 = p_x + p_r * 0.30;
+    let z: f64 = p_z - p_r * 0.20;
+    let y: f64 = ground_h(x, z) + ground_far(x, z) + 0.05;
+    let out: i32 = mesh_emit_yaw(g_shadow, p_b, p_tex, x, y, z, 0.0, p_r,
+                                 255, 255, 255, p_a);
+    return out;
+}
+
+// --- foliage and props ----------------------------------------------------
+
+// The chosen shrub representation. See the bake-off in house_yard.hml; SOLID
+// won for the boxwood balls and the arborvitae, PUFF for the low spreaders.
+export let SHRUB_CHOICE: i32 = 2;
+
+export fn yw_emit_plants(p_b, p_tex_g, p_tex_f, p_frustum: array<f64>): i32 {
+    let n: i32 = 0;
+    let np: i32 = g_pl_x.length;
+    // shadows first (they are alpha and get their own depth bias)
+    let k0: i32 = bcount(p_b);
+    mesh_set_cull(MESH_CULL_OFF);
+    for (let i = 0; i < np; i++) {
+        let s: f64 = g_pl_s[i];
+        let rr: f64 = 0.78 * s;
+        if (g_pl_k[i] == 1) { rr = 0.46 * s; }
+        if (g_pl_k[i] == 2) { rr = 0.88 * s; }
+        n = n + emit_shadow(p_b, p_tex_f, g_pl_x[i], g_pl_z[i], rr, 215);
+    }
+    yw_depth_bias(p_b, k0, bcount(p_b), 1.40);
+
+    // the bodies
+    mesh_set_cull(MESH_CULL_POS);
+    for (let i = 0; i < np; i++) {
+        let x: f64 = g_pl_x[i];
+        let z: f64 = g_pl_z[i];
+        let s: f64 = g_pl_s[i];
+        let y: f64 = ground_h(x, z) + ground_far(x, z);
+        // a shrub is a vertical surface: it sees more of the sky than the
+        // lawn does, so it rides ~60 % above the ground exposure
+        let sh: f64 = cl01(0.30 + yw_shade(x, z) * 0.98);
+        let t: i32 = cl255(i32(255.0 * sh));
+        let tb: i32 = cl255(i32(255.0 * cl01(sh * 1.04)));
+        let kind: i32 = g_pl_k[i];
+        if (kind == 0) {
+            if (frustum_sphere(p_frustum, x, y + s * 0.5, z, s * 0.9) == 0) { continue; }
+            n = n + mesh_emit_yaw(g_shrub_solid, p_b, p_tex_g, x, y, z,
+                                  g_pl_y[i], s, t, t, tb, 255);
+        }
+        if (kind == 1) {
+            if (frustum_sphere(p_frustum, x, y + s * 0.5, z, s * 0.9) == 0) { continue; }
+            n = n + mesh_emit_yaw(g_cone_solid, p_b, p_tex_g, x, y, z,
+                                  g_pl_y[i], s, t, t, tb, 255);
+        }
+        if (kind == 2) {
+            // Low spreader: a puff of five small cards.
+            //
+            // AND ITS OWN DEPTH BIAS. This prop is only a third of a metre
+            // tall, so its depth key is within centimetres of the contact
+            // shadow underneath it — and that shadow has already been pulled
+            // 1.4 m toward the camera to beat the lawn. Without an equal pull
+            // here the shadow draws OVER the shrub and the mulch bed comes out
+            // empty. This is the cost of hand-ordering coplanar geometry and
+            // it is the second thing the engine's missing depth-bias parameter
+            // would have made a non-issue.
+            let q0: i32 = bcount(p_b);
+            mesh_set_cull(MESH_CULL_OFF);
+            for (let q = 0; q < 5; q++) {
+                let a: f64 = f64(q) * 1.2566370614359172 + g_pl_y[i];
+                let rr: f64 = s * 0.42;
+                let px: f64 = x + cos(a) * rr;
+                let pz: f64 = z + sin(a) * rr * 0.7;
+                let py: f64 = ground_h(px, pz) + ground_far(px, pz) + s * 0.30 + h01(i * 7 + q, 3) * s * 0.14;
+                let tt: i32 = cl255(i32(255.0 * sh * (0.80 + h01(q, i) * 0.28)));
+                n = n + billboard_world(p_b, p_tex_f, px, py, pz, s * 0.66,
+                                        tt, tt, cl255(tt + 6), 255);
+            }
+            yw_depth_bias(p_b, q0, bcount(p_b), 1.85);
+            mesh_set_cull(MESH_CULL_POS);
+        }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// --- the trees ------------------------------------------------------------
+export fn yw_emit_trees(p_b, p_tex_g, p_tex_f, p_frustum: array<f64>,
+                        p_uvset: i32): i32 {
+    let n: i32 = 0;
+    // root shadows, biased to the front of the lawn
+    let k0: i32 = bcount(p_b);
+    mesh_set_cull(MESH_CULL_OFF);
+    n = n + emit_shadow(p_b, p_tex_f, TREE_A_X, TREE_A_Z, 3.3, 225);
+    n = n + emit_shadow(p_b, p_tex_f, TREE_B_X, TREE_B_Z, 2.8, 210);
+    yw_depth_bias(p_b, k0, bcount(p_b), 1.70);
+
+    // trunks. CULL_OFF: the trunk is a nine-sided tube whose back faces are
+    // always farther in w and are therefore overdrawn correctly by the painter's
+    // sort. Culling them saves ~45 triangles and costs a winding assumption; at
+    // this scale the safety is worth more than the triangles.
+    mesh_set_cull(MESH_CULL_OFF);
+    let sa: f64 = yw_shade(TREE_A_X, TREE_A_Z);
+    let ta: i32 = cl255(i32(255.0 * (0.80 + sa * 0.20)));
+    n = n + mesh_emit_yaw(g_trunk_a, p_b, p_tex_g, TREE_A_X, ground_h(TREE_A_X, TREE_A_Z),
+                          TREE_A_Z, 0.35, 1.0, ta, ta, ta, 255);
+    let sb: f64 = yw_shade(TREE_B_X, TREE_B_Z);
+    let tb: i32 = cl255(i32(255.0 * (0.74 + sb * 0.22)));
+    n = n + mesh_emit_yaw(g_trunk_b, p_b, p_tex_g, TREE_B_X, ground_h(TREE_B_X, TREE_B_Z),
+                          TREE_B_Z, 0.0 - 0.8, 1.0, tb, tb, tb, 255);
+    let out: i32 = n;
+    return out;
+}
+
+// --- the canopy -----------------------------------------------------------
+// Emitted with the leaf card selected per cluster. billboard.hml binds ONE uv
+// rect at a time, so the caller groups clusters by card: four passes, four
+// texture-run-friendly groups, no per-cluster uv rebind.
+export fn yw_emit_canopy(p_b, p_tex, p_card: i32, p_frustum: array<f64>): i32 {
+    let n: i32 = 0;
+    let ncl: i32 = g_cl_x.length;
+    for (let i = 0; i < ncl; i++) {
+        if (g_cl_k[i] != p_card) { continue; }
+        let t: f64 = g_cl_t[i];
+        let r: i32 = cl255(i32(255.0 * t));
+        let g: i32 = cl255(i32(255.0 * t));
+        let b: i32 = cl255(i32(250.0 * t));
+        n = n + billboard_world(p_b, p_tex, g_cl_x[i], g_cl_y[i], g_cl_z[i],
+                                g_cl_s[i], r, g, b, 255);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// --- background treeline --------------------------------------------------
+export fn yw_emit_background(p_b, p_tex): i32 {
+    let n: i32 = 0;
+    let nb: i32 = g_bg_x.length;
+    for (let i = 0; i < nb; i++) {
+        let t: f64 = g_bg_t[i];
+        let r: i32 = cl255(i32(238.0 * t));
+        let g: i32 = cl255(i32(246.0 * t));
+        let b: i32 = cl255(i32(255.0 * t));
+        n = n + billboard_world(p_b, p_tex, g_bg_x[i], g_bg_y[i], g_bg_z[i],
+                                g_bg_s[i], r, g, b, 255);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// --- props ----------------------------------------------------------------
+// Right edge of the hero frame, beside the driveway.
+export let MAILBOX_X: f64 = 6.30;
+export let MAILBOX_Z: f64 = 10.20;
+// Far left, mostly hidden behind the second tree and the treeline.
+export let OUTB_X: f64 = 0.0 - 14.2;
+export let OUTB_Z: f64 = 0.0 - 3.4;
+
+export fn yw_emit_props(p_b, p_tex_g, p_tex_f, p_frustum: array<f64>): i32 {
+    let n: i32 = 0;
+    mesh_set_cull(MESH_CULL_OFF);
+    let k0: i32 = bcount(p_b);
+    n = n + emit_shadow(p_b, p_tex_f, MAILBOX_X, MAILBOX_Z, 0.60, 190);
+    n = n + emit_shadow(p_b, p_tex_f, OUTB_X, OUTB_Z + 4.2, 4.2, 170);
+    yw_depth_bias(p_b, k0, bcount(p_b), 1.40);
+
+    mesh_set_cull(MESH_CULL_POS);
+    let sm: f64 = cl01(0.34 + yw_shade(MAILBOX_X, MAILBOX_Z) * 1.02);
+    let tm: i32 = cl255(i32(255.0 * sm));
+    n = n + mesh_emit_yaw(g_mailbox, p_b, p_tex_g, MAILBOX_X,
+                          ground_h(MAILBOX_X, MAILBOX_Z), MAILBOX_Z,
+                          0.26, 1.0, tm, tm, tm, 255);
+    n = n + mesh_emit_yaw(g_outbuilding, p_b, p_tex_g, OUTB_X,
+                          ground_h(OUTB_X, OUTB_Z), OUTB_Z,
+                          0.18, 1.0, 236, 238, 246, 255);
+    // its openings, pulled 2.4 m forward in the sort — comfortably past the
+    // worst centroid error of the 6.2 m gable wall they lie on, and far short
+    // of the 9 m to the next thing in front of the building
+    let ko: i32 = bcount(p_b);
+    n = n + mesh_emit_yaw(g_outb_trim, p_b, p_tex_g, OUTB_X,
+                          ground_h(OUTB_X, OUTB_Z), OUTB_Z,
+                          0.18, 1.0, 236, 238, 246, 255);
+    yw_depth_bias(p_b, ko, bcount(p_b), 2.40);
+    if (g_standin == 1) {
+        n = n + mesh_emit_yaw(g_house, p_b, p_tex_g, 0.0, 0.0, 0.0, 0.0, 1.0,
+                              255, 255, 255, 255);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// THE SHRUB BAKE-OFF — a side-by-side rig, four approaches, same light
+// ===========================================================================
+// Emits four shrubs in a row at z = p_z, so a single render answers "which of
+// these actually looks like a boxwood at 40 metres and at 4".
+export fn yw_emit_shrub_rig(p_b, p_tex_g, p_tex_f, p_x0: f64, p_z: f64,
+                            p_step: f64, p_scale: f64): i32 {
+    let n: i32 = 0;
+    let s: f64 = p_scale;
+    for (let k = 0; k < 4; k++) {
+        let x: f64 = p_x0 + f64(k) * p_step;
+        let y: f64 = ground_h(x, p_z) + ground_far(x, p_z);
+        mesh_set_cull(MESH_CULL_OFF);
+        let k0: i32 = bcount(p_b);
+        n = n + emit_shadow(p_b, p_tex_f, x, p_z, 0.80 * s, 215);
+        yw_depth_bias(p_b, k0, bcount(p_b), 1.40);
+        if (k == SHRUB_BB) {
+            n = n + billboard_world(p_b, p_tex_f, x, y + s * 0.5, p_z, s,
+                                    255, 255, 255, 255);
+        }
+        if (k == SHRUB_CROSS) {
+            mesh_set_cull(MESH_CULL_OFF);
+            n = n + mesh_emit_yaw(g_shrub_cross, p_b, p_tex_f, x, y, p_z, 0.4, s,
+                                  255, 255, 255, 255);
+        }
+        if (k == SHRUB_SOLID) {
+            mesh_set_cull(MESH_CULL_POS);
+            n = n + mesh_emit_yaw(g_shrub_solid, p_b, p_tex_g, x, y, p_z, 0.4, s,
+                                  255, 255, 255, 255);
+        }
+        if (k == SHRUB_PUFF) {
+            mesh_set_cull(MESH_CULL_OFF);
+            for (let q = 0; q < 5; q++) {
+                let a: f64 = f64(q) * 1.2566370614359172;
+                let rr: f64 = s * 0.24;
+                let px: f64 = x + cos(a) * rr;
+                let pz: f64 = p_z + sin(a) * rr;
+                let py: f64 = y + s * 0.46 + sin(a * 2.0) * s * 0.14;
+                let tt: i32 = cl255(i32(255.0 * (0.78 + h01(q, 3) * 0.30)));
+                n = n + billboard_world(p_b, p_tex_f, px, py, pz, s * 0.60,
+                                        tt, tt, cl255(tt + 5), 255);
+            }
+        }
+    }
+    let out: i32 = n;
+    return out;
+}

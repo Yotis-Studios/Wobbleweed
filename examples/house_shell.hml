@@ -1,0 +1,1390 @@
+// house_shell.hml — THE BUILDING, as a module.
+//
+// Split out of examples/house.hml by the critic pass so the house can stand in
+// the real yard (examples/house_world.hml) instead of on a placeholder plane.
+// examples/house.hml is now the thin four-angle runner over this module and
+// examples/house_scene.hml is the integrated demo. NOTHING IN HERE CHANGED
+// MEANING in the split: the constants, the atlas and every builder are the
+// house half's, verbatim. Only the entry points at the bottom are new.
+//
+// Exports, in the order you call them:
+//     hs_build_assets()   -> builds the 128x128 house atlas and the sky strip
+//     hs_atlas() / hs_sky_atlas()
+//     hs_build()          -> the two meshes: mass and applied trim
+//     hs_mesh_house() / hs_mesh_trim() / hs_tris()
+//     hs_build_ground()   -> the PLACEHOLDER lawn (house.hml only; the scene
+//                            uses house_world.hml's)
+//     HS_TRIM_BIAS        -> subtract this from the trim mesh's painter keys
+//
+// The trim mesh must be emitted with its depth keys pulled HS_TRIM_BIAS toward
+// the camera or every applied detail sinks into the wall it is lying on. There
+// is no polygon offset in this engine; see the note in examples/house.hml.
+
+import { divi } from "@stdlib/math";
+import { atlas_new, atlas_px, atlas_rect_uv } from "../src/atlas.hml";
+import { mesh_new, mesh_begin, mesh_vert, mesh_quad, mesh_end,
+         mesh_tri_count, mesh_buf } from "../src/mesh.hml";
+export let TW = 320;
+export let TH = 240;
+export let SCALE = 3;
+
+export let FOVY = 1.0123;                  // 58 degrees
+export let ASPECT = 1.3333333333333333;
+export let NEARZ = 0.06;
+export let FARZ = 260.0;
+// The guard band has to be BIG for a ground plane.  emit.hml rejects any
+// triangle that STRADDLES the guard rect (it wants clip.hml's slow path for
+// those), and a lawn quad four metres from the eye projects thousands of
+// pixels outside a 320x240 frame — so at the stock 640 px guard the quads
+// nearest the camera were dropped and the sky showed through the grass in the
+// bottom corner of the frame.  6000 px costs nothing here because SDL clips
+// what it is handed.
+export let GUARD = 6000.0;
+export let DEPTH_FAR = 90.0;               // painter-sort range: 44 mm per bucket
+
+export let SKY_W = 640;                    // twice the target width: the sky pans
+export let SKY_H = 240;
+export let ATL = 128;                      // the one house/ground atlas, 128 x 128
+
+export let CAP_WORLD = 6000;
+export let CAP_SKY = 8;
+
+// ===========================================================================
+// THE HOUSE, IN METRES.  Every number here came off the photograph.
+// ===========================================================================
+
+// ---- main block: two storeys, ridge running left-right ---------------------
+export let MB_X0 = -5.40;   let MB_X1 = 6.10;          // 11.50 m of facade
+let MB_Z0 = -8.40;   let MB_Z1 = 0.00;          // 8.40 m deep
+export let MB_EAVE = 5.55;                             // top of the two-storey wall
+export let MB_RIDGE_Y = 7.95;
+let MB_RIDGE_Z = -4.20;
+let MSLOPE = 0.5714285714285714;                // 2.40 / 4.20  ->  29.7 deg
+let EAVE_OVER = 0.34;                           // eave overhang, front and back
+let RAKE_OVER = 0.24;                           // gable rake overhang
+
+// ---- cross gable: the centre-right block that steps FORWARD ---------------
+let CG_X0 = 1.75;    let CG_X1 = 6.10;          // 4.35 m
+export let CG_Z = 1.35;                                // its front face
+let CG_APEX_Y = 7.32;                           // below the main ridge, as photographed
+let CG_RIDGE_X = 3.925;
+let CG_SLOPE = 0.8137931034482758;              // 1.77 / 2.175  ->  39.1 deg
+
+// ---- right wing: single storey link + attached garage ---------------------
+let RW_X0 = 6.10;    let RW_X1 = 13.00;
+let RW_Z0 = -4.60;
+let RW_STEP_X = 8.60;                           // link ends / garage begins
+export let RW_LINK_Z = 1.35;                           // link front face
+export let RW_GAR_Z = 3.05;                            // garage front face, further forward
+let RW_EAVE_Y = 2.88;                           // west eave, against the main block
+let RW_RIDGE_X = 11.10;
+let RW_RIDGE_Y = 4.88;
+let RW_SLOPE_W = 0.40;                          // 2.00 / 5.00  ->  21.8 deg
+let RW_SLOPE_E = 1.0526315789473684;            // 2.00 / 1.90  ->  46.5 deg
+let RW_RAKE = 0.12;                             // the wing's rake overhang
+
+// ---- entry porch ----------------------------------------------------------
+export let PO_X0 = -1.36;   let PO_X1 = 1.36;
+export let PO_Z = 1.62;                                // front edge of the porch roof
+let PO_ROOF_WALL = 3.16;                        // roof at the wall
+let PO_ROOF_FRONT = 2.96;                       // roof at the front: a shed
+let PO_COL_X = 1.21;                            // columns at +/- this
+let PO_COL_HW = 0.075;                          // column half-width (0.15 sq)
+let PO_COL_Z = 1.46;
+let ST_X0 = -1.50;   let ST_X1 = 1.50;          // the stoop
+export let ST_Z = 1.80;     let ST_Y = 0.17;
+
+// ---- chimney: red brick, breaks the ridge line ---------------------------
+export let CH_X0 = 6.14;    let CH_X1 = 7.34;
+let CH_Z0 = -1.55;   let CH_Z1 = -0.05;
+let CH_Y0 = 2.60;                               // buried in the wing roof below this
+let CH_Y1 = 8.62;
+export let CH_CAP = 8.80;
+let CH_LIP = 0.09;
+
+// ---- the horizontal band that makes it THIS house ------------------------
+let BRICK_TOP = 1.16;
+let FLOOR2 = 2.98;                              // ground storey / second storey line
+
+// ---- openings -------------------------------------------------------------
+let UW_SILL = 3.86;  let UW_HEAD = 5.20;        // upper windows, 1.34 tall
+let UW_HW = 0.93;                               // half the window+shutter unit
+let GW_SILL = 1.28;  let GW_HEAD = 2.66;        // ground windows
+let PW_HW = 1.65;                               // picture window unit half-width
+let PW_X = -3.05;
+let DOOR_HW = 0.48; let DOOR_TOP = 2.23;
+export let GD_X0 = 9.70;   let GD_X1 = 12.50;  let GD_TOP = 2.34;   // garage door
+let LW_X = 7.35;    let LW_HW = 1.00;                        // link window
+let LANT_X = 9.30;  let LANT_Y0 = 2.36;  let LANT_Y1 = 2.76;
+
+let PROUD = 0.05;                               // applied detail stands this far off
+export let TRIM_BIAS = 0.60;                           // and this far nearer in the SORT
+
+// ===========================================================================
+// LIGHT.  Sun high, slightly BEHIND-LEFT of the camera.  Every value here is
+// a multiplier on a full-sun texture: it can only darken, which is exactly
+// what a white house needs.
+// ===========================================================================
+
+let F_UP     = 0.76;    // front wall, second storey, full sun
+let F_MID    = 0.63;    // front wall at the floor line
+let F_LOW    = 0.41;    // front wall at the brick — the tree shades the base
+let F_EAVE   = 0.36;    // the band directly under the eave
+let F_WEST   = 0.56;    // -X faces, raking light
+let F_EAST   = 0.34;    // +X faces, away from the sun
+let F_BACK   = 0.32;
+let F_ROOFS  = 0.50;    // roof plane facing the camera and the sky
+let F_ROOFW  = 0.47;
+let F_ROOFE  = 0.30;
+let F_SOFFIT = 0.22;    // under an eave or a porch roof
+let F_PORCH  = 0.30;    // inside the porch: the darkest thing on the house
+let F_TRIM   = 0.70;    // white fascia, columns, sills
+let F_BRICKS = 0.46;    // sunlit brick (the chimney)
+let F_BRICKL = 0.33;    // the wainscot, in the tree's shade
+let F_GROUND = 0.62;
+
+let COOL_SUN = 0.0;     // tint selector: 0 warm sunlight, 1 cool skylight
+let COOL_SHD = 1.0;
+
+// ===========================================================================
+// ATLAS SLOTS.  One 128x128 RGBA atlas holds the whole building AND the
+// placeholder lawn, so the entire world is ONE SDL_RenderGeometry call.
+// ===========================================================================
+
+let S_SIDING = 0;    let S_BRICK = 1;   let S_SHINGLE = 2;  let S_WHITE = 3;
+let S_CONC = 4;      let S_GRASS = 5;   let S_WINU = 6;     let S_WINP = 7;
+let S_DOOR = 8;      let S_GDOOR = 9;   let S_LANT = 10;    let S_WINL = 11;
+let S_DARK = 12;     let S_FLOWER = 13;  let S_SLOTS = 14;
+
+let TILE_M = 2.00;                      // metres covered by a 32x32 tile
+let GRASS_M = 3.00;
+
+// ===========================================================================
+// STATE
+// ===========================================================================
+
+let g_eng = null;
+let g_win = null;
+let g_target = null;
+let g_atl = null;
+let g_sky = null;
+let g_tex = ptr_null();
+let g_tex_sky = ptr_null();
+let g_house = null;
+let g_trim = null;
+let g_ground = null;
+let g_bworld = null;
+let g_bsky = null;
+let g_env: array<f64> = [];
+let g_dep: array<f64> = [];
+let g_uv: array<f64> = [];
+let g_mvp = [];
+let g_pix = ptr_null();
+let g_big = ptr_null();
+let g_rgb = null;
+let g_rgb_big = null;
+
+let g_m = null;                          // the mesh currently being built
+let g_sky_u: f64 = 0.0;
+let g_tris: i32 = 0;
+let g_draw_ground: i32 = 1;
+
+// ===========================================================================
+// SMALL MATHS
+// ===========================================================================
+
+fn cl(p_v: i32): i32 {
+    let v: i32 = p_v;
+    if (v < 0) { v = 0; }
+    if (v > 255) { v = 255; }
+    let o: i32 = v;
+    return o;
+}
+
+// Vertex colour from a light multiplier and a coolness.  Sunlit surfaces are
+// warm (blue pulled down), shadowed surfaces are lit by the sky and go cool.
+fn lr(p_f: f64, p_c: f64): i32 {
+    let o: i32 = cl(i32(255.0 * p_f * (1.000 - 0.100 * p_c) + 0.5));
+    return o;
+}
+fn lg(p_f: f64, p_c: f64): i32 {
+    let o: i32 = cl(i32(255.0 * p_f * (0.985 - 0.040 * p_c) + 0.5));
+    return o;
+}
+fn lb(p_f: f64, p_c: f64): i32 {
+    let o: i32 = cl(i32(255.0 * p_f * (0.962 + 0.048 * p_c) + 0.5));
+    return o;
+}
+
+fn bl(p_a: f64, p_b: f64, p_c: f64, p_d: f64, p_s: f64, p_t: f64): f64 {
+    let top: f64 = p_a + (p_b - p_a) * p_s;
+    let bot: f64 = p_d + (p_c - p_d) * p_s;
+    let o: f64 = top + (bot - top) * p_t;
+    return o;
+}
+
+// How many tiles fit in `p_len` metres at `p_tile` metres each, at least one.
+fn nt(p_len: f64, p_tile: f64): i32 {
+    let l: f64 = p_len;
+    if (l < 0.0) { l = 0.0 - l; }
+    let n: i32 = i32(l / p_tile + 0.5);
+    if (n < 1) { n = 1; }
+    let o: i32 = n;
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// TEXTURE NOISE.  Tileable on a 32x32 lattice by construction: the lattice
+// indices wrap, so a tile laid next to itself has no seam.  All mixing in u64
+// with an explicit 32-bit mask, because i32 * throws on overflow.
+// ---------------------------------------------------------------------------
+
+fn h01s(p_gx: i32, p_gy: i32, p_seed: i32): f64 {
+    let hx: u64 = u64(p_gx & 1023);
+    let hy: u64 = u64(p_gy & 1023);
+    let hs: u64 = u64(p_seed & 1023);
+    let h: u64 = (hx * 73856093) ^ (hy * 19349663) ^ (hs * 83492791);
+    h = ((h ^ (h >> 13)) * 1274126177) & 4294967295;
+    let o: f64 = f64(h) * 2.3283064365386963e-10;
+    return o;
+}
+
+// Bilinear value noise with independent x/y lattice sizes (2^sx by 2^sy),
+// wrapping at 32 texels.  Anisotropic on purpose: a lattice that is wide and
+// short gives HORIZONTAL structure, which is what siding, brick and shingle
+// all want.  Per-texel noise is what makes a retro renderer look like
+// television static.
+fn tn(p_x: i32, p_y: i32, p_sx: i32, p_sy: i32, p_seed: i32): f64 {
+    let sx: i32 = p_sx;   let sy: i32 = p_sy;
+    let cw: i32 = 1 << sx;  let chh: i32 = 1 << sy;
+    let nx: i32 = 32 >> sx;  if (nx < 1) { nx = 1; }
+    let ny: i32 = 32 >> sy;  if (ny < 1) { ny = 1; }
+    let gx: i32 = p_x >> sx;
+    let gy: i32 = p_y >> sy;
+    let fx: f64 = f64(p_x - gx * cw) / f64(cw);
+    let fy: f64 = f64(p_y - gy * chh) / f64(chh);
+    let ux: f64 = fx * fx * (3.0 - 2.0 * fx);
+    let uy: f64 = fy * fy * (3.0 - 2.0 * fy);
+    let x0: i32 = gx % nx;     let x1: i32 = (gx + 1) % nx;
+    let y0: i32 = gy % ny;     let y1: i32 = (gy + 1) % ny;
+    let a: f64 = h01s(x0, y0, p_seed);
+    let b: f64 = h01s(x1, y0, p_seed);
+    let c: f64 = h01s(x0, y1, p_seed);
+    let d: f64 = h01s(x1, y1, p_seed);
+    let t: f64 = a + (b - a) * ux;
+    let u: f64 = c + (d - c) * ux;
+    let o: f64 = t + (u - t) * uy;
+    return o;
+}
+
+let g_bayer: array<i32> = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+fn bay(p_x: i32, p_y: i32): i32 {
+    let o: i32 = g_bayer[(p_y & 3) * 4 + (p_x & 3)];
+    return o;
+}
+
+// ===========================================================================
+// THE ATLAS
+// ===========================================================================
+
+fn px(p_x: i32, p_y: i32, p_r: i32, p_g: i32, p_b: i32) {
+    atlas_px(g_atl, p_x, p_y, cl(p_r), cl(p_g), cl(p_b), 255);
+}
+
+fn rect(p_x: i32, p_y: i32, p_w: i32, p_h: i32, p_r: i32, p_g: i32, p_b: i32) {
+    for (let j = 0; j < p_h; j++) {
+        for (let i = 0; i < p_w; i++) { px(p_x + i, p_y + j, p_r, p_g, p_b); }
+    }
+}
+
+// --- clapboard: 32x32 = 2.00 m, four-texel courses -------------------------
+// Each board has a lit upper face, a body, and a hard lap SHADOW at its lower
+// edge.  That shadow line is the entire reason clapboard reads as clapboard.
+fn build_siding(p_ox: i32, p_oy: i32) {
+    for (let y = 0; y < 32; y++) {
+        let c: i32 = y & 3;
+        let v: i32 = 236;
+        if (c == 0) { v = 247; }
+        if (c == 1) { v = 240; }
+        if (c == 2) { v = 231; }
+        if (c == 3) { v = 199; }
+        for (let x = 0; x < 32; x++) {
+            // long, low mottle: 8 texels wide, 2 tall.  Weathering, not noise.
+            let m: i32 = i32(tn(x, y, 3, 1, 11) * 7.0) - 3;
+            let d: i32 = divi(bay(x, y) - 7, 4);
+            let s: i32 = v + m + d;
+            px(p_ox + x, p_oy + y, s, s - 2, s - 7);
+        }
+    }
+}
+
+// --- brick: 32x32 = 2.00 m, 0.25 x 0.125 m bricks, running bond ------------
+fn build_brick(p_ox: i32, p_oy: i32) {
+    for (let y = 0; y < 32; y++) {
+        let course: i32 = y >> 1;
+        let joint: i32 = y & 1;              // the lower texel of each course
+        let off: i32 = (course & 1) * 2;
+        for (let x = 0; x < 32; x++) {
+            let bx: i32 = (x + off) & 3;
+            let bi: i32 = (x + off) >> 2;
+            // per-brick colour variation, then a little within-brick mottle
+            let v: f64 = h01s(bi, course, 3);
+            let r: i32 = 152 + i32(v * 22.0) - 11;
+            let g: i32 = 92 + i32(v * 14.0) - 7;
+            let b: i32 = 68 + i32(v * 12.0) - 6;
+            let m: i32 = i32(tn(x, y, 2, 1, 29) * 9.0) - 4;
+            r = r + m; g = g + m; b = b + m;
+            if (joint == 1 || bx == 0) {
+                // mortar: lift toward a warm grey rather than paint a hard line
+                r = r + i32(f64(171 - r) * 0.55);
+                g = g + i32(f64(160 - g) * 0.55);
+                b = b + i32(f64(146 - b) * 0.55);
+            }
+            let d: i32 = divi(bay(x, y) - 7, 3);
+            px(p_ox + x, p_oy + y, r + d, g + d, b + d);
+        }
+    }
+}
+
+// --- asphalt shingle: 32x32 = 2.00 m, 0.25 m courses, 0.50 m tabs ----------
+fn build_shingle(p_ox: i32, p_oy: i32) {
+    for (let y = 0; y < 32; y++) {
+        let c: i32 = y & 3;
+        let course: i32 = y >> 2;
+        let toff: i32 = (course & 1) * 4;
+        for (let x = 0; x < 32; x++) {
+            let base: i32 = 100;
+            if (c == 0) { base = 64; }        // the butt shadow of the course above
+            if (c == 1) { base = 104; }
+            if (c == 2) { base = 99; }
+            if (c == 3) { base = 92; }
+            let g1: i32 = i32(tn(x, y, 1, 1, 47) * 13.0) - 6;   // granules
+            let g2: i32 = i32(tn(x, y, 3, 2, 53) * 19.0) - 9;   // sheet-to-sheet
+            let v: i32 = base + g1 + g2;
+            // the tab slot is only the LOWER half of a course; running it the
+            // full height turns the roof into a grey brick wall.
+            if (((x + toff) & 7) == 0 && c >= 2) { v = v - 30; }
+            let d: i32 = divi(bay(x, y) - 7, 3);
+            px(p_ox + x, p_oy + y, v + d - 4, v + d, v + d + 7);
+        }
+    }
+}
+
+// --- flat white trim, 16x16.  Painted wood: a faint vertical grain. --------
+fn build_white(p_ox: i32, p_oy: i32) {
+    for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 16; x++) {
+            let m: i32 = i32(tn(x, y, 1, 3, 71) * 9.0) - 4;
+            let d: i32 = divi(bay(x, y) - 7, 4);
+            let v: i32 = 243 + m + d;
+            px(p_ox + x, p_oy + y, v, v - 2, v - 9);
+        }
+    }
+}
+
+fn build_conc(p_ox: i32, p_oy: i32) {
+    for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 16; x++) {
+            let m: i32 = i32(tn(x, y, 2, 2, 91) * 17.0) - 8;
+            let d: i32 = divi(bay(x, y) - 7, 3);
+            let v: i32 = 206 + m + d;
+            px(p_ox + x, p_oy + y, v, v - 1, v - 6);
+        }
+    }
+}
+
+// --- placeholder lawn, 32x16 = 3.00 m.  the-yard replaces this. -----------
+fn build_grass(p_ox: i32, p_oy: i32) {
+    for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 32; x++) {
+            let m: f64 = tn(x, y * 2, 2, 2, 131);
+            let v: i32 = i32(m * 30.0);
+            let d: i32 = divi(bay(x, y) - 7, 2);
+            px(p_ox + x, p_oy + y, 96 + v + d, 122 + v + d, 52 + divi(v, 2) + d);
+        }
+    }
+}
+
+// --- a window UNIT: black shutters + white casing + dark sash, one sprite --
+// Drawing the shutters into the same cell as the window is what guarantees
+// the rhythm of dark rectangles never drifts out of register with the glass.
+fn build_window(p_ox: i32, p_oy: i32, p_w: i32, p_h: i32, p_sh: i32,
+                p_cols: i32, p_rows: i32) {
+    let sh: i32 = p_sh;                      // shutter width in texels
+    let w: i32 = p_w;   let h: i32 = p_h;
+    // shutters
+    for (let y = 0; y < h; y++) {
+        for (let s = 0; s < 2; s++) {
+            let x0: i32 = 0;
+            if (s == 1) { x0 = w - sh; }
+            for (let i = 0; i < sh; i++) {
+                let v: i32 = 44;
+                if ((y & 1) == 0) { v = 54; }             // louvre
+                if (i == 0) { v = v + 16; }               // lit outer edge
+                if (i == sh - 1) { v = v - 12; }
+                if (y == 0 || y == h - 1) { v = 60; }     // rail
+                px(p_ox + x0 + i, p_oy + y, v, v + 2, v + 3);
+            }
+        }
+    }
+    // casing + glass
+    // The casing is deliberately WIDE (3 texels).  The shutters are black and
+    // the glass is nearly black; the only thing that keeps them from merging
+    // into one dark smear at this size is a bright frame between them.
+    let gx0: i32 = sh + 3;
+    let gx1: i32 = w - sh - 3;
+    let gy0: i32 = 3;
+    let gy1: i32 = h - 4;
+    for (let y = 0; y < h; y++) {
+        for (let x = sh; x < w - sh; x++) {
+            let v: i32 = 246;                             // white casing
+            let r: i32 = v; let g: i32 = v - 2; let b: i32 = v - 10;
+            if (x >= gx0 && x < gx1 && y >= gy0 && y < gy1) {
+                // sash glass: upper reflects the sky, lower is the dark room
+                let up: i32 = 0;
+                let mid: i32 = divi(gy0 + gy1, 2);
+                if (y < mid) { up = 1; }
+                r = 46; g = 52; b = 62;
+                if (up == 1) { r = 66; g = 78; b = 96; }
+                let m: i32 = i32(tn(x * 3, y * 3, 2, 2, 17) * 13.0) - 6;
+                r = r + m; g = g + m; b = b + m;
+                // muntins: one meeting rail, then p_cols / p_rows of glazing bar
+                let bar: i32 = 0;
+                if (y == mid) { bar = 1; }
+                for (let cc = 1; cc < p_cols; cc++) {
+                    if (x == gx0 + divi((gx1 - gx0) * cc, p_cols)) { bar = 1; }
+                }
+                for (let rr = 1; rr < p_rows; rr++) {
+                    let yy: i32 = gy0 + divi((gy1 - gy0) * rr, p_rows);
+                    if (y == yy) { bar = 1; }
+                }
+                if (bar == 1) { r = 214; g = 214; b = 206; }
+            }
+            if (y >= gy1) { r = 240; g = 238; b = 228; }   // sill
+            if (y == h - 1) { r = 150; g = 148; b = 142; } // sill shadow
+            px(p_ox + x, p_oy + y, r, g, b);
+        }
+    }
+}
+
+// --- the front door: a white storm door with dark glass, deeply recessed ---
+fn build_door(p_ox: i32, p_oy: i32, p_w: i32, p_h: i32) {
+    for (let y = 0; y < p_h; y++) {
+        for (let x = 0; x < p_w; x++) {
+            let r: i32 = 240; let g: i32 = 239; let b: i32 = 231;
+            if (x >= 2 && x < p_w - 2 && y >= 2 && y < p_h - 8) {
+                r = 34; g = 33; b = 32;
+                let m: i32 = i32(tn(x * 2, y, 2, 3, 23) * 15.0) - 5;
+                r = r + m; g = g + m; b = b + m;
+                if (x == divi(p_w, 2)) { r = 70; g = 70; b = 68; }
+            }
+            if (x < 1 || x >= p_w - 1) { r = 176; g = 174; b = 166; }
+            px(p_ox + x, p_oy + y, r, g, b);
+        }
+    }
+}
+
+// --- the garage door: white, four sections of raised panels ---------------
+fn build_gdoor(p_ox: i32, p_oy: i32, p_w: i32, p_h: i32) {
+    let secs: i32 = 4;
+    let cols: i32 = 4;
+    for (let y = 0; y < p_h; y++) {
+        for (let x = 0; x < p_w; x++) {
+            let sy: i32 = divi(y * secs, p_h);
+            let sx: i32 = divi(x * cols, p_w);
+            let ly: i32 = y - divi(sy * p_h, secs);
+            let lx: i32 = x - divi(sx * p_w, cols);
+            let hh: i32 = divi(p_h, secs);
+            let ww: i32 = divi(p_w, cols);
+            let v: i32 = 240;
+            if (ly <= 1 || lx <= 1 || ly >= hh - 2 || lx >= ww - 2) { v = 228; }
+            if (ly == 0) { v = 186; }                  // section joint shadow
+            if (ly == 1) { v = 250; }                  // and its lit lower lip
+            let m: i32 = i32(tn(x, y, 3, 3, 61) * 7.0) - 3;
+            v = v + m + divi(bay(x, y) - 7, 4);
+            if (x < 1 || x >= p_w - 1) { v = v - 40; }
+            px(p_ox + x, p_oy + y, v, v - 2, v - 9);
+        }
+    }
+}
+
+// --- the carriage lantern, on a patch of siding so it needs no alpha ------
+fn build_lantern(p_ox: i32, p_oy: i32, p_w: i32, p_h: i32) {
+    for (let y = 0; y < p_h; y++) {
+        for (let x = 0; x < p_w; x++) {
+            // background: the same clapboard, so the patch vanishes into the wall
+            let c: i32 = y & 3;
+            let v: i32 = 236;
+            if (c == 0) { v = 247; }
+            if (c == 1) { v = 240; }
+            if (c == 2) { v = 231; }
+            if (c == 3) { v = 199; }
+            let r: i32 = v; let g: i32 = v - 2; let b: i32 = v - 7;
+            let cx: i32 = divi(p_w, 2);
+            // body: a tapered dark lantern with an amber pane
+            let inb: i32 = 0;
+            if (y >= 3 && y < p_h - 2) {
+                let half: i32 = 3;
+                if (y < 5) { half = 2; }
+                if (y >= p_h - 4) { half = 2; }
+                if (x >= cx - half && x <= cx + half) { inb = 1; }
+            }
+            if (y >= 1 && y < 4 && x >= cx - 1 && x <= cx + 1) { inb = 1; }  // bracket
+            if (inb == 1) { r = 30; g = 30; b = 30; }
+            if (inb == 1 && y >= 6 && y < p_h - 5 && x >= cx - 1 && x <= cx + 1) {
+                r = 176; g = 138; b = 74;                                     // the pane
+            }
+            px(p_ox + x, p_oy + y, r, g, b);
+        }
+    }
+}
+
+// THE PINK FLOWERING PLANT BESIDE THE STEP.  [critic pass]
+//
+// It is about five pixels across in the hero frame and it was the single
+// clearest omission on the building: it is the ONLY warm colour anywhere on a
+// facade of white, charcoal, black and cool red brick, and the eye goes to the
+// only warm thing in a cold picture whatever its size. Everything else on this
+// house is a surface; this is a spot of colour, and it is drawn as one — a grey
+// pot, a mound of leaf, and pink blossom scattered through the upper half with
+// a few darker ones behind so it is not a flat pink lozenge at distance.
+//
+// The atlas has no alpha (it uploads BLEND_NONE), so the cell is opaque and the
+// quad is small enough to read as the plant itself rather than as a card. The
+// background of the cell is the porch's shadow value, not black, so the edge
+// does not ring against the recess it stands in.
+fn build_flower(p_ox: i32, p_oy: i32, p_w: i32, p_h: i32) {
+    let w: i32 = p_w;  let h: i32 = p_h;
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            // porch-shadow backdrop, so the sprite does not ring
+            let r: i32 = 74;  let g: i32 = 70;  let b: i32 = 66;
+            let fy: f64 = f64(y) / f64(h);
+            let cx: f64 = f64(x) - f64(w - 1) * 0.5;
+            let ax: f64 = cx;  if (ax < 0.0) { ax = 0.0 - ax; }
+            if (fy > 0.62) {
+                // the pot: a tapered grey-terracotta tub with a rim
+                let hw: f64 = f64(w) * (0.30 - (fy - 0.62) * 0.22);
+                if (ax <= hw) {
+                    let sh: f64 = 1.0 - 0.42 * (cx / (hw + 0.6));
+                    r = i32(126.0 * sh);  g = i32(112.0 * sh);  b = i32(104.0 * sh);
+                    if (fy < 0.70) { r = r + 26; g = g + 24; b = b + 22; }
+                }
+            } else {
+                // the mound of foliage, widest at the pot rim
+                let t: f64 = fy / 0.62;
+                let hw: f64 = f64(w) * (0.16 + 0.30 * t);
+                if (ax <= hw) {
+                    let n: f64 = tn(p_ox + x, p_oy + y, 1, 1, 41);
+                    let sh: f64 = 0.72 + 0.46 * n - 0.24 * (cx / (hw + 0.6));
+                    r = i32(58.0 * sh);  g = i32(88.0 * sh);  b = i32(44.0 * sh);
+                    // blossom: only in the upper mound, and only on the
+                    // brighter half of the noise, so it clusters
+                    let bn: f64 = tn(p_ox + x * 2, p_oy + y * 2, 0, 0, 77);
+                    if (t < 0.72 && bn > 0.56) {
+                        let hot: f64 = 0.74 + 0.42 * bn;
+                        r = i32(214.0 * hot);  g = i32(112.0 * hot);  b = i32(150.0 * hot);
+                    } else if (t < 0.80 && bn > 0.47) {
+                        r = 138;  g = 74;  b = 96;      // blossom in shade
+                    }
+                }
+            }
+            px(p_ox + x, p_oy + y, r, g, b);
+        }
+    }
+}
+
+fn build_atlas() {
+    build_siding(0, 0);
+    build_brick(32, 0);
+    build_shingle(64, 0);
+    build_white(96, 0);
+    build_conc(112, 0);
+    build_grass(96, 16);
+    build_window(0, 32, 32, 24, 6, 1, 1);      // standard window unit
+    build_window(32, 32, 56, 24, 7, 3, 1);     // picture window unit
+    build_window(58, 56, 36, 24, 7, 2, 1);     // link window unit
+    rect(108, 32, 8, 8, 96, 96, 96);           // S_DARK: flat mid grey
+    build_door(108, 40, 20, 36);
+    build_gdoor(0, 56, 48, 40);
+    build_lantern(48, 56, 10, 14);
+    build_flower(0, 96, 14, 18);
+
+    for (let i = 0; i < S_SLOTS * 4; i++) { g_uv.push(0.0); }
+    atlas_rect_uv(g_atl, 0, 0, 32, 32, g_uv, S_SIDING * 4);
+    atlas_rect_uv(g_atl, 32, 0, 32, 32, g_uv, S_BRICK * 4);
+    atlas_rect_uv(g_atl, 64, 0, 32, 32, g_uv, S_SHINGLE * 4);
+    atlas_rect_uv(g_atl, 96, 0, 16, 16, g_uv, S_WHITE * 4);
+    atlas_rect_uv(g_atl, 112, 0, 16, 16, g_uv, S_CONC * 4);
+    atlas_rect_uv(g_atl, 96, 16, 32, 16, g_uv, S_GRASS * 4);
+    atlas_rect_uv(g_atl, 0, 32, 32, 24, g_uv, S_WINU * 4);
+    atlas_rect_uv(g_atl, 32, 32, 56, 24, g_uv, S_WINP * 4);
+    atlas_rect_uv(g_atl, 58, 56, 36, 24, g_uv, S_WINL * 4);
+    atlas_rect_uv(g_atl, 108, 32, 8, 8, g_uv, S_DARK * 4);
+    atlas_rect_uv(g_atl, 108, 40, 20, 36, g_uv, S_DOOR * 4);
+    atlas_rect_uv(g_atl, 0, 56, 48, 40, g_uv, S_GDOOR * 4);
+    atlas_rect_uv(g_atl, 48, 56, 10, 14, g_uv, S_LANT * 4);
+    atlas_rect_uv(g_atl, 0, 96, 14, 18, g_uv, S_FLOWER * 4);
+}
+
+// ---------------------------------------------------------------------------
+// THE SKY.  Deep blue, and HORIZONTAL BANDS of cloud with hard edges — the
+// reference photograph has been through a retro treatment and its clouds are
+// flat ribbons, not puffs.  So the cloud field is quantised to three levels
+// and never blended.
+// ---------------------------------------------------------------------------
+fn build_sky() {
+    for (let y = 0; y < SKY_H; y++) {
+        let t: f64 = f64(y) / f64(SKY_H);
+        let e: f64 = t * t * (3.0 - 2.0 * t);
+        for (let x = 0; x < SKY_W; x++) {
+            let d: f64 = (f64(bay(x, y)) - 7.5) * 0.0125;
+            let ee: f64 = e + d;
+            if (ee < 0.0) { ee = 0.0; }
+            if (ee > 1.0) { ee = 1.0; }
+            let r: i32 = i32(34.0 + (128.0 - 34.0) * ee + 0.5);
+            let g: i32 = i32(66.0 + (152.0 - 66.0) * ee + 0.5);
+            let b: i32 = i32(146.0 + (196.0 - 146.0) * ee + 0.5);
+            // bands: very wide in x, very short in y, and QUANTISED — the
+            // reference photograph's clouds are flat ribbons with hard edges,
+            // not puffs, because it has already been through a pixel
+            // treatment.  Soft blobs here would look like a different picture.
+            let n: f64 = h01s(x >> 6, y >> 3, 5) * 0.56
+                       + h01s(x >> 4, y >> 4, 9) * 0.29
+                       + h01s(x >> 7, y >> 2, 13) * 0.15;
+            let thr: f64 = 0.79 - 0.13 * ee;
+            if (n > thr) {
+                let k: i32 = 1;
+                if (n > thr + 0.09) { k = 2; }
+                let cr: i32 = 176; let cg: i32 = 188; let cb: i32 = 214;
+                if (k == 2) { cr = 214; cg = 221; cb = 238; }
+                r = r + divi((cr - r) * 3, 4);
+                g = g + divi((cg - g) * 3, 4);
+                b = b + divi((cb - b) * 3, 4);
+            }
+            atlas_px(g_sky, x, y, cl(r), cl(g), cl(b), 255);
+        }
+    }
+}
+
+// ===========================================================================
+// GEOMETRY
+// ===========================================================================
+//
+// `patch` is the only primitive.  A planar (or bilinear) quad A-B-C-D with A
+// top-left, B top-right, C bottom-right, D bottom-left, subdivided p_nu by
+// p_nv.  EVERY sub-quad maps the WHOLE uv rect of slot `p_slot`, so a tile
+// repeats across the face without texture wrap.  Vertex colour is lerped
+// vertically from `p_ftop` at the A-B edge to `p_fbot` at the D-C edge, which
+// is how the eave shadow and the tree shade across the ground storey get in.
+//
+// Winding is A-B-C then A-C-D; with A top-left and the outward face toward
+// the viewer that is clockwise on screen, which is EMIT_BF_CCW's keep case.
+
+fn patch(p_ax: f64, p_ay: f64, p_az: f64,
+         p_bx: f64, p_by: f64, p_bz: f64,
+         p_cx: f64, p_cy: f64, p_cz: f64,
+         p_dx: f64, p_dy: f64, p_dz: f64,
+         p_nu: i32, p_nv: i32, p_slot: i32,
+         p_ftop: f64, p_fbot: f64, p_cool: f64) {
+    let m = g_m;
+    let so: i32 = p_slot * 4;
+    let u0: f64 = g_uv[so];      let v0: f64 = g_uv[so + 1];
+    let u1: f64 = g_uv[so + 2];  let v1: f64 = g_uv[so + 3];
+    let nu: i32 = p_nu;   if (nu < 1) { nu = 1; }
+    let nv: i32 = p_nv;   if (nv < 1) { nv = 1; }
+    let fn_: f64 = f64(nu);
+    let fv: f64 = f64(nv);
+    for (let j = 0; j < nv; j++) {
+        let t0: f64 = f64(j) / fv;
+        let t1: f64 = f64(j + 1) / fv;
+        let f0: f64 = p_ftop + (p_fbot - p_ftop) * t0;
+        let f1: f64 = p_ftop + (p_fbot - p_ftop) * t1;
+        let r0: i32 = lr(f0, p_cool);  let g0: i32 = lg(f0, p_cool);  let b0: i32 = lb(f0, p_cool);
+        let r1: i32 = lr(f1, p_cool);  let g1: i32 = lg(f1, p_cool);  let b1: i32 = lb(f1, p_cool);
+        for (let i = 0; i < nu; i++) {
+            let s0: f64 = f64(i) / fn_;
+            let s1: f64 = f64(i + 1) / fn_;
+            let ia = mesh_vert(m, bl(p_ax, p_bx, p_cx, p_dx, s0, t0),
+                                  bl(p_ay, p_by, p_cy, p_dy, s0, t0),
+                                  bl(p_az, p_bz, p_cz, p_dz, s0, t0), u0, v0, r0, g0, b0);
+            let ib = mesh_vert(m, bl(p_ax, p_bx, p_cx, p_dx, s1, t0),
+                                  bl(p_ay, p_by, p_cy, p_dy, s1, t0),
+                                  bl(p_az, p_bz, p_cz, p_dz, s1, t0), u1, v0, r0, g0, b0);
+            let ic = mesh_vert(m, bl(p_ax, p_bx, p_cx, p_dx, s1, t1),
+                                  bl(p_ay, p_by, p_cy, p_dy, s1, t1),
+                                  bl(p_az, p_bz, p_cz, p_dz, s1, t1), u1, v1, r1, g1, b1);
+            let id = mesh_vert(m, bl(p_ax, p_bx, p_cx, p_dx, s0, t1),
+                                  bl(p_ay, p_by, p_cy, p_dy, s0, t1),
+                                  bl(p_az, p_bz, p_cz, p_dz, s0, t1), u0, v1, r1, g1, b1);
+            mesh_quad(m, ia, ib, ic, id);
+        }
+    }
+}
+
+// A rectangle in the XY plane facing +Z (the whole facade is these).
+fn wallz(p_x0: f64, p_x1: f64, p_y0: f64, p_y1: f64, p_z: f64,
+         p_slot: i32, p_tile: f64, p_ftop: f64, p_fbot: f64, p_cool: f64) {
+    let nu: i32 = nt(p_x1 - p_x0, p_tile);
+    let nv: i32 = nt(p_y1 - p_y0, p_tile);
+    patch(p_x0, p_y1, p_z,  p_x1, p_y1, p_z,  p_x1, p_y0, p_z,  p_x0, p_y0, p_z,
+          nu, nv, p_slot, p_ftop, p_fbot, p_cool);
+}
+
+// A rectangle in the ZY plane.  p_face = +1 for a face looking toward +X,
+// -1 for one looking toward -X; the winding flips so both cull correctly.
+fn wallx(p_z0: f64, p_z1: f64, p_y0: f64, p_y1: f64, p_x: f64, p_face: f64,
+         p_slot: i32, p_tile: f64, p_ftop: f64, p_fbot: f64, p_cool: f64) {
+    let nu: i32 = nt(p_z1 - p_z0, p_tile);
+    let nv: i32 = nt(p_y1 - p_y0, p_tile);
+    if (p_face > 0.0) {
+        patch(p_x, p_y1, p_z1,  p_x, p_y1, p_z0,  p_x, p_y0, p_z0,  p_x, p_y0, p_z1,
+              nu, nv, p_slot, p_ftop, p_fbot, p_cool);
+    } else {
+        patch(p_x, p_y1, p_z0,  p_x, p_y1, p_z1,  p_x, p_y0, p_z1,  p_x, p_y0, p_z0,
+              nu, nv, p_slot, p_ftop, p_fbot, p_cool);
+    }
+}
+
+// A horizontal rectangle.  p_face = +1 looks up, -1 looks down (a soffit).
+fn slab(p_x0: f64, p_x1: f64, p_z0: f64, p_z1: f64, p_y: f64, p_face: f64,
+        p_slot: i32, p_tile: f64, p_f: f64, p_cool: f64) {
+    let nu: i32 = nt(p_x1 - p_x0, p_tile);
+    let nv: i32 = nt(p_z1 - p_z0, p_tile);
+    if (p_face > 0.0) {
+        patch(p_x0, p_y, p_z0,  p_x1, p_y, p_z0,  p_x1, p_y, p_z1,  p_x0, p_y, p_z1,
+              nu, nv, p_slot, p_f, p_f, p_cool);
+    } else {
+        patch(p_x0, p_y, p_z1,  p_x1, p_y, p_z1,  p_x1, p_y, p_z0,  p_x0, p_y, p_z0,
+              nu, nv, p_slot, p_f, p_f, p_cool);
+    }
+}
+
+// A box with five visible faces (no bottom) — chimney, columns, stoop.
+fn box5(p_x0: f64, p_x1: f64, p_y0: f64, p_y1: f64, p_z0: f64, p_z1: f64,
+        p_slot: i32, p_tile: f64, p_fs: f64, p_fw: f64, p_fe: f64, p_fn: f64,
+        p_ftop: f64, p_cool: f64) {
+    wallz(p_x0, p_x1, p_y0, p_y1, p_z1, p_slot, p_tile, p_fs, p_fs, p_cool);
+    wallz(p_x1, p_x0, p_y0, p_y1, p_z0, p_slot, p_tile, p_fn, p_fn, p_cool);
+    wallx(p_z0, p_z1, p_y0, p_y1, p_x1, 1.0, p_slot, p_tile, p_fe, p_fe, p_cool);
+    wallx(p_z0, p_z1, p_y0, p_y1, p_x0, -1.0, p_slot, p_tile, p_fw, p_fw, p_cool);
+    slab(p_x0, p_x1, p_z0, p_z1, p_y1, 1.0, p_slot, p_tile, p_ftop, p_cool);
+}
+
+// A CASING around an opening: head plus two jambs, as strips that do not
+// overlap the opening itself (there is no sill strip — every opening here
+// meets the ground or a stoop).  Drawing a solid casing rect and then the door on top of it
+// puts two decals 25 mm apart into the same 44 mm sort bucket, and which one
+// wins is then decided per triangle by where the bucket boundary happens to
+// fall — which looked exactly like a diagonal tear across the front door.
+fn frame4(p_x0: f64, p_x1: f64, p_y0: f64, p_y1: f64, p_t: f64, p_z: f64,
+          p_slot: i32, p_f: f64, p_cool: f64) {
+    let t: f64 = p_t;
+    sprite(p_x0 - t, p_x1 + t, p_y1, p_y1 + t, p_z, p_slot, 2, 1, p_f, p_cool);
+    sprite(p_x0 - t, p_x0, p_y0, p_y1, p_z, p_slot, 1, 3, p_f * 0.94, p_cool);
+    sprite(p_x1, p_x1 + t, p_y0, p_y1, p_z, p_slot, 1, 3, p_f * 0.86, p_cool);
+}
+
+// A detail SPRITE laid flat on a wall, PROUD of it so the painter sort cannot
+// tie with the wall behind.
+//
+// Unlike `patch`, this SUBDIVIDES THE UV RECT instead of repeating it — a
+// window is one picture, not a tile.  The subdivision is the whole point:
+// UVs are affine, so a window drawn as a single quad gets a diagonal seam
+// straight through it and every muntin bends.  4x3 sub-quads is enough that
+// the warble reads as the engine's signature wobble rather than as damage.
+fn sprite(p_x0: f64, p_x1: f64, p_y0: f64, p_y1: f64, p_z: f64,
+          p_slot: i32, p_nu: i32, p_nv: i32, p_f: f64, p_cool: f64) {
+    let m = g_m;
+    let so: i32 = p_slot * 4;
+    let u0: f64 = g_uv[so];      let v0: f64 = g_uv[so + 1];
+    let u1: f64 = g_uv[so + 2];  let v1: f64 = g_uv[so + 3];
+    let nu: i32 = p_nu;   if (nu < 1) { nu = 1; }
+    let nv: i32 = p_nv;   if (nv < 1) { nv = 1; }
+    let r: i32 = lr(p_f, p_cool);
+    let g: i32 = lg(p_f, p_cool);
+    let b: i32 = lb(p_f, p_cool);
+    for (let j = 0; j < nv; j++) {
+        let t0: f64 = f64(j) / f64(nv);
+        let t1: f64 = f64(j + 1) / f64(nv);
+        let ya: f64 = p_y1 + (p_y0 - p_y1) * t0;
+        let yb: f64 = p_y1 + (p_y0 - p_y1) * t1;
+        let va: f64 = v0 + (v1 - v0) * t0;
+        let vb: f64 = v0 + (v1 - v0) * t1;
+        for (let i = 0; i < nu; i++) {
+            let s0: f64 = f64(i) / f64(nu);
+            let s1: f64 = f64(i + 1) / f64(nu);
+            let xa: f64 = p_x0 + (p_x1 - p_x0) * s0;
+            let xb: f64 = p_x0 + (p_x1 - p_x0) * s1;
+            let ua: f64 = u0 + (u1 - u0) * s0;
+            let ub: f64 = u0 + (u1 - u0) * s1;
+            let ia = mesh_vert(m, xa, ya, p_z, ua, va, r, g, b);
+            let ib = mesh_vert(m, xb, ya, p_z, ub, va, r, g, b);
+            let ic = mesh_vert(m, xb, yb, p_z, ub, vb, r, g, b);
+            let id = mesh_vert(m, xa, yb, p_z, ua, vb, r, g, b);
+            mesh_quad(m, ia, ib, ic, id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// roof helpers
+// ---------------------------------------------------------------------------
+
+// Height of the main block's FRONT roof plane at depth z.
+fn mroof_y(p_z: f64): f64 {
+    let o: f64 = MB_EAVE - p_z * MSLOPE;
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// GABLE ENDS, AS HORIZONTAL STRIPS.  [critic pass]
+//
+// A gable end used to be built as a DEGENERATE `patch`: A at the apex, B == C
+// at the eave under it, D at the far eave, subdivided 3x2.  That produces the
+// right silhouette and the wrong texture.  `patch` runs u along A->B and v
+// along A->D, so on a collapsed quad both UV axes run down the RAKES, and the
+// clapboard fans out of the apex like a sunburst instead of lying in courses.
+// On the cross gable and the garage — the two gables that FACE THE CAMERA in
+// the photograph — that fan is the most obviously wrong texture on the
+// building, and it is wrong in the one place the reference is most legible.
+//
+// A gable is a stack of horizontal trapezoids.  Built that way, v maps to
+// height and u maps across, so the boards stay level and the courses line up
+// with the wall below.  The two edges are linear in y, so a trapezoid per band
+// is exact geometry, not an approximation, and the top band collapses to the
+// apex triangle by itself.
+//
+// `nv` bands each get ONE tile of v, so the course spacing matches `wallz`'s
+// when the band height matches the tile.  Callers pass the band count that
+// makes (apex - base) / nv come out near TILE_M.
+// ---------------------------------------------------------------------------
+
+// A gable in the XY plane at constant z, facing +Z: the cross gable and the
+// garage.  Apex at p_xa, eaves at p_x0 (left) and p_x1 (right).
+fn gable_z(p_x0: f64, p_x1: f64, p_xa: f64, p_yb: f64, p_ya: f64, p_z: f64,
+           p_nv: i32, p_slot: i32, p_ftop: f64, p_fbot: f64, p_cool: f64) {
+    let nv: i32 = p_nv;  if (nv < 1) { nv = 1; }
+    let so: i32 = p_slot * 4;
+    let u0: f64 = g_uv[so];      let v0: f64 = g_uv[so + 1];
+    let u1: f64 = g_uv[so + 2];  let v1: f64 = g_uv[so + 3];
+    let m = g_m;
+    let fv: f64 = f64(nv);
+    for (let j = 0; j < nv; j++) {
+        // t measured from the BASE up, so t=1 is the apex
+        let t0: f64 = f64(j) / fv;
+        let t1: f64 = f64(j + 1) / fv;
+        let ya: f64 = p_yb + (p_ya - p_yb) * t1;   // upper edge
+        let yb: f64 = p_yb + (p_ya - p_yb) * t0;   // lower edge
+        let xl_t: f64 = p_x0 + (p_xa - p_x0) * t1;
+        let xr_t: f64 = p_x1 + (p_xa - p_x1) * t1;
+        let xl_b: f64 = p_x0 + (p_xa - p_x0) * t0;
+        let xr_b: f64 = p_x1 + (p_xa - p_x1) * t0;
+        // shade runs bottom (fbot, at the eave) to top (ftop, at the ridge)
+        let fa: f64 = p_fbot + (p_ftop - p_fbot) * t1;
+        let fb: f64 = p_fbot + (p_ftop - p_fbot) * t0;
+        let ra: i32 = lr(fa, p_cool); let ga: i32 = lg(fa, p_cool); let ba: i32 = lb(fa, p_cool);
+        let rb: i32 = lr(fb, p_cool); let gb: i32 = lg(fb, p_cool); let bb: i32 = lb(fb, p_cool);
+        // one whole tile of v per band; u spans the band so the courses run
+        // level and the boards get wider toward the eave, which is what a
+        // clapboard gable actually does under an affine mapper
+        let ia = mesh_vert(m, xl_t, ya, p_z, u0, v0, ra, ga, ba);
+        let ib = mesh_vert(m, xr_t, ya, p_z, u1, v0, ra, ga, ba);
+        let ic = mesh_vert(m, xr_b, yb, p_z, u1, v1, rb, gb, bb);
+        let id = mesh_vert(m, xl_b, yb, p_z, u0, v1, rb, gb, bb);
+        mesh_quad(m, ia, ib, ic, id);
+    }
+}
+
+// The same thing in the ZY plane at constant x: the main block's two ends.
+// p_face = +1 for a face looking toward +X, -1 toward -X.
+fn gable_x(p_z0: f64, p_z1: f64, p_za: f64, p_yb: f64, p_ya: f64, p_x: f64,
+           p_face: f64, p_nv: i32, p_slot: i32,
+           p_ftop: f64, p_fbot: f64, p_cool: f64) {
+    let nv: i32 = p_nv;  if (nv < 1) { nv = 1; }
+    let so: i32 = p_slot * 4;
+    let u0: f64 = g_uv[so];      let v0: f64 = g_uv[so + 1];
+    let u1: f64 = g_uv[so + 2];  let v1: f64 = g_uv[so + 3];
+    let m = g_m;
+    let fv: f64 = f64(nv);
+    for (let j = 0; j < nv; j++) {
+        let t0: f64 = f64(j) / fv;
+        let t1: f64 = f64(j + 1) / fv;
+        let ya: f64 = p_yb + (p_ya - p_yb) * t1;
+        let yb: f64 = p_yb + (p_ya - p_yb) * t0;
+        let za_t: f64 = p_z0 + (p_za - p_z0) * t1;
+        let zb_t: f64 = p_z1 + (p_za - p_z1) * t1;
+        let za_b: f64 = p_z0 + (p_za - p_z0) * t0;
+        let zb_b: f64 = p_z1 + (p_za - p_z1) * t0;
+        let fa: f64 = p_fbot + (p_ftop - p_fbot) * t1;
+        let fb: f64 = p_fbot + (p_ftop - p_fbot) * t0;
+        let ra: i32 = lr(fa, p_cool); let ga: i32 = lg(fa, p_cool); let ba: i32 = lb(fa, p_cool);
+        let rb: i32 = lr(fb, p_cool); let gb: i32 = lg(fb, p_cool); let bb: i32 = lb(fb, p_cool);
+        if (p_face > 0.0) {
+            let ia = mesh_vert(m, p_x, ya, zb_t, u0, v0, ra, ga, ba);
+            let ib = mesh_vert(m, p_x, ya, za_t, u1, v0, ra, ga, ba);
+            let ic = mesh_vert(m, p_x, yb, za_b, u1, v1, rb, gb, bb);
+            let id = mesh_vert(m, p_x, yb, zb_b, u0, v1, rb, gb, bb);
+            mesh_quad(m, ia, ib, ic, id);
+        } else {
+            let ia = mesh_vert(m, p_x, ya, za_t, u0, v0, ra, ga, ba);
+            let ib = mesh_vert(m, p_x, ya, zb_t, u1, v0, ra, ga, ba);
+            let ic = mesh_vert(m, p_x, yb, zb_b, u1, v1, rb, gb, bb);
+            let id = mesh_vert(m, p_x, yb, za_b, u0, v1, rb, gb, bb);
+            mesh_quad(m, ia, ib, ic, id);
+        }
+    }
+}
+
+// Height of the cross-gable roof at x.
+fn cg_y(p_x: f64): f64 {
+    let d: f64 = p_x - CG_RIDGE_X;
+    if (d < 0.0) { d = 0.0 - d; }
+    let o: f64 = CG_APEX_Y - CG_SLOPE * d;
+    return o;
+}
+
+// Where the cross-gable roof cuts into the main front slope, as a depth.
+// At the wing's own eaves this is z = 0 (it dies into the wall); at its ridge
+// it is z = -3.10, well up the main roof.  This is the VALLEY.
+fn valley_z(p_x: f64): f64 {
+    let o: f64 = (MB_EAVE - cg_y(p_x)) / MSLOPE;
+    return o;
+}
+
+// Height of the right wing's roof at x.
+fn rw_y(p_x: f64): f64 {
+    let o: f64 = 0.0;
+    if (p_x <= RW_RIDGE_X) { o = RW_EAVE_Y + (p_x - RW_X0) * RW_SLOPE_W; }
+    else { o = RW_RIDGE_Y - (p_x - RW_RIDGE_X) * RW_SLOPE_E; }
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// A wall of the facade: brick wainscot, clapboard above it with the tree's
+// shade falling across the ground storey, and the eave shadow at the top.
+// This stack of three is the single strongest cue that it is THIS house.
+// ---------------------------------------------------------------------------
+fn facade(p_x0: f64, p_x1: f64, p_ytop: f64, p_z: f64, p_eave: i32,
+          p_scale: f64, p_cool: f64) {
+    let s: f64 = p_scale;                       // overall dimming for this wall
+    let top: f64 = p_ytop;
+    let ysh: f64 = top - 0.48;                  // the band under the eave
+    if (p_eave == 0) { ysh = top; }
+    // brick wainscot
+    wallz(p_x0, p_x1, 0.0, BRICK_TOP, p_z, S_BRICK, TILE_M,
+          F_BRICKL * s * 1.14, F_BRICKL * s, p_cool);
+    // ground storey clapboard
+    if (ysh > FLOOR2) {
+        wallz(p_x0, p_x1, BRICK_TOP, FLOOR2, p_z, S_SIDING, TILE_M,
+              F_MID * s, F_LOW * s, p_cool);
+        wallz(p_x0, p_x1, FLOOR2, ysh, p_z, S_SIDING, TILE_M,
+              F_UP * s, F_MID * s, p_cool);
+    } else {
+        wallz(p_x0, p_x1, BRICK_TOP, ysh, p_z, S_SIDING, TILE_M,
+              F_MID * s, F_LOW * s, p_cool);
+    }
+    if (p_eave == 1) {
+        wallz(p_x0, p_x1, ysh, top, p_z, S_SIDING, TILE_M,
+              F_EAVE * s, F_EAVE * s * 1.45, COOL_SHD);
+    }
+}
+
+// A window unit, hung on a wall at z, standing PROUD of it.
+fn window_unit(p_cx: f64, p_hw: f64, p_y0: f64, p_y1: f64, p_z: f64,
+               p_slot: i32, p_f: f64, p_cool: f64) {
+    sprite(p_cx - p_hw, p_cx + p_hw, p_y0, p_y1, p_z + PROUD, p_slot,
+           5, 3, p_f, p_cool);
+}
+
+// ---------------------------------------------------------------------------
+// THE BUILDING
+// ---------------------------------------------------------------------------
+
+fn build_main_block() {
+    // ---- facade, in three x-segments: left of the porch, the porch bay, and
+    //      between the porch and the cross gable.
+    //
+    //      The porch bay is split HORIZONTALLY at the porch roof: below it is
+    //      the recess, which is the darkest surface on the house; above it is
+    //      ordinary second-storey siding with the porch roof's own shadow cast
+    //      up onto it.  Darkening the whole bay top to bottom (the first thing
+    //      this file did) makes the house look like it has a hole in it.
+    facade(MB_X0, ST_X0, MB_EAVE, MB_Z1, 1, 1.0, COOL_SUN);
+    facade(ST_X1, CG_X0, MB_EAVE, MB_Z1, 1, 1.0, COOL_SUN);
+    // the recess, under the porch roof
+    wallz(ST_X0, ST_X1, 0.0, BRICK_TOP, MB_Z1, S_BRICK, TILE_M,
+          F_BRICKL * 0.90, F_BRICKL * 0.72, 0.45);
+    wallz(ST_X0, ST_X1, BRICK_TOP, PO_ROOF_WALL, MB_Z1, S_SIDING, TILE_M,
+          F_PORCH, F_PORCH * 1.35, 0.45);
+    // above the porch roof: second storey, with the roof's shadow at its foot
+    wallz(ST_X0, ST_X1, PO_ROOF_WALL, PO_ROOF_WALL + 0.42, MB_Z1, S_SIDING, TILE_M,
+          F_MID * 0.72, F_MID * 0.42, COOL_SHD);
+    wallz(ST_X0, ST_X1, PO_ROOF_WALL + 0.42, MB_EAVE - 0.48, MB_Z1, S_SIDING, TILE_M,
+          F_UP, F_MID * 0.86, COOL_SUN);
+    wallz(ST_X0, ST_X1, MB_EAVE - 0.48, MB_EAVE, MB_Z1, S_SIDING, TILE_M,
+          F_EAVE, F_EAVE * 1.45, COOL_SHD);
+
+    // ---- west gable end.  The brick veneer WRAPS the corner — it is a
+    //      wainscot, not a billboard stuck on the front.
+    wallx(MB_Z0, MB_Z1, BRICK_TOP, MB_EAVE, MB_X0, -1.0, S_SIDING, TILE_M,
+          F_WEST, F_WEST * 0.78, COOL_SHD);
+    wallx(MB_Z0, MB_Z1, 0.0, BRICK_TOP, MB_X0, -1.0, S_BRICK, TILE_M,
+          F_BRICKL * 1.25, F_BRICKL * 1.05, COOL_SHD);
+    // Its gable, as horizontal courses — see gable_x.  This was two degenerate
+    // `patch` calls, which gave the right shape and a sunburst of clapboard.
+    //
+    // WINDING.  The original pair were written the other way round and both
+    // were silently backface-culled: the west end of the house had a gable
+    // -shaped hole in it and the roof read as a kite hovering over the wall.
+    // Nothing warns you — a culled triangle is indistinguishable from one you
+    // never wrote.  It took a screenshot from a second camera to see it, which
+    // is the argument for rendering more than one angle.
+    gable_x(MB_Z0, MB_Z1, MB_RIDGE_Z, MB_EAVE, MB_RIDGE_Y, MB_X0, -1.0,
+            2, S_SIDING, F_WEST * 1.05, F_WEST * 0.95, COOL_SHD);
+
+    // ---- east gable end (only seen from the right-hand cameras) ----------
+    wallx(MB_Z0, MB_Z1, BRICK_TOP, MB_EAVE, MB_X1, 1.0, S_SIDING, TILE_M,
+          F_EAST, F_EAST * 0.8, COOL_SHD);
+    wallx(MB_Z0, MB_Z1, 0.0, BRICK_TOP, MB_X1, 1.0, S_BRICK, TILE_M,
+          F_BRICKL * 0.9, F_BRICKL * 0.8, COOL_SHD);
+    // and its gable — mirror face, because this end looks toward +X
+    gable_x(MB_Z0, MB_Z1, MB_RIDGE_Z, MB_EAVE, MB_RIDGE_Y, MB_X1, 1.0,
+            2, S_SIDING, F_EAST * 1.05, F_EAST * 0.95, COOL_SHD);
+
+    // ---- back wall --------------------------------------------------------
+    wallz(MB_X1, MB_X0, BRICK_TOP, MB_EAVE, MB_Z0, S_SIDING, TILE_M,
+          F_BACK, F_BACK * 0.8, COOL_SHD);
+    wallz(MB_X1, MB_X0, 0.0, BRICK_TOP, MB_Z0, S_BRICK, TILE_M,
+          F_BRICKL * 0.9, F_BRICKL * 0.8, COOL_SHD);
+
+    // ---- FRONT ROOF SLOPE, cut by the cross-gable valley -----------------
+    // Built as x-strips.  A strip inside the wing's span stops at the valley
+    // instead of at the eave, which is what makes the two roofs meet in a
+    // real valley rather than poking through one another.
+    let x0: f64 = MB_X0 - RAKE_OVER;
+    let x1: f64 = MB_X1 + RAKE_OVER;
+    let strips: i32 = 20;
+    let ez: f64 = MB_Z1 + EAVE_OVER;
+    for (let i = 0; i < strips; i++) {
+        let xa: f64 = x0 + (x1 - x0) * f64(i) / f64(strips);
+        let xb: f64 = x0 + (x1 - x0) * f64(i + 1) / f64(strips);
+        let za: f64 = ez;
+        let zb: f64 = ez;
+        if (xa > CG_X0 && xa < CG_X1) { za = valley_z(xa); }
+        if (xb > CG_X0 && xb < CG_X1) { zb = valley_z(xb); }
+        if (za < MB_RIDGE_Z + 0.02 && zb < MB_RIDGE_Z + 0.02) { continue; }
+        patch(xa, MB_RIDGE_Y, MB_RIDGE_Z,  xb, MB_RIDGE_Y, MB_RIDGE_Z,
+              xb, mroof_y(zb), zb,          xa, mroof_y(za), za,
+              1, 3, S_SHINGLE, F_ROOFS, F_ROOFS * 1.06, COOL_SUN);
+    }
+    // back slope
+    let bz: f64 = MB_Z0 - EAVE_OVER;
+    patch(x1, MB_RIDGE_Y, MB_RIDGE_Z,  x0, MB_RIDGE_Y, MB_RIDGE_Z,
+          x0, mroof_y(2.0 * MB_RIDGE_Z - bz), bz,
+          x1, mroof_y(2.0 * MB_RIDGE_Z - bz), bz,
+          6, 3, S_SHINGLE, F_ROOFE, F_ROOFE, COOL_SHD);
+
+}
+
+fn build_cross_gable() {
+    // front wall of the wing, and its two ground-floor windows
+    facade(CG_X0, CG_X1, MB_EAVE, CG_Z, 1, 1.0, COOL_SUN);
+    // west return (the 1.35 m of side wall the step exposes)
+    wallx(MB_Z1, CG_Z, 0.0, MB_EAVE, CG_X0, -1.0, S_SIDING, TILE_M,
+          F_WEST, F_WEST * 0.7, COOL_SHD);
+    wallx(MB_Z1, CG_Z, 0.0, MB_EAVE, CG_X1, 1.0, S_SIDING, TILE_M,
+          F_EAST, F_EAST * 0.8, COOL_SHD);
+
+    // The gable over it.  THIS ONE FACES THE CAMERA in the photograph, so it
+    // is the gable whose clapboard the reference actually shows: level
+    // courses running clean across, dying into the two rakes.
+    gable_z(CG_X0, CG_X1, CG_RIDGE_X, MB_EAVE, CG_APEX_Y, CG_Z,
+            2, S_SIDING, F_UP * 0.95, F_UP, COOL_SUN);
+
+    // the two roof planes, each running from the rake at the front back to
+    // the valley on the main slope
+    let fz: f64 = CG_Z + EAVE_OVER;
+    patch(CG_RIDGE_X, CG_APEX_Y, fz,           CG_X0 - RAKE_OVER, MB_EAVE - 0.20, fz,
+          CG_X0, MB_EAVE, MB_Z1,               CG_RIDGE_X, CG_APEX_Y, valley_z(CG_RIDGE_X),
+          3, 3, S_SHINGLE, F_ROOFW, F_ROOFW * 1.05, COOL_SUN);
+    patch(CG_X1 + RAKE_OVER, MB_EAVE - 0.20, fz,  CG_RIDGE_X, CG_APEX_Y, fz,
+          CG_RIDGE_X, CG_APEX_Y, valley_z(CG_RIDGE_X),  CG_X1, MB_EAVE, MB_Z1,
+          3, 3, S_SHINGLE, F_ROOFE, F_ROOFE * 1.1, COOL_SHD);
+
+}
+
+fn build_right_wing() {
+    let step_y: f64 = rw_y(RW_STEP_X);
+
+    // ---- link: front wall from the main block to the step ---------------
+    facade(RW_X0, RW_STEP_X, RW_EAVE_Y, RW_LINK_Z, 0, 1.0, COOL_SUN);
+    // the wedge of wall between the flat eave line and the rising roof plane
+    patch(RW_X0, RW_EAVE_Y, RW_LINK_Z,   RW_STEP_X, step_y, RW_LINK_Z,
+          RW_STEP_X, RW_EAVE_Y, RW_LINK_Z, RW_X0, RW_EAVE_Y, RW_LINK_Z,
+          3, 1, S_SIDING, F_EAVE, F_EAVE * 1.3, COOL_SHD);
+
+    // ---- the step: a west-facing wall carrying the garage forward -------
+    //      brick below, siding above, built as two disjoint bands.  Laying a
+    //      brick band ON TOP of a full-height siding wall is exactly the
+    //      coplanar fight the painter sort cannot resolve.
+    wallx(RW_LINK_Z, RW_GAR_Z, BRICK_TOP, step_y, RW_STEP_X, -1.0, S_SIDING, TILE_M,
+          F_WEST, F_WEST * 0.72, COOL_SHD);
+    wallx(RW_LINK_Z, RW_GAR_Z, 0.0, BRICK_TOP, RW_STEP_X, -1.0,
+          S_BRICK, TILE_M, F_BRICKL * 1.1, F_BRICKL, COOL_SHD);
+
+    // ---- garage: front wall and its gable -------------------------------
+    facade(RW_STEP_X, RW_X1, RW_EAVE_Y, RW_GAR_Z, 0, 1.0, COOL_SUN);
+    // The garage gable, level courses.  The left rake starts at step_y rather
+    // than RW_EAVE_Y because the west slope is already climbing by the time it
+    // reaches the step — the wing's ridge is off centre.
+    gable_z(RW_STEP_X, RW_X1, RW_RIDGE_X, RW_EAVE_Y, RW_RIDGE_Y, RW_GAR_Z,
+            2, S_SIDING, F_UP * 0.94, F_UP, COOL_SUN);
+
+    // ---- east wall and back, brick wainscot wrapping both ---------------
+    wallx(RW_Z0, RW_GAR_Z, BRICK_TOP, RW_EAVE_Y, RW_X1, 1.0, S_SIDING, TILE_M,
+          F_EAST, F_EAST * 0.8, COOL_SHD);
+    wallx(RW_Z0, RW_GAR_Z, 0.0, BRICK_TOP, RW_X1, 1.0, S_BRICK, TILE_M,
+          F_BRICKL * 0.9, F_BRICKL * 0.8, COOL_SHD);
+    wallz(RW_X1, RW_X0, BRICK_TOP, RW_EAVE_Y, RW_Z0, S_SIDING, TILE_M,
+          F_BACK, F_BACK * 0.8, COOL_SHD);
+    wallz(RW_X1, RW_X0, 0.0, BRICK_TOP, RW_Z0, S_BRICK, TILE_M,
+          F_BRICKL * 0.9, F_BRICKL * 0.8, COOL_SHD);
+
+    // ---- roof.  West slope in two pieces because the link's roof stops
+    //      1.7 m short of the garage's, and the east slope over the garage.
+    let fzl: f64 = RW_LINK_Z + EAVE_OVER;
+    let fzg: f64 = RW_GAR_Z + EAVE_OVER;
+    let bz: f64 = RW_Z0 - EAVE_OVER;
+    let ex: f64 = RW_X1 + RW_RAKE;
+    let ey: f64 = rw_y(ex);
+    patch(RW_X0, rw_y(RW_X0), bz,          RW_STEP_X, step_y, bz,
+          RW_STEP_X, step_y, fzl,          RW_X0, rw_y(RW_X0), fzl,
+          3, 4, S_SHINGLE, F_ROOFW, F_ROOFW * 1.07, COOL_SUN);
+    patch(RW_STEP_X, step_y, bz,           RW_RIDGE_X, RW_RIDGE_Y, bz,
+          RW_RIDGE_X, RW_RIDGE_Y, fzg,     RW_STEP_X, step_y, fzg,
+          2, 4, S_SHINGLE, F_ROOFW, F_ROOFW * 1.07, COOL_SUN);
+    patch(RW_RIDGE_X, RW_RIDGE_Y, bz,      ex, ey, bz,
+          ex, ey, fzg,                     RW_RIDGE_X, RW_RIDGE_Y, fzg,
+          2, 4, S_SHINGLE, F_ROOFE, F_ROOFE * 1.1, COOL_SHD);
+
+}
+
+fn build_chimney() {
+    // Red brick, exterior, on the main block's east end.  It is the second
+    // most important thing in the silhouette after the roof, so it is given a
+    // real cap with a lip: a chimney that just stops looks like a pipe.
+    box5(CH_X0, CH_X1, CH_Y0, CH_Y1, CH_Z0, CH_Z1, S_BRICK, TILE_M,
+         F_BRICKS, F_BRICKS * 0.92, F_BRICKS * 0.52, F_BRICKS * 0.6,
+         F_BRICKS * 0.7, COOL_SUN);
+    box5(CH_X0 - CH_LIP, CH_X1 + CH_LIP, CH_Y1, CH_CAP, CH_Z0 - CH_LIP, CH_Z1 + CH_LIP,
+         S_CONC, 0.50, F_TRIM * 0.82, F_TRIM * 0.76, F_TRIM * 0.45, F_TRIM * 0.5,
+         F_TRIM * 0.6, COOL_SUN);
+}
+
+fn build_porch() {
+    // stoop
+    box5(ST_X0, ST_X1, 0.0, ST_Y, MB_Z1, ST_Z, S_CONC, 0.60,
+         F_GROUND * 0.72, F_GROUND * 0.6, F_GROUND * 0.5, F_GROUND * 0.5,
+         F_GROUND * 0.86, COOL_SHD);
+
+    // two slender square columns
+    for (let s = 0; s < 2; s++) {
+        let cx: f64 = 0.0 - PO_COL_X;
+        if (s == 1) { cx = PO_COL_X; }
+        box5(cx - PO_COL_HW, cx + PO_COL_HW, ST_Y, PO_ROOF_FRONT - 0.04,
+             PO_COL_Z - PO_COL_HW, PO_COL_Z + PO_COL_HW, S_WHITE, 0.40,
+             F_TRIM, F_TRIM * 0.76, F_TRIM * 0.55, F_TRIM * 0.5,
+             F_TRIM * 0.6, COOL_SUN);
+    }
+
+    // shed roof: top surface, front fascia, soffit, and two rake ends
+    patch(PO_X0 - 0.14, PO_ROOF_WALL, MB_Z1,   PO_X1 + 0.14, PO_ROOF_WALL, MB_Z1,
+          PO_X1 + 0.14, PO_ROOF_FRONT, PO_Z,   PO_X0 - 0.14, PO_ROOF_FRONT, PO_Z,
+          4, 2, S_SHINGLE, F_ROOFS * 0.92, F_ROOFS, COOL_SUN);
+    wallz(PO_X0 - 0.14, PO_X1 + 0.14, PO_ROOF_FRONT - 0.20, PO_ROOF_FRONT, PO_Z,
+          S_WHITE, 0.60, F_TRIM, F_TRIM * 0.88, COOL_SUN);
+    slab(PO_X0 - 0.14, PO_X1 + 0.14, MB_Z1, PO_Z, PO_ROOF_FRONT - 0.20, -1.0,
+         S_WHITE, 0.60, F_SOFFIT * 1.15, COOL_SHD);
+    wallx(MB_Z1, PO_Z, PO_ROOF_FRONT - 0.20, PO_ROOF_WALL, PO_X0 - 0.14, -1.0,
+          S_WHITE, 0.60, F_TRIM * 0.8, F_TRIM * 0.8, COOL_SHD);
+    wallx(MB_Z1, PO_Z, PO_ROOF_FRONT - 0.20, PO_ROOF_WALL, PO_X1 + 0.14, 1.0,
+          S_WHITE, 0.60, F_TRIM * 0.5, F_TRIM * 0.5, COOL_SHD);
+}
+
+// ---------------------------------------------------------------------------
+// APPLIED TRIM.  Everything that lies ON a surface rather than being one:
+// windows, doors, casings, rake boards, fascia, the lantern.  All of it goes
+// in its own mesh so it can be committed with TRIM_BIAS and stop losing the
+// sort to the wall underneath it.  See the DEPTH note at the head of the file.
+// ---------------------------------------------------------------------------
+fn build_trim() {
+    // upper storey: four double-hung windows with black shutters.  Two on the
+    // setback wall, two on the cross gable.  This rhythm of dark rectangles
+    // on white is most of what the facade IS.
+    window_unit(-4.05, UW_HW, UW_SILL, UW_HEAD, MB_Z1, S_WINU, 0.68, COOL_SUN);
+    window_unit(-1.95, UW_HW, UW_SILL, UW_HEAD, MB_Z1, S_WINU, 0.68, COOL_SUN);
+    window_unit(2.85, UW_HW, UW_SILL, UW_HEAD, CG_Z, S_WINU, 0.68, COOL_SUN);
+    window_unit(5.00, UW_HW, UW_SILL, UW_HEAD, CG_Z, S_WINU, 0.68, COOL_SUN);
+
+    // ground storey: the picture window left of the entry, two on the wing
+    window_unit(PW_X, PW_HW, GW_SILL, GW_HEAD, MB_Z1, S_WINP, 0.50, COOL_SUN);
+    window_unit(2.85, UW_HW, GW_SILL, GW_HEAD, CG_Z, S_WINU, 0.50, COOL_SUN);
+    window_unit(5.00, UW_HW, GW_SILL, GW_HEAD, CG_Z, S_WINU, 0.50, COOL_SUN);
+
+    // ---- the front door, deep in the porch shadow ------------------------
+    frame4(0.0 - DOOR_HW, DOOR_HW, ST_Y, DOOR_TOP, 0.11, MB_Z1 + PROUD,
+           S_WHITE, 0.32, COOL_SHD);
+    sprite(0.0 - DOOR_HW, DOOR_HW, ST_Y, DOOR_TOP, MB_Z1 + PROUD, S_DOOR,
+           2, 5, 0.52, COOL_SHD);
+
+    // ---- garage door in its white surround, link window, lantern --------
+    frame4(GD_X0, GD_X1, 0.0, GD_TOP, 0.16, RW_GAR_Z + PROUD,
+           S_WHITE, F_TRIM, COOL_SUN);
+    sprite(GD_X0, GD_X1, 0.0, GD_TOP, RW_GAR_Z + PROUD, S_GDOOR, 5, 4, 0.66, COOL_SUN);
+    window_unit(LW_X, LW_HW, GW_SILL, GW_HEAD + 0.06, RW_LINK_Z, S_WINL, 0.62, COOL_SUN);
+    sprite(LANT_X - 0.13, LANT_X + 0.13, LANT_Y0, LANT_Y1, RW_GAR_Z + PROUD,
+           S_LANT, 1, 2, 0.62, COOL_SUN);
+
+    // ---- eave fascia and soffit on the main block ------------------------
+    // Without these the roof edge is a pencil line and the silhouette goes
+    // soft.  0.26 m: at 320x240 and 19 m a 0.20 m board is one pixel and
+    // disappears entirely.
+    let ez: f64 = MB_Z1 + EAVE_OVER;
+    let ey: f64 = mroof_y(ez);
+    wallz(MB_X0 - RAKE_OVER, CG_X0, ey - 0.26, ey, ez, S_WHITE, 0.60,
+          F_TRIM * 1.12, F_TRIM * 0.95, COOL_SUN);
+    slab(MB_X0 - RAKE_OVER, CG_X0, MB_Z1, ez, ey - 0.26, -1.0, S_WHITE, 0.60,
+         F_SOFFIT, COOL_SHD);
+
+    // ---- rake boards on the cross gable ---------------------------------
+    let rz: f64 = CG_Z + PROUD;
+    patch(CG_RIDGE_X, CG_APEX_Y, rz,       CG_X0, MB_EAVE, rz,
+          CG_X0, MB_EAVE - 0.20, rz,       CG_RIDGE_X, CG_APEX_Y - 0.20, rz,
+          3, 1, S_WHITE, F_TRIM * 1.08, F_TRIM * 0.92, COOL_SUN);
+    patch(CG_X1, MB_EAVE, rz,              CG_RIDGE_X, CG_APEX_Y, rz,
+          CG_RIDGE_X, CG_APEX_Y - 0.20, rz,  CG_X1, MB_EAVE - 0.20, rz,
+          3, 1, S_WHITE, F_TRIM * 1.08, F_TRIM * 0.92, COOL_SUN);
+
+    // ---- rake boards on the garage gable, and the link's roof edge ------
+    let sy: f64 = rw_y(RW_STEP_X);
+    let gz: f64 = RW_GAR_Z + PROUD;
+    patch(RW_STEP_X, sy, gz,               RW_RIDGE_X, RW_RIDGE_Y, gz,
+          RW_RIDGE_X, RW_RIDGE_Y - 0.20, gz,  RW_STEP_X, sy - 0.20, gz,
+          2, 1, S_WHITE, F_TRIM * 1.08, F_TRIM * 0.92, COOL_SUN);
+    patch(RW_RIDGE_X, RW_RIDGE_Y, gz,      RW_X1, RW_EAVE_Y, gz,
+          RW_X1, RW_EAVE_Y - 0.20, gz,     RW_RIDGE_X, RW_RIDGE_Y - 0.20, gz,
+          2, 1, S_WHITE, F_TRIM * 1.08, F_TRIM * 0.92, COOL_SUN);
+    let fzl: f64 = RW_LINK_Z + EAVE_OVER;
+    patch(RW_X0, rw_y(RW_X0), fzl,         RW_STEP_X, sy, fzl,
+          RW_STEP_X, sy - 0.20, fzl,       RW_X0, rw_y(RW_X0) - 0.20, fzl,
+          3, 1, S_WHITE, F_TRIM * 1.08, F_TRIM * 0.92, COOL_SUN);
+    patch(RW_X0, rw_y(RW_X0) - 0.20, fzl,  RW_STEP_X, sy - 0.20, fzl,
+          RW_STEP_X, sy - 0.20, RW_LINK_Z, RW_X0, rw_y(RW_X0) - 0.20, RW_LINK_Z,
+          3, 1, S_WHITE, F_SOFFIT, F_SOFFIT, COOL_SHD);
+
+    // ---- the pink flowering plant on the step  [critic pass] -------------
+    // On the stoop, beside the left column, clear of the door. It stands 0.20 m
+    // FORWARD of the column plane so the painter sort never has to break a tie
+    // between the two, and it is a hair brighter than F_PORCH because in the
+    // photograph it catches the light bouncing off the stoop rather than
+    // sitting in the full shadow of the porch roof.
+    sprite(0.0 - 1.06, 0.0 - 0.62, ST_Y, ST_Y + 0.56, PO_COL_Z + 0.20,
+           S_FLOWER, 2, 3, F_PORCH * 1.55, 0.55);
+}
+
+fn build_house() {
+    g_house = mesh_new(4000);
+    g_m = g_house;
+    mesh_begin(g_house);
+    build_main_block();
+    build_cross_gable();
+    build_right_wing();
+    build_chimney();
+    build_porch();
+    mesh_end(g_house);
+
+    g_trim = mesh_new(1200);
+    g_m = g_trim;
+    mesh_begin(g_trim);
+    build_trim();
+    mesh_end(g_trim);
+}
+
+// ---------------------------------------------------------------------------
+// PLACEHOLDER LAWN.  the-yard owns the real one; this exists so house.hml
+// stands up on its own and so the building has something to sit on.
+// ---------------------------------------------------------------------------
+let GROUND_SLOPE = 0.030;
+
+fn ground_y(p_z: f64): f64 {
+    let z: f64 = p_z;
+    if (z <= 0.0) { let a: f64 = 0.0; return a; }
+    let o: f64 = 0.0 - GROUND_SLOPE * z;
+    return o;
+}
+
+fn build_ground() {
+    g_ground = mesh_new(1900);
+    g_m = g_ground;
+    mesh_begin(g_ground);
+    // The cell size is bounded from below by the NEAR PLANE, not by looks: a
+    // quad with one corner behind the eye is a straddle, emit.hml refuses it
+    // and only the far triangle of that quad survives, so a coarse grid tears
+    // a triangular hole in the lawn at the camera's feet and the sky shows
+    // through it.  4 m cells did; 3.7 m cells do not.  See the report.
+    let n: i32 = 30;
+    let x0: f64 = -46.0;   let x1: f64 = 66.0;
+    let z0: f64 = -32.0;   let z1: f64 = 30.0;
+    for (let j = 0; j < n; j++) {
+        let za: f64 = z0 + (z1 - z0) * f64(j) / f64(n);
+        let zb: f64 = z0 + (z1 - z0) * f64(j + 1) / f64(n);
+        let ya: f64 = ground_y(za);
+        let yb: f64 = ground_y(zb);
+        for (let i = 0; i < n; i++) {
+            let xa: f64 = x0 + (x1 - x0) * f64(i) / f64(n);
+            let xb: f64 = x0 + (x1 - x0) * f64(i + 1) / f64(n);
+            // mown stripes, and the foreground darker because a big tree
+            // stands over it — that gradient is most of the depth in the
+            // photograph, so even the placeholder keeps it.
+            let stripe: f64 = 0.0;
+            if ((i & 1) == 0) { stripe = 0.055; }
+            let shade: f64 = 1.0 - 0.30 * (zb - 4.0) / 30.0;
+            if (shade > 1.0) { shade = 1.0; }
+            if (shade < 0.55) { shade = 0.55; }
+            let f: f64 = (F_GROUND + stripe) * shade;
+            patch(xa, ya, za,  xb, ya, za,  xb, yb, zb,  xa, yb, zb,
+                  1, 1, S_GRASS, f, f * 0.97, 0.35);
+        }
+    }
+    mesh_end(g_ground);
+}
+// ===========================================================================
+// MODULE ENTRY POINTS  (the only thing in this file the house half did not
+// write; everything above is its work, moved verbatim)
+// ===========================================================================
+
+export let HS_TRIM_BIAS: f64 = 0.60;    // == TRIM_BIAS above
+
+export fn hs_build_assets() {
+    g_atl = atlas_new(ATL, ATL, 1, 1);
+    g_sky = atlas_new(SKY_W, SKY_H, 1, 1);
+    build_atlas();
+    build_sky();
+}
+export fn hs_atlas() { let o = g_atl; return o; }
+export fn hs_sky_atlas() { let o = g_sky; return o; }
+
+export fn hs_build() { build_house(); }
+export fn hs_mesh_house() { let o = g_house; return o; }
+export fn hs_mesh_trim() { let o = g_trim; return o; }
+export fn hs_tris(): i32 {
+    let o: i32 = mesh_tri_count(g_house) + mesh_tri_count(g_trim);
+    return o;
+}
+export fn hs_mass_tris(): i32 { let o: i32 = mesh_tri_count(g_house); return o; }
+export fn hs_trim_tris(): i32 { let o: i32 = mesh_tri_count(g_trim); return o; }
+
+export fn hs_build_ground() { build_ground(); }
+export fn hs_mesh_ground() { let o = g_ground; return o; }
+export fn hs_ground_tris(): i32 { let o: i32 = mesh_tri_count(g_ground); return o; }
